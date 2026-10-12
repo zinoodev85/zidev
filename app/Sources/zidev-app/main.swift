@@ -31,14 +31,15 @@ func termColor(_ hex: UInt32) -> SwiftTerm.Color {
                     blue: UInt16(hex & 0xff) * 257)
 }
 
+/// the colors of zidev's iTerm profile, so zidev looks the same in its app
 struct Theme {
-    let bg: UInt32, fg: UInt32, ansi: [UInt32]
-    static let dark = Theme(bg: 0x15171c, fg: 0xd4d7dd, ansi: [
-        0x14191e, 0xe0675a, 0x5fc96f, 0xd9c45a, 0x6c8cf0, 0xc678dd, 0x56c8d4, 0xc7c9cd,
-        0x686d76, 0xf08a7e, 0x7fe08f, 0xece17a, 0x93acf7, 0xe09ef0, 0x7fe3ee, 0xffffff])
-    static let light = Theme(bg: 0xfafafa, fg: 0x1a1c20, ansi: [
-        0x14191e, 0xb43c2a, 0x188a2c, 0x9a7d00, 0x2744c7, 0xa035a0, 0x00838a, 0xc7c7c7,
-        0x686868, 0xc8503e, 0x24a33c, 0xb39200, 0x4a64d8, 0xb84ab8, 0x00a0a8, 0xffffff])
+    let bg: UInt32, fg: UInt32, cursor: UInt32, selection: UInt32, ansi: [UInt32]
+    static let dark = Theme(bg: 0x010c18, fg: 0xecdef4, cursor: 0x38ff9d, selection: 0x1d3a4f, ansi: [
+        0x0b3b61, 0xff3a3a, 0x52ffd0, 0xfff383, 0x1376f9, 0xc792ea, 0xff5ed4, 0x16fda2,
+        0x63686d, 0xff54b0, 0x74ffd8, 0xfcf5ae, 0x388eff, 0xae81ff, 0xff6ad7, 0x60fbbf])
+    static let light = Theme(bg: 0xfafafa, fg: 0x101010, cursor: 0x000000, selection: 0xb3d7ff, ansi: [
+        0x14191e, 0xb43c2a, 0x00c200, 0xc7c400, 0x2744c7, 0xc040be, 0x00c5c7, 0xc7c7c7,
+        0x686868, 0xdd7975, 0x58e790, 0xece100, 0xa7abf2, 0xe17ee1, 0x60fdff, 0xffffff])
 }
 
 final class ZidevView: LocalProcessTerminalView {
@@ -100,7 +101,7 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         term = ZidevView(frame: NSRect(x: 0, y: 0, width: 1200, height: 760))
         term.processDelegate = self
         term.optionAsMetaKey = true
-        term.font = NSFont(name: "MesloLGS-NF-Regular", size: 14) ?? NSFont(name: "SF Mono", size: 13)
+        term.font = NSFont(name: "MesloLGS-NF-Regular", size: 16) ?? NSFont(name: "SF Mono", size: 13)
             ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
         window = NSWindow(contentRect: term.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
@@ -118,7 +119,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
             self?.term.zidevKey(e) == true ? nil : e  // before the menu and the terminal see it
         }
         clickWatch = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] e in
-            self?.term.cmdClick(e) == true ? nil : e
+            guard let self else { return e }
+            if self.titleDoubleClick(e) { return nil }
+            return self.term.cmdClick(e) ? nil : e
         }
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global().async {
@@ -137,6 +140,14 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
                           execName: "-zsh", currentDirectory: NSHomeDirectory())
     }
 
+    /// a double click on the title bar fills the screen (and back), whatever System Settings say
+    func titleDoubleClick(_ e: NSEvent) -> Bool {
+        guard e.type == .leftMouseDown, e.clickCount == 2, e.window === window,
+              e.locationInWindow.y > window.contentLayoutRect.maxY else { return false }
+        window.zoom(nil)
+        return true
+    }
+
     /// light or dark, as macOS is: background, text and the 16 colors
     func paint() {
         let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -144,7 +155,8 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         term.installColors(t.ansi.map(termColor))
         term.nativeBackgroundColor = color(t.bg)
         term.nativeForegroundColor = color(t.fg)
-        term.caretColor = color(t.fg)
+        term.caretColor = color(t.cursor)
+        term.selectedTextBackgroundColor = color(t.selection)
         window.backgroundColor = color(t.bg)
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     }

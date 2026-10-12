@@ -20,10 +20,10 @@ rm -rf build/zidev.app
 mkdir -p build/zidev.app/Contents/MacOS build/zidev.app/Contents/Resources
 if [ "$1" = zip ]; then
   swift build -c release --disable-sandbox --triple x86_64-apple-macosx13.0 --scratch-path .build-x86
-  lipo -create .build/arm64-apple-macosx/release/zidev-app .build-x86/x86_64-apple-macosx/release/zidev-app \
+  lipo -create "$(swift build -c release --show-bin-path)/zidev-app" .build-x86/x86_64-apple-macosx/release/zidev-app \
     -output build/zidev.app/Contents/MacOS/zidev
 else
-  cp .build/release/zidev-app build/zidev.app/Contents/MacOS/zidev
+  cp "$(swift build -c release --show-bin-path)/zidev-app" build/zidev.app/Contents/MacOS/zidev
 fi
 cp zidev.icns build/zidev.app/Contents/Resources/zidev.icns
 VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../zidev)

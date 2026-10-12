@@ -53,3 +53,4 @@ Decisions on how zidev should be. Only these.
 - zidev is its own Mac app with a nice icon, its own window and Dock entry; no paying Apple.
 - The app comes with brew, ready built (no Command Line Tools); `zidev app` puts it into Applications.
 - In the app, cmd-click on a `! command` runs it.
+- The app looks like zidev in my iTerm (same colors and font); a double click on its title bar maximizes it.
