@@ -3450,6 +3450,7 @@ def cmd_selftest():
         hook({"hook_event_name": "UserPromptSubmit", "prompt": "second", "session_id": "cid-2"})
         check("/clear: claude id followed, title kept",
               status(zid).get("claude_id") == "cid-2" and status(zid).get("prompt") == "fix the login bug")
+        check("Claude gets its real colors in tmux", t("show-environment", "-g", "CLAUDE_CODE_TMUX_TRUECOLOR") == "CLAUDE_CODE_TMUX_TRUECOLOR=1")
         check("list --json", json.loads(z("list", "--json").stdout)[0]["status"]["state"] == "working")
 
         # the sidebar reacts only while a client looks at it

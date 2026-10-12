@@ -21,7 +21,7 @@ Needs macOS and iTerm. Brings tmux, Python and the viewers (bat, delta, glow, mi
 
 **zidev.app**: zidev in a window of its own, with its own Dock icon. `brew install` brings it ready built (no Xcode tools needed); `zidev app` puts it
 into `~/Applications` and opens it (from source: `app/build.sh` first). Every cmd / alt key reaches zidev directly
-(no iTerm profile needed); its colors and font (MesloLGS NF, comes with it) are zidev's iTerm profile's, light or dark as macOS is; a double click on the title bar fills the screen; cmd-click on a `! command` runs it. Built on your Mac, it
+(no iTerm profile needed); its colors and font (MesloLGS NF, comes with it) are zidev's iTerm profile's, and Claude shows its real colors (zidev turns off its 256-color fallback in tmux), light or dark as macOS is; a double click on the title bar fills the screen; cmd-click on a `! command` runs it. Built on your Mac, it
 runs without an Apple developer account. Closing it leaves the sessions running.
 
 ## Start
