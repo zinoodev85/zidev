@@ -3,6 +3,10 @@
 set -e
 cd "$(dirname "$0")"
 v=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' zidev)
+if git ls-remote --exit-code --tags origin "v$v" >/dev/null; then
+  echo "v$v is out already: raise VERSION in zidev first" >&2
+  exit 1
+fi
 app/build.sh zip  # the app, ready built: brew installs it without Swift
 git tag "v$v" 2>/dev/null || true
 git push origin main "v$v"

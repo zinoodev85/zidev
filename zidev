@@ -60,7 +60,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
