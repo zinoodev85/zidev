@@ -54,4 +54,4 @@ Decisions on how zidev should be. Only these.
 - The app comes with brew, ready built (no Command Line Tools); `zidev app` puts it into Applications.
 - In the app, cmd-click on a `! command` runs it.
 - The app just looks right on every Mac, nothing to set up: Claude's own colors (as outside tmux), zidev's font; a double click on its title bar maximizes it.
-- A folded project shows the spinner while a session in it works.
+- A folded project shows the spinner while a session in it works, ● while one waits for my answer.

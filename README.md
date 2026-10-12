@@ -36,7 +36,7 @@ runs without an Apple developer account. Closing it leaves the sessions running.
 | key | |
 |---|---|
 | `⏎` / click | show session (Claude) / tab; a project: its first session (folded or not) |
-| `space` / click `▸` | fold / unfold a project or the changed files (folded: a spinner while a session in it works) |
+| `space` / click `▸` | fold / unfold a project or the changed files (folded: ● while a session in it needs you, a spinner while one works) |
 | right click | menu of the row: close tab · rename / restart / close session · rename / new session / archive / remove project |
 | `j` / `k`, arrows | move; the wheel scrolls the list, the cursor stays |
 | `n` / `p` | new session in project / new project (folder) |
