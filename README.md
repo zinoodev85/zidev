@@ -17,6 +17,12 @@ brew install --cask claude-code   # if not there yet
 Needs macOS and iTerm. Brings tmux, Python and the viewers (bat, delta, glow, micro, eza, fd, fzf, rg).
 `zidev doctor` checks the setup. From source: link `zidev` into your PATH (`ln -s $PWD/zidev ~/.local/bin/`).
 
+## App
+
+`app/build.sh` builds **zidev.app**: zidev in a window of its own, with its own Dock icon. Every cmd / alt key
+reaches zidev directly (no iTerm profile needed); light or dark follows macOS. Built on your Mac, it runs
+without an Apple developer account. Copy it to `~/Applications`. Closing it leaves the sessions running.
+
 ## Start
 
 - `zidev` in iTerm: opens zidev in a new tab with the `zidev` profile (installed by zidev; *Profiles > zidev*

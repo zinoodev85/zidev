@@ -2544,6 +2544,7 @@ class Sidebar:
         self.cursor = 0
         self.top = 0
         self.max_top = 0  # the last line can't go higher than the bottom
+        self.theme = None  # "light" / "dark" once the selection bar is painted for it (256 colors)
         self.pick_at = None  # the pick list the cursor was put on
         self.scrolled = False  # the wheel moved the list: the cursor may be off screen
         self.view_seen = None
@@ -2688,6 +2689,9 @@ class Sidebar:
 
     def put(self, y, x, text, attr=0):
         h, w = self.scr.getmaxyx()
+        if attr & curses.A_REVERSE and self.theme:  # the selected row: a quiet gray bar, colors kept
+            pair = (SEL_PAIR if self.focused else 2 * SEL_PAIR) + curses.pair_number(attr)
+            attr = attr & ~(curses.A_REVERSE | curses.A_COLOR) | curses.color_pair(pair)
         if 0 <= y < h and x < w:
             with contextlib.suppress(curses.error):
                 self.scr.addnstr(y, x, text, w - x, attr)
@@ -2729,7 +2733,7 @@ class Sidebar:
             y = body_top + n
             self.rows[y] = i
             sel = i == self.cursor  # always shown; dimmer while the focus is elsewhere
-            base = curses.A_REVERSE | (0 if self.focused else curses.A_DIM) if sel else 0
+            base = curses.A_REVERSE | (0 if self.focused or self.theme else curses.A_DIM) if sel else 0
             if sel:
                 self.put(y, 0, " " * w, base)
             if kind == "project":
@@ -3204,18 +3208,35 @@ class Sidebar:
             tmux("resize-pane", "-t", self.pane, "-x", str(want))
         self.win_w = win_w
 
+    def paint(self, theme):
+        """Colors for the terminal's light or dark theme: text keeps the theme's own colors; the
+        selected row gets a gray bar that fits it (reverse video glares: a white block on dark)."""
+        if theme == self.theme or curses.COLORS < 256:
+            return
+        self.theme = theme
+        bars = SEL_BARS.get(theme, SEL_BARS["dark"])
+        for n, color in enumerate((-1, curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                                   curses.COLOR_CYAN, curses.COLOR_MAGENTA)):
+            for k, bar in enumerate(bars, 1):
+                curses.init_pair(k * SEL_PAIR + n, color, bar)
+        tmux("set", "-g", "pane-border-style", f"fg=colour{BORDERS.get(theme, BORDERS['dark'])}")
+        tmux("set", "-g", "pane-active-border-style", f"fg=colour{BORDERS.get(theme, BORDERS['dark'])}")
+
     def run(self):
         curses.curs_set(0)
         curses.use_default_colors()
         for n, color in enumerate((curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW,
                                    curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
             curses.init_pair(n, color, -1)
+        self.paint("dark")
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(0)
         self.scr.keypad(True)
         while True:
             flags = (tmux("display", "-p", "-t", self.pane,
-                          "#{window_active} #{session_attached} #{pane_active}") or "0 0 0").split()
+                          "#{window_active} #{session_attached} #{pane_active} #{client_theme}") or "0 0 0").split()
+            if len(flags) > 3:  # the terminal's light / dark theme (tmux asks it), as it switches
+                self.paint(flags[3])
             if flags[0] != "1" or flags[1] == "0":  # not shown: kept drawn, so a switch here shows it as it is
                 self.visible = self.focused = False
                 self.load()
@@ -3242,6 +3263,11 @@ class Sidebar:
             if ch != -1:
                 self.key(ch)
                 self.save_view()
+
+
+SEL_PAIR = 10  # color pairs 10-15: on the selection bar, 20-25: on it while the focus is elsewhere
+SEL_BARS = {"dark": (238, 236), "light": (252, 254)}  # 256-color grays: the same in every theme
+BORDERS = {"dark": 237, "light": 252}
 
 
 def complete_dir(text):
@@ -3473,7 +3499,7 @@ def cmd_selftest():
             t("select-pane", "-t", side)  # focused: the cursor shows
             t("send-keys", "-t", side, *["k"] * 30)
             time.sleep(0.5)
-            lit = lambda: next((l for l in t("capture-pane", "-p", "-e", "-t", side).splitlines() if "\x1b[7m" in l), "")
+            lit = lambda: next((l for l in t("capture-pane", "-p", "-e", "-t", side).splitlines() if re.search(r"48;5;23[68]m", l)), "")  # its gray bar
             for _ in range(40):
                 row = lit()
                 if text in row:
@@ -4056,6 +4082,9 @@ def main():
         cmd_sidebar()
     elif cmd == "welcome":
         cmd_welcome()
+    elif cmd == "keys":  # for the zidev app: which key sends what (the iTerm profile's map, by name)
+        print(json.dumps({**{k: v[1] for k, v in ZED_KEYS["bindings"].items()},
+                          **{key: seq for seq, key, _, _ in EDIT_KEYS}}))
     elif cmd in ("--version", "version"):
         print(f"zidev {VERSION}")
     elif os.path.isdir(os.path.expanduser(cmd)):

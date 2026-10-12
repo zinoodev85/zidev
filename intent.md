@@ -49,3 +49,5 @@ Decisions on how zidev should be. Only these.
 - A project's first session is its main one: click / ⏎ on the project opens it, folded or not. Folding: click ▸ / ▾, or space.
 - zidev ships on Homebrew: one `brew install` brings it with everything it needs.
 - `zidev .` opens zidev on that folder's project, like `code .`.
+- zidev looks good in every terminal theme, light or dark: the selection is a quiet gray bar, never a glaring block.
+- zidev is its own Mac app with a nice icon, its own window and Dock entry; no paying Apple.
