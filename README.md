@@ -10,7 +10,7 @@ with `claude --resume`. Decisions on how zidev should behave: [intent.md](intent
 ## Install
 
 ```
-brew install OWNER/zidev/zidev
+brew install zinoodev85/zidev/zidev
 brew install --cask claude-code   # if not there yet
 ```
 
