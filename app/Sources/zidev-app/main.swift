@@ -98,16 +98,25 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
 
     func applicationDidFinishLaunching(_ n: Notification) {
         menu()
-        term = ZidevView(frame: NSRect(x: 0, y: 0, width: 1200, height: 760))
+        // colors 16-255 as xterm (and iTerm) has them, not mixed from the 16: Claude's bars inside tmux are those
+        var options = TerminalOptions.default
+        options.ansi256PaletteStrategy = .xterm
+        term = ZidevView(frame: NSRect(x: 0, y: 0, width: 1200, height: 760), options: options)
         term.processDelegate = self
         term.optionAsMetaKey = true
         term.font = NSFont(name: "MesloLGS-NF-Regular", size: 16) ?? NSFont(name: "SF Mono", size: 13)
             ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
-        window = NSWindow(contentRect: term.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+        term.fontSmoothing = false  // thin strokes, as iTerm draws text on a Retina screen
+        // a margin around the text, as iTerm has
+        let frame = NSView(frame: term.frame.insetBy(dx: -8, dy: -4))
+        term.frame.origin = CGPoint(x: 8, y: 4)
+        term.autoresizingMask = [.width, .height]
+        frame.addSubview(term)
+        window = NSWindow(contentRect: frame.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "zidev"
         window.titlebarAppearsTransparent = true
-        window.contentView = term
+        window.contentView = frame
         window.delegate = self
         window.setFrameAutosaveName("zidev")
         if !window.setFrameUsingName("zidev") { window.center() }
