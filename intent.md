@@ -1,0 +1,50 @@
+# zidev — intent
+
+Decisions on how zidev should be. Only these.
+
+- zidev is my place for Claude sessions; build features here, not in Neovim/Neovide.
+- Keep it simple.
+- What is selected always shows as selected.
+- When a human is needed (by Claude or a script), the sidebar shows it.
+- Add a project from any terminal with one command.
+- File preview: Esc closes it, Enter keeps it open, e edits (back to the preview after).
+- No tab bar: Arc-style, everything open lives in the vertical sidebar.
+- Tabs (terminal, commands, git, files) belong to the project, shared by all its sessions, listed under the project.
+- Every project always has a terminal and a changes tab.
+- Tabs are always full screen, never split — except Claude: cmd-t puts a terminal next to it (cmd-t again: away). cmd-shift-t: a new terminal tab under the project.
+- HTML file: ask "open in browser or preview here?"; browser serves it from a simple local server.
+- Images and binary files (movies…): open in their default app.
+- Changes tab: the diff of one changed file at a time (delta); scrolling never runs into another file; no git client (lazygit was too much). Its changed files are listed under it in the sidebar; the cursor on one shows its diff, ⏎ opens it in the viewer pop-up.
+- Menus work with the mouse: click picks an item, moving the mouse does not close them.
+- Clicking a file path never opens the browser; relative paths resolve in the session folder.
+- Clicking file:line opens the preview at exactly that line.
+- File preview highlights what changed on this branch (vs main, incl. uncommitted).
+- Long lines in the preview wrap under their own indentation, never into the gutter.
+- Viewing is calm: text from the top, no ~ filler, a quiet status / keys line at the bottom; it never jumps.
+- One color scheme for the whole tool (viewer, editor, changes, markdown).
+- Esc closes everywhere (preview, tabs, editor); no q. Editor asks to save when changed.
+- Editor has the usual mac keys: cmd-x / c / v, cmd-f, cmd-a, cmd-s, cmd-z / cmd-shift-z, and WebStorm's.
+- alt / cmd + arrows and backspace move and delete by word / line everywhere (editor, Claude, shell); never stray characters.
+- The wheel scrolls the pane under the mouse; over the sidebar it scrolls the list (the cursor stays).
+- No line numbers by default (viewer, editor, changes); l shows them (alt-l in the editor).
+- Quick prompts ask in the bottom bar, short: save? y / n.
+- A file is open at most once in the sidebar; opening it again shows its tab.
+- cmd-b hides / shows the sidebar.
+- cmd-↑ / cmd-↓ move between a project's items in the sidebar: Claude, terminals, files (not the changes tab).
+- A plain click on a web link opens it in the browser (no cmd-click needed).
+- A `! command` Claude suggests: a click copies it, a double click types it into Claude's prompt; I send it.
+- Projects can get a name (r on the project, or zidev rename-project); the folder stays as it is.
+- An agent skill (~/.claude/skills/zidev) explains zidev to agents; zidev rewrites it on every start so it stays current.
+- Right click on a sidebar row: a menu with its actions (close, rename, …); a left click opens it.
+- Changed files under the changes tab fold like an accordion: folded at first, showing their number. ⏎ on a changed file (in the sidebar or in its diff) opens it as a file tab.
+- Session names follow Claude (/rename, else Claude's own title, else the first prompt); r in the sidebar renames over it until the next /rename. r never pre-fills the long first prompt.
+- Close / Remove from the right-click menu acts at once, no question (x still asks).
+- Clicking a path or link that wraps over several lines (also Claude's indented wrap at - or /) opens the whole thing.
+- A session can start with its task: zidev new DIR --prompt "…" sends it as Claude's first message (e.g. started from a todo).
+- A bare file name the AI mentions (before-table.png, Cart.ts:12) opens on click when exactly one file has it: a full path shown earlier, else the project's files.
+- A folder path (anime/v2/) is a path, not a web link: a click shows its tree in the preview.
+- x on a project removes it with its sessions and tabs; x x (one key each, no ⏎) confirms. Every question is one key: the same key again or y.
+- A name several files have: they list at the top of the sidebar to pick (at most 20, then "… n more"); the AI is asked in the background which one is meant, that one goes first (✦). esc / x drops the list.
+- The sidebar stays still: a click opens, never folds or closes anything else; cursor and scroll stay the same when the window changes; no redraw flash.
+- A project's first session is its main one: click / ⏎ on the project opens it, folded or not. Folding: click ▸ / ▾, or space.
+- zidev ships on Homebrew: one `brew install` brings it with everything it needs.

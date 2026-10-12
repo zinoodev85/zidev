@@ -1,0 +1,4035 @@
+#!/usr/bin/env python3
+"""zidev — a cmux-style sidebar of Claude Code sessions, grouped by project.
+
+Runs on its own tmux server (socket "zidev"), so sessions keep running when the
+terminal quits. Each session is a tmux window: sidebar pane on the left, Claude on the
+right. Claude Code hooks report each session's status to ~/.zidev/status.
+
+  zidev              start (restoring saved sessions) or attach
+  zidev start        start the server in the background, without attaching
+  zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
+  zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
+  zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
+  zidev list [--json]  print sessions and their status
+  zidev kill         stop the tmux server (sessions stay saved, restored on next start)
+  zidev reload       load new zidev code into a running server (Claude sessions keep running)
+  zidev --version    print the version
+  zidev doctor       check the setup: tools, hook settings, saved state
+  zidev logs [-f]    show (or follow) the error log
+  zidev selftest     run the end-to-end test on a throwaway tmux server
+  zidev open FILE[:LINE] [--tab]   (inside zidev) show a file in the preview, or as a tab
+"""
+
+import contextlib
+import curses
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import traceback
+import tty
+import uuid
+
+for _k in [k for k in os.environ if k.startswith("ZMUX_")]:  # the old name (zmux) still works
+    os.environ.setdefault("ZIDEV_" + _k[5:], os.environ[_k])
+HOME = os.environ.get("ZIDEV_HOME") or os.path.expanduser("~/.zidev")
+# one color scheme for the whole tool: viewer (bat), changes (delta reads BAT_THEME), editor (micro), markdown (glow)
+THEME = {"bat": "Dracula", "micro": "dracula-tc", "glow": "dracula"}
+os.environ["BAT_THEME"] = THEME["bat"]
+os.environ["MICRO_TRUECOLOR"] = "1"
+STATE = f"{HOME}/sessions.json"
+LOCK = f"{HOME}/sessions.lock"
+STATUS_DIR = f"{HOME}/status"
+SEEN_DIR = f"{HOME}/seen"
+CONFIG = f"{HOME}/config.json"
+VIEW = f"{HOME}/view.json"  # the sidebar's cursor and scroll, the same in every window
+HOOK_SETTINGS = f"{HOME}/claude-settings.json"
+LOG = f"{HOME}/zidev.log"
+# cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
+ANCHOR = f"{HOME}/home"
+
+VERSION = "0.1.0"
+# the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
+# so hooks and key bindings that call it keep working; its files sit next to the real one
+SELF = os.path.abspath(__file__)
+HERE = os.path.dirname(os.path.realpath(__file__))
+TMUX_CONF = os.path.join(HERE, "tmux.conf")
+SOCKET = os.environ.get("ZIDEV_SOCKET", "zidev")
+SESSION = "zidev"
+SIDEBAR_W = 34  # default; dragging its border sets config sidebar_w
+SIDEBAR_MIN = 8
+CLAUDE = os.environ.get("ZIDEV_CLAUDE", "claude")  # override for tests
+
+HOOK_EVENTS = [
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+    "PermissionRequest", "Notification", "Stop", "StopFailure", "SessionEnd",
+]
+ASKING_TOOLS = {"AskUserQuestion": "has a question", "ExitPlanMode": "plan ready"}
+
+
+# ── storage ────────────────────────────────────────────────────────────────
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_state():
+    d = read_json(STATE, {})
+    d.setdefault("projects", [])
+    d.setdefault("sessions", [])
+    d.setdefault("collapsed", [])
+    d.setdefault("changes_open", [])  # projects whose changed files show under the changes tab
+    for s in d["sessions"]:  # the files pane became the commands bar
+        if "files" in s:
+            s["cmds"] = s.pop("files")
+    return d
+
+
+@contextlib.contextmanager
+def edit_state():
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = load_state()
+        yield d
+        write_json(STATE, d)
+
+
+def read_status(zid):
+    return read_json(f"{STATUS_DIR}/{zid}.json", {})
+
+
+def set_status(zid, state, detail=""):
+    path = f"{STATUS_DIR}/{zid}.json"
+    st = read_json(path, {})
+    if st.get("state") != state:
+        st["since"] = time.time()
+    st.update(state=state, detail=detail)
+    write_json(path, st)
+
+
+def seen_at(zid):
+    try:
+        return os.path.getmtime(f"{SEEN_DIR}/{zid}")
+    except OSError:
+        return 0
+
+
+def mark_seen(zid):
+    path = f"{SEEN_DIR}/{zid}"
+    try:
+        os.utime(path)
+    except OSError:
+        open(path, "w").close()
+
+
+def migrate_home():
+    """zmux → zidev: move ~/.zmux to ~/.zidev once, leaving a symlink for old tools."""
+    old = os.path.expanduser("~/.zmux")
+    if os.environ.get("ZIDEV_HOME") or os.path.exists(HOME) or not os.path.isdir(old) or os.path.islink(old):
+        return
+    os.rename(old, HOME)
+    os.symlink(HOME, old)
+    with contextlib.suppress(OSError):
+        os.rename(f"{HOME}/zmux.log", LOG)
+
+
+def old_server_running():
+    """A tmux server from before the rename (socket "zmux") with the same sessions."""
+    return (SOCKET == "zidev" and subprocess.run(["tmux", "-L", "zmux", "has-session"],
+                                                  capture_output=True).returncode == 0)
+
+
+def setup_dirs():
+    for d in (HOME, STATUS_DIR, SEEN_DIR, ANCHOR):
+        os.makedirs(d, exist_ok=True)
+    hook = {"type": "command", "command": f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} hook",
+            "timeout": 5}
+    write_json(HOOK_SETTINGS, {"hooks": {e: [{"hooks": [hook]}] for e in HOOK_EVENTS}})
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%F %T')} {msg}\n")
+
+
+# ── tmux ───────────────────────────────────────────────────────────────────
+
+def tmux(*args):
+    """Run a tmux command on the zidev server; stdout, or None on failure."""
+    r = subprocess.run(["tmux", "-L", SOCKET, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def self_cmd(*args):
+    return "exec " + " ".join(shlex.quote(a) for a in (sys.executable, SELF, *args))
+
+
+def server_running():
+    return tmux("has-session", "-t", SESSION) is not None
+
+
+def session_windows():
+    """{zidev id: tmux window id} for every session window."""
+    out = tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{@zidev_id}") or ""
+    wins = {}
+    for line in out.splitlines():
+        wid, _, zid = line.partition(" ")
+        if zid:
+            wins[zid] = wid
+    return wins
+
+
+def add_sidebar(wid):
+    tmux("split-window", "-h", "-b", "-d", "-l", str(sidebar_width()), "-t", wid, self_cmd("sidebar"))
+
+
+def spawn_window(s, select=False):
+    out = tmux("new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-t", f"{SESSION}:",
+               "-c", s["cwd"], "-e", f"ZIDEV_ID={s['id']}", "-n", project_name(s["cwd"]),
+               self_cmd("run", s["id"]))
+    if not out:
+        return None
+    wid, claude = out.split()
+    tmux("set-option", "-w", "-t", wid, "@zidev_id", s["id"])
+    mark_tab(claude, s["cwd"], "claude", owner=s["id"])
+    add_sidebar(wid)
+    if select:
+        show_window(wid)
+    return wid
+
+
+# ── tabs ───────────────────────────────────────────────────────────────────
+# Arc-style: right of the sidebar one tab fills the window, never split. Each session window shows
+# its Claude or one of its project's tabs (terminal, commands, files, git): those belong to the
+# project, shared by its sessions, and are listed under the project in the sidebar. Tabs not shown
+# wait in the hidden PARK session and swap in when picked. A Claude only ever shows in its own
+# window. A clicked file opens as a floating preview over the tab; enter docks it as a tab.
+
+PARK = "zidev-park"
+TAB_KINDS = ("claude", "term", "cmds", "file", "git")
+TAB_FIELDS = {"pane": "pane_id", "session": "session_name", "window": "window_id", "owner": "@zidev_owner",
+              "project": "@zidev_project", "kind": "@zidev_side", "order": "@zidev_order", "used": "@zidev_used",
+              "label": "@zidev_label", "file": "@zidev_file", "float": "pane_floating_flag",
+              "cmd": "pane_current_command"}
+SHELLS = ("zsh", "bash", "fish", "sh", "-zsh", "-bash", "login")
+
+
+def tmux_all(*cmds):
+    """Several tmux commands in one call."""
+    args = []
+    for c in cmds:
+        args += [*c, ";"]
+    return tmux(*args[:-1]) if args else ""
+
+
+def all_tabs():
+    out = tmux("list-panes", "-a", "-F", "\t".join(f"#{{{f}}}" for f in TAB_FIELDS.values())) or ""
+    tabs = []
+    for line in out.splitlines():
+        t = dict(zip(TAB_FIELDS, line.split("\t")))
+        if t.get("kind") not in TAB_KINDS or not t.get("project"):
+            continue
+        for k in ("order", "used"):
+            t[k] = int(t[k]) if t[k].isdigit() else 0
+        t["float"] = t["float"] == "1"
+        t["visible"] = t["session"] == SESSION
+        tabs.append(t)
+    return sorted(tabs, key=lambda t: t["order"])
+
+
+def project_tabs(cwd, tabs=None):
+    """A project's docked tabs besides its Claudes."""
+    return [t for t in (all_tabs() if tabs is None else tabs)
+            if t["project"] == cwd and t["kind"] != "claude" and not t["float"]]
+
+
+def claude_tab(zid, tabs=None):
+    return next((t for t in (all_tabs() if tabs is None else tabs) if t["kind"] == "claude" and t["owner"] == zid), None)
+
+
+def shown_in(wid, tabs=None):
+    """The tab filling a session window."""
+    return next((t for t in (all_tabs() if tabs is None else tabs) if t["window"] == wid and not t["float"]), None)
+
+
+def floating_in(wid, tabs=None):
+    return next((t for t in (all_tabs() if tabs is None else tabs) if t["window"] == wid and t["float"]), None)
+
+
+def window_zid(wid, wins=None):
+    return next((z for z, w in (session_windows() if wins is None else wins).items() if w == wid), None)
+
+
+def last_session(cwd, tabs=None, wins=None):
+    """The project's session whose window was used last: where its tabs show by default."""
+    tabs, wins = all_tabs() if tabs is None else tabs, session_windows() if wins is None else wins
+    used = {}
+    for t in tabs:
+        z = window_zid(t["window"], wins) if t["visible"] else None
+        if z and t["project"] == cwd:
+            used[z] = max(used.get(z, 0), t["used"])
+    return max(used, key=used.get) if used else None
+
+
+def tab_label(kind, file=None):
+    return {"claude": "Claude", "term": "terminal", "cmds": "commands", "git": "changes"}.get(kind) \
+        or os.path.basename(file or "file")
+
+
+def tab_cmd(kind, cwd, file=None, line=None):
+    if kind == "file":
+        return self_cmd("view", file, str(line or ""))
+    return self_cmd(kind, cwd, *([file] if kind == "git" and file else []))  # changes: of one file
+
+
+def next_seq():
+    seq = int(tmux("show", "-gv", "@zidev_seq") or 0) + 1
+    tmux("set", "-g", "@zidev_seq", str(seq))
+    return seq
+
+
+def mark_tab(pane, cwd, kind, file=None, owner=None):
+    seq = str(next_seq())
+    opts = {"@zidev_project": cwd, "@zidev_side": kind, "@zidev_order": seq, "@zidev_used": seq,
+            "@zidev_label": tab_label(kind, file), "@zidev_file": file or ""}
+    if owner:
+        opts["@zidev_owner"] = owner
+    tmux_all(*(["set", "-p", "-t", pane, k, v] for k, v in opts.items()))
+
+
+def ensure_park():
+    if tmux("has-session", "-t", PARK) is None:
+        tmux("new-session", "-d", "-s", PARK, "-n", "_", "-x", "200", "-y", "50", "exec sleep 2147483647")
+
+
+def spawn_parked(cwd, kind, file=None, line=None):
+    ensure_park()
+    return tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", f"{PARK}:", "-c", cwd,
+                tab_cmd(kind, cwd, file, line))
+
+
+def file_tab(cwd, path):
+    """The project's docked tab of file path, if it has one (a file is open at most once)."""
+    return next((t for t in project_tabs(cwd) if t["kind"] == "file" and t["file"] == path), None)
+
+
+def reuse_file_tab(zid, cwd, path, line=None):
+    """Show the file's tab instead of opening it again (at line, when given); its pane, or None."""
+    t = file_tab(cwd, path)
+    if not t:
+        return None
+    if line:
+        tmux("respawn-pane", "-k", "-t", t["pane"], "-c", os.path.dirname(path), tab_cmd("file", cwd, path, line))
+    select_tab(t["pane"], zid)
+    return t["pane"]
+
+
+def new_tab(zid, kind, file=None, line=None):
+    """Open a project tab and show it in the window of session zid."""
+    s = session_of(zid)
+    if not s or zid not in session_windows():
+        return None
+    if kind == "file" and file_tab(s["cwd"], file):
+        return reuse_file_tab(zid, s["cwd"], file, line)
+    pane = spawn_parked(s["cwd"], kind, file, line)
+    if pane:
+        mark_tab(pane, s["cwd"], kind, file)
+        select_tab(pane, zid)
+    return pane
+
+
+def find_tab(pane, tabs=None):
+    return next((t for t in (all_tabs() if tabs is None else tabs) if t["pane"] == pane), None)
+
+
+def swap_in(t, shown):
+    """Put parked tab t where pane `shown` is (that one goes to the park)."""
+    tmux("swap-pane", "-d", "-s", t["pane"], "-t", shown)
+    if t["kind"] == "file" and is_markdown(t["file"]):  # glow renders at its start width: restart it
+        tmux("respawn-pane", "-k", "-t", t["pane"], "-c", os.path.dirname(t["file"]),
+             tab_cmd("file", t["project"], t["file"]))
+    elif t["kind"] == "git":  # the changes as they are now
+        tmux("respawn-pane", "-k", "-t", t["pane"], "-c", t["project"], tab_cmd("git", t["project"], t["file"]))
+
+
+def show_changes(t, file, zid, focus=True):
+    """The changes tab with the diff of one changed file ("": the first)."""
+    tmux("set", "-p", "-t", t["pane"], "@zidev_file", file)
+    if t["visible"]:
+        tmux("respawn-pane", "-k", "-t", t["pane"], "-c", t["project"], tab_cmd("git", t["project"], file))
+    return select_tab(t["pane"], zid, focus)  # a parked one is redrawn as it swaps in
+
+
+def fill_window(t, wid):
+    """An empty session window (its shown tab died): tab t fills it."""
+    width = int(tmux("display", "-p", "-t", wid, "#{window_width}") or 200)
+    tmux("join-pane", "-d", "-h", "-l", str(max(20, width - sidebar_width() - 1)), "-s", t["pane"],
+         "-t", f"{wid}.0")
+
+
+def vacate(t, wins, tabs):
+    """Take shown tab t out of its window: that window shows its Claude again."""
+    claude = claude_tab(window_zid(t["window"], wins), tabs)
+    if claude and not claude["visible"]:
+        swap_in(claude, t["pane"])
+    else:
+        ensure_park()
+        tmux("break-pane", "-d", "-s", t["pane"], "-t", f"{PARK}:")
+
+
+def select_tab(pane, zid=None, focus=True):
+    """Show a tab and focus it: a project tab in the window of session zid (default: where it is
+    shown, else the project's last used window), a Claude in its own window."""
+    tabs, wins = all_tabs(), session_windows()
+    t = find_tab(pane, tabs)
+    if not t:
+        return False
+    if t["kind"] == "claude":
+        zid = t["owner"]
+    elif t["float"] or (t["visible"] and not zid):
+        zid = window_zid(t["window"], wins)
+    zid = zid or last_session(t["project"], tabs, wins)
+    wid = wins.get(zid)
+    if not wid:
+        return False
+    if t["window"] != wid:
+        if t["visible"]:
+            vacate(t, wins, tabs)
+        shown = shown_in(wid, tabs)
+        if shown:
+            swap_in(t, shown["pane"])
+        else:
+            fill_window(t, wid)
+    tmux("set", "-p", "-t", pane, "@zidev_used", str(next_seq()))
+    if focus:
+        tmux_all(["select-window", "-t", wid], ["select-pane", "-t", pane])
+    settle(wid)
+    sync_tabs(t["project"])
+    return True
+
+
+def window_choices(zid, tabs=None):
+    """What session zid's window can show, in sidebar order: its Claude, then its project's tabs."""
+    tabs = all_tabs() if tabs is None else tabs
+    claude = claude_tab(zid, tabs)
+    return ([claude] if claude else []) + (project_tabs(claude["project"], tabs) if claude else [])
+
+
+def sidebar_hidden():
+    return tmux("show", "-gv", "@zidev_hidden") == "1"
+
+
+def split_of(zid):
+    """The terminal next to session zid's Claude (cmd-t), shown or parked: (pane, window) or (None, None)."""
+    out = tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@zidev_side}\t#{@zidev_owner}\t#{window_id}") or ""
+    return next(((p, w) for p, k, o, w in (l.split("\t") for l in out.splitlines()) if k == "split" and o == zid),
+                (None, None))
+
+
+def settle(wid=None):
+    """After the shown tab changed: Claude's side terminal is next to it only while Claude shows
+    (parked otherwise); a hidden sidebar (cmd-b) stays hidden. tmux unzooms on every swap or join,
+    so this runs after each. Not while a preview floats (it would be zoomed away)."""
+    wins = session_windows()
+    for zid, w in [(window_zid(wid, wins), wid)] if wid else wins.items():
+        if not zid:
+            continue
+        shown = shown_in(w)
+        pane, at = split_of(zid)
+        want = bool(shown and shown["kind"] == "claude"
+                    and tmux("show", "-pv", "-t", shown["pane"], "@zidev_split") == "1")
+        if want and not pane:  # its shell ended
+            tmux("set", "-p", "-t", shown["pane"], "@zidev_split", "0")
+            want = False
+        elif pane and at == w and not want:
+            ensure_park()
+            tmux("break-pane", "-d", "-s", pane, "-t", f"{PARK}:")
+        elif pane and at != w and want:
+            tmux("join-pane", "-d", "-h", "-l", "40%", "-s", pane, "-t", shown["pane"])
+        zoomed = tmux("display", "-p", "-t", w, "#{window_zoomed_flag}") == "1"
+        side = int(tmux("display", "-p", "-t", f"{w}.0", "#{pane_width}") or 0)
+        if sidebar_hidden() and not floating_in(w):
+            if want:  # zoom would hide the terminal too: the sidebar shrinks to a sliver instead
+                if zoomed:
+                    tmux("resize-pane", "-Z", "-t", f"{w}.1")
+                tmux("resize-pane", "-t", f"{w}.0", "-x", "1")
+            elif not zoomed:
+                tmux_all(["select-pane", "-t", f"{w}.1"], ["resize-pane", "-Z", "-t", f"{w}.1"])
+        else:
+            if zoomed:
+                tmux("resize-pane", "-Z", "-t", f"{w}.1")
+            if side < SIDEBAR_MIN:
+                tmux("resize-pane", "-t", f"{w}.0", "-x", str(sidebar_width()))
+        if want:  # 40 % of what is right of the sidebar, however the sidebar changed
+            room = tmux("display", "-p", "-t", f"{w}.0", "#{window_width} #{pane_width}")
+            if room:
+                win, bar = map(int, room.split())
+                tmux("resize-pane", "-t", split_of(zid)[0], "-x", str(max(10, (win - bar - 2) * 2 // 5)))
+
+
+def toggle_split(pane):
+    """cmd-t: a terminal next to the session's Claude, or away again (it keeps running, parked)."""
+    zid = zid_of_pane(pane)
+    wid, claude = session_windows().get(zid), claude_tab(zid)
+    if not wid or not claude:
+        return
+    on = tmux("show", "-pv", "-t", claude["pane"], "@zidev_split") == "1"
+    if (shown_in(wid) or {}).get("pane") != claude["pane"]:  # another tab shows: Claude with its terminal
+        on = False
+        select_tab(claude["pane"], zid)
+    tmux("set", "-p", "-t", claude["pane"], "@zidev_split", "0" if on else "1")
+    split, _ = split_of(zid)
+    if not on and not split:
+        split = tmux("split-window", "-d", "-h", "-l", "40%", "-t", claude["pane"], "-c", claude["project"],
+                     "-e", f"ZIDEV_ID={zid}", "-P", "-F", "#{pane_id}")
+        tmux_all(["set", "-p", "-t", split, "@zidev_side", "split"], ["set", "-p", "-t", split, "@zidev_owner", zid],
+                 ["set", "-p", "-t", split, "@zidev_project", claude["project"]])
+    settle(wid)
+    tmux("select-pane", "-t", claude["pane"] if on else split)
+
+
+def toggle_sidebar():
+    tmux("set", "-g", "@zidev_hidden", "0" if sidebar_hidden() else "1")
+    settle()
+
+
+def cycle_tab(pane, delta, items=False):
+    """The next / previous tab of the window; items: in sidebar order, Claude, terminals and files
+    only (cmd-↑ / cmd-↓), no wrap."""
+    zid = zid_of_pane(pane)
+    wid = session_windows().get(zid)
+    tabs = all_tabs()
+    choices, shown = window_choices(zid, tabs), shown_in(wid, tabs)
+    if items:
+        choices = [t for t in choices if t["kind"] in ("claude", "term", "file")]
+        i = next((n for n, t in enumerate(choices) if shown and t["pane"] == shown["pane"]), None)
+        j = 0 if i is None else i + delta
+        if 0 <= j < len(choices) and j != i:
+            select_tab(choices[j]["pane"], zid)
+        return
+    i = next((n for n, t in enumerate(choices) if shown and t["pane"] == shown["pane"]), 0)
+    if len(choices) > 1:
+        select_tab(choices[(i + delta) % len(choices)]["pane"], zid)
+
+
+def close_tab(pane):
+    """Close a tab (never a Claude); its window shows the tab used before it. A project's own
+    terminal and changes tab stay: they restart, parked."""
+    tabs, wins = all_tabs(), session_windows()
+    t = find_tab(pane, tabs)
+    if not t or t["kind"] == "claude":
+        return
+    keep = t["kind"] in ALWAYS and [x["pane"] for x in project_tabs(t["project"], tabs) if x["kind"] == t["kind"]] == [pane]
+    if t["visible"] and not t["float"]:
+        zid = window_zid(t["window"], wins)
+        rest = [x for x in window_choices(zid, tabs) if x["pane"] != pane and not x["visible"]]
+        if rest:
+            nxt = max(rest, key=lambda x: x["used"])
+            swap_in(nxt, pane)
+            tmux("set", "-p", "-t", nxt["pane"], "@zidev_used", str(next_seq()))
+            if tmux("display", "-p", "-t", pane, "#{pane_active}") == "1":
+                tmux("select-pane", "-t", nxt["pane"])
+    if keep:
+        sync_tabs(t["project"])
+        tmux_all(["set", "-p", "-t", pane, "@zidev_file", ""],  # last: may be this very process
+                 ["respawn-pane", "-k", "-t", pane, "-c", t["project"], tab_cmd(t["kind"], t["project"])])
+        return
+    tmux("kill-pane", "-t", pane)
+    settle(t["window"])
+    sync_tabs(t["project"])
+
+
+ALWAYS = ("term", "git")  # every project has a terminal and (in a git repo) a changes tab
+
+
+def ensure_project_tabs():
+    """Give each project its terminal and changes tab, parked, when it has none."""
+    tabs = all_tabs()
+    d = load_state()
+    for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
+        if not os.path.isdir(cwd) or cwd in d.get("archived", []):
+            continue
+        have = {t["kind"] for t in project_tabs(cwd, tabs)}
+        repo = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+        for kind in ALWAYS:
+            if kind not in have and (kind != "git" or repo):
+                pane = spawn_parked(cwd, kind)
+                if pane:
+                    mark_tab(pane, cwd, kind)
+        if not have.issuperset(ALWAYS):
+            sync_tabs(cwd)
+
+
+def show_kind(zid, kind):
+    """In session zid's window: its project's last used tab of a kind (terminal, commands, git), or a new one."""
+    cwd = session_of(zid).get("cwd")
+    same = [t for t in project_tabs(cwd) if t["kind"] == kind] if cwd else []
+    if same:
+        return select_tab(max(same, key=lambda t: t["used"])["pane"], zid)
+    new_tab(zid, kind)
+
+
+def preview(zid, path, line=None):
+    """Show a file in the window's floating preview (reused for the next file; enter docks it)."""
+    s, wid = session_of(zid), session_windows().get(zid)
+    if not s or not wid:
+        return
+    if file_tab(s["cwd"], path):  # already a tab: show that one
+        floating = floating_in(wid)
+        if floating:
+            tmux("kill-pane", "-t", floating["pane"])
+        reuse_file_tab(zid, s["cwd"], path, line)
+        return
+    cmd = tab_cmd("file", s["cwd"], path, line)
+    floating = floating_in(wid)
+    if floating:
+        tmux("respawn-pane", "-k", "-t", floating["pane"], "-c", s["cwd"], cmd)
+        tmux_all(["set", "-p", "-t", floating["pane"], "@zidev_file", path],
+                 ["set", "-p", "-t", floating["pane"], "@zidev_label", tab_label("file", path)],
+                 ["select-pane", "-t", floating["pane"]])
+        return
+    pane = float_pane(wid, s["cwd"], cmd)
+    if pane:
+        mark_tab(pane, s["cwd"], "file", path)
+
+
+def float_pane(wid, cwd, cmd):
+    """A floating pane over everything right of the sidebar (small margin); its id."""
+    geo = tmux("display", "-p", "-t", f"{wid}.1", "#{pane_left} #{window_width} #{window_height}")
+    if not geo:
+        return None
+    left, width, height = map(int, geo.split())
+    x, w = left + 2, max(20, width - left - 4)
+    return tmux("new-pane", "-P", "-F", "#{pane_id}", "-t", f"{wid}.1", "-x", str(w), "-y", str(max(8, height - 2)),
+                "-X", str(x), "-Y", "1", "-c", cwd, cmd)
+
+
+def pin_tab(pane):
+    """Dock the floating preview as a tab."""
+    t = find_tab(pane)
+    if not (t and t["float"]):
+        wid = tmux("display", "-p", "-t", pane, "#{window_id}")
+        t = floating_in(wid) if wid else None
+    if not t:
+        return
+    zid = window_zid(t["window"])
+    if t["kind"] == "file" and file_tab(t["project"], t["file"]):  # already docked: that tab, not a second
+        tmux("kill-pane", "-t", t["pane"])
+        reuse_file_tab(zid, t["project"], t["file"])
+        return
+    ensure_park()
+    tmux("break-pane", "-d", "-s", t["pane"], "-t", f"{PARK}:")
+    select_tab(t["pane"], zid)
+
+
+def repair_tabs():
+    """Session windows whose shown tab died: their Claude (else the tab used last) fills them.
+    A parked Claude whose session is gone: closed."""
+    tabs, wins = all_tabs(), session_windows()
+    for t in tabs:
+        if t["kind"] == "claude" and t["owner"] not in wins and not t["visible"]:
+            tmux("kill-pane", "-t", t["pane"])
+    for line in (tmux("list-panes", "-t", PARK, "-s", "-F", "#{pane_id}\t#{@zidev_side}\t#{@zidev_owner}") or "").splitlines():
+        p, kind, owner = line.split("\t")
+        if kind == "split" and owner not in wins:  # its session is gone
+            tmux("kill-pane", "-t", p)
+    for zid, wid in wins.items():
+        if shown_in(wid, tabs):
+            continue
+        parked = [t for t in window_choices(zid, tabs) if not t["visible"]]
+        if parked:
+            fill_window(parked[0] if parked[0]["kind"] == "claude" else max(parked, key=lambda t: t["used"]), wid)
+
+
+def sync_tabs(cwd, tabs=None):
+    """Save a project's tabs (restored after a restart). An archived one's stay as saved."""
+    if cwd in archived():
+        return
+    tabs, wins = all_tabs() if tabs is None else tabs, session_windows()
+    saved = [{"kind": t["kind"], "file": t["file"] or None,
+              "shown_in": window_zid(t["window"], wins) if t["visible"] else None} for t in project_tabs(cwd, tabs)]
+    with edit_state() as d:
+        d.setdefault("project_tabs", {})[cwd] = saved
+        for s in d["sessions"]:
+            if s["cwd"] == cwd:
+                for k in ("tabs", "term", "cmds"):
+                    s.pop(k, None)
+
+
+def saved_tabs(d, cwd):
+    """A project's tabs to restore; from before they were the project's: its sessions' tabs."""
+    if cwd in d.get("project_tabs", {}):
+        return d["project_tabs"][cwd]
+    old = []
+    for s in (s for s in d["sessions"] if s["cwd"] == cwd):
+        if "tabs" in s:
+            old += [{"kind": t["kind"], "file": t.get("file"), "shown_in": s["id"] if t.get("active") else None}
+                    for t in s["tabs"]]
+        old += [{"kind": k, "file": None, "shown_in": None} for k in ("term", "cmds") if s.get(k)]
+    return list({(t["kind"], t["file"]): t for t in reversed(old)}.values())[::-1]  # one of each
+
+
+def restore_tabs():
+    """After a start: every project's saved tabs, parked or shown where they were."""
+    d, tabs = load_state(), all_tabs()
+    for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
+        if project_tabs(cwd, tabs) or not os.path.isdir(cwd) or cwd in d.get("archived", []):
+            continue
+        shown = set()
+        for t in saved_tabs(d, cwd):
+            if t["kind"] not in TAB_KINDS[1:] or (t["kind"] == "file" and not os.path.isfile(t.get("file") or "")):
+                continue
+            pane = spawn_parked(cwd, t["kind"], t.get("file"))
+            if not pane:
+                continue
+            mark_tab(pane, cwd, t["kind"], t.get("file"))
+            if t.get("shown_in") and t["shown_in"] not in shown:
+                shown.add(t["shown_in"])
+                select_tab(pane, t["shown_in"], focus=False)
+        sync_tabs(cwd)
+
+
+def zid_of_pane(pane):
+    """The session a pane is about: its window's, a Claude's own; parked: ZIDEV_ID."""
+    out = tmux("display", "-p", "-t", pane, "#{@zidev_id}\t#{@zidev_owner}") if pane else None
+    zid, _, owner = (out or "").partition("\t")
+    return owner or zid or os.environ.get("ZIDEV_ID")
+
+
+def show_window(wid):
+    tmux("select-window", "-t", wid)
+    tmux("select-pane", "-t", f"{wid}.1")
+
+
+SKILL_DIR = os.environ.get("ZIDEV_SKILL_DIR") or os.path.expanduser("~/.claude/skills/zidev")
+SKILL = """---
+name: zidev
+description: What zidev is and how to work inside it. Use when running in a zidev session (env ZIDEV_ID is set), when the user mentions zidev, its sidebar, tabs, preview or changes tab, or asks to rename the project, show them a file, or open a new session.
+---
+
+# zidev
+
+zidev is the user's place for Claude Code sessions: a tmux server (socket `zidev`, `tmux -L zidev`) with a
+sidebar of projects on the left (Arc-style, no tab bar). Each project lists its Claude sessions with live status
+(working / needs you / finished) and its tabs: terminals, the changes tab, commands, files. The selected item fills
+the rest of the window. Sessions keep running when the terminal closes and come back after a reboot.
+
+You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your project is your session's folder.
+
+## What you can do for the user
+
+- Show a file: write `path:line` (e.g. `src/a.ts:42`) in your answer; a click opens a preview at that line.
+  Or open it yourself: `zidev open FILE[:LINE]` (preview), `zidev open FILE --tab` (a tab under the project).
+- Web links in your output open in the browser on a plain click.
+- Rename your project in the sidebar (the folder stays): `zidev rename-project "Name"`; `""` gives back the folder name.
+- A new session in another folder: `zidev new DIR`. Give it its task right away: `zidev new DIR --prompt "…"`
+  (Claude's first message, sent when the session starts).
+- Sessions and their status: `zidev list --json`.
+
+## Do not
+
+- `zidev kill` or `tmux -L zidev kill-server`: stops every session of the user (only when developing zidev, see below).
+- Change tmux options or key bindings of the `zidev` server.
+
+## Keys (so you can tell the user)
+
+Sidebar:
+{keys}
+
+Everywhere: cmd-b hide / show sidebar · cmd-↑ / cmd-↓ item above / below · cmd-t terminal next to Claude ·
+cmd-shift-t new terminal tab · cmd-w close tab · esc closes preview, viewer, changes, editor (no q) · ctrl-q menu.
+Preview: esc close, ⏎ keep as tab, e edit, l line numbers. Editor (micro): usual mac keys (cmd-x / c / v / f / a / s / z).
+
+## CLI
+{cli}
+
+## Developing zidev itself
+
+Source: `{source}` (one Python file). Decisions: `{intent}` (only the user's decisions; keep it updated).
+After each change: `zidev selftest` (throwaway server, never touches real sessions), then `zidev kill` and a new
+iTerm window with profile "zidev". This skill is written by zidev on start from the `SKILL` text in the source:
+change it there, not here.
+"""
+
+
+def install_skill():
+    """The agent skill about zidev (~/.claude/skills/zidev), rewritten on start when zidev changed."""
+    keys = "\n".join(f"- `{k}` {text}" for k, text in Sidebar.HELP if k)
+    cli = "\n".join(l for l in __doc__.splitlines() if l.startswith("  zidev"))
+    text = SKILL.replace("{keys}", keys).replace("{cli}", f"\n```\n{cli}\n```").replace("{source}", SELF) \
+        .replace("{intent}", os.path.join(HERE, "intent.md"))
+    path = f"{SKILL_DIR}/SKILL.md"
+    if not os.path.exists(path) or open(path).read() != text:
+        os.makedirs(SKILL_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+
+def ensure_server():
+    """Start the tmux server with every saved session, or fill in missing windows."""
+    setup_dirs()
+    install_skill()
+    fresh = not server_running()
+    if fresh:
+        home = subprocess.run(
+            ["tmux", "-L", SOCKET, "-f", TMUX_CONF, "new-session", "-d", "-P", "-F", "#{window_id}",
+             "-s", SESSION, "-n", "home", "-c", os.path.expanduser("~"), "-x", "200", "-y", "50",
+             self_cmd("welcome")],
+            capture_output=True, text=True, check=True).stdout.strip()
+        add_sidebar(home)
+    else:
+        tmux("source-file", TMUX_CONF)
+    install_tmux_hooks()
+    wins = session_windows()
+    d = load_state()
+    for s in d["sessions"]:
+        if s["id"] not in wins and os.path.isdir(s["cwd"]) and s["cwd"] not in d.get("archived", []):
+            wins[s["id"]] = spawn_window(s)
+    restore_tabs()
+    ensure_project_tabs()
+    if fresh:
+        last = load_state().get("last")
+        if last in wins:
+            show_window(wins[last])
+
+
+def sidebar_width():
+    with contextlib.suppress(TypeError, ValueError):
+        return max(SIDEBAR_MIN, int(read_json(CONFIG, {}).get("sidebar_w", SIDEBAR_W)))
+    return SIDEBAR_W
+
+
+def restart_claude(s, wid):
+    claude = (claude_tab(s["id"]) or {}).get("pane", f"{wid}.1")
+    tmux("respawn-pane", "-k", "-t", claude, "-c", s["cwd"], "-e", f"ZIDEV_ID={s['id']}",
+         self_cmd("run", s["id"]))
+    select_tab(claude)
+
+
+def new_session(cwd, select=True, prompt=None):
+    cwd = os.path.realpath(os.path.expanduser(cwd))
+    s = {"id": str(uuid.uuid4()), "cwd": cwd, "title": "", "created": time.time()}
+    if prompt:
+        s["prompt"] = prompt  # Claude's first message, sent once on its first start
+    if cwd in archived():  # a new session brings the project back
+        unarchive_project(cwd)
+    with edit_state() as d:
+        d["sessions"].append(s)
+        if cwd not in d["projects"]:
+            d["projects"].append(cwd)
+        if cwd in d["collapsed"]:
+            d["collapsed"].remove(cwd)
+    set_status(s["id"], "idle")
+    if server_running():
+        spawn_window(s, select)
+        ensure_project_tabs()
+    return s
+
+
+def close_session(zid):
+    with edit_state() as d:
+        d["sessions"] = [s for s in d["sessions"] if s["id"] != zid]
+    for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
+        with contextlib.suppress(OSError):
+            os.remove(path)
+    wid = session_windows().get(zid)
+    if wid:
+        tabs = all_tabs()
+        shown, claude = shown_in(wid, tabs), claude_tab(zid, tabs)
+        if shown and shown["kind"] != "claude":  # the project's tab outlives the session
+            ensure_park()
+            tmux("break-pane", "-d", "-s", shown["pane"], "-t", f"{PARK}:")
+        if claude and not claude["visible"]:
+            tmux("kill-pane", "-t", claude["pane"])
+        tmux("kill-window", "-t", wid)  # last: may be the caller's own window
+
+
+_names = (None, {})
+
+
+def project_name(cwd):
+    """The name given to the project (r on its row, zidev rename-project), else its folder's."""
+    global _names
+    try:
+        mtime = os.stat(STATE).st_mtime_ns
+    except OSError:
+        mtime = None
+    if _names[0] != mtime:  # the sidebar asks on every draw: read the file only when it changed
+        _names = (mtime, load_state().get("names", {}))
+    return _names[1].get(cwd) or os.path.basename(cwd.rstrip("/")) or cwd
+
+
+def rename_project(cwd, name):
+    """Give a project a display name; "" gives it back its folder's name."""
+    with edit_state() as d:
+        names = d.setdefault("names", {})
+        if name.strip():
+            names[cwd] = name.strip()
+        else:
+            names.pop(cwd, None)
+
+
+def cmd_rename_project(args):
+    """zidev rename-project [PATH] NAME: PATH defaults to this session's project (else the current folder)."""
+    if not args:
+        sys.exit("usage: zidev rename-project [PATH] NAME   (NAME \"\" gives back the folder's name)")
+    d = load_state()
+    if len(args) == 1:
+        own = next((s["cwd"] for s in d["sessions"] if s["id"] == os.environ.get("ZIDEV_ID")), None)
+        path, name = own or os.getcwd(), args[0]
+    else:
+        path, name = args[0], " ".join(args[1:])
+    cwd = os.path.realpath(path)
+    if cwd not in d["projects"] + [s["cwd"] for s in d["sessions"]]:
+        sys.exit(f"not a zidev project: {cwd}")
+    rename_project(cwd, name)
+    print(f"{cwd} → {project_name(cwd)}")
+
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+ITERM_PROFILES = os.path.expanduser("~/Library/Application Support/iTerm2/DynamicProfiles")
+
+
+def iterm_profile():
+    """An iTerm profile for zidev tabs: your default profile plus cmd-w / cmd-t sent to zidev
+    (the USER_KEYS sequences), running zidev itself. Written once; iTerm picks up changes by itself."""
+    keys = {"0x77-0x100000-0xd": USER_KEYS[0][0], "0x74-0x100000-0x11": USER_KEYS[1][0],  # cmd-w, cmd-t
+            "0x62-0x100000-0xb": USER_KEYS[2][0],  # cmd-b
+            "0xf700-0x300000-0x7e": USER_KEYS[3][0], "0xf701-0x300000-0x7d": USER_KEYS[4][0],  # cmd-↑, cmd-↓
+            "0x54-0x120000-0x11": USER_KEYS[5][0], "0x74-0x120000-0x11": USER_KEYS[5][0]}  # cmd-shift-t
+    for seq, key, _, _ in EDIT_KEYS:  # mac / WebStorm editing keys
+        keys.update({k: seq for k in iterm_keys(key)})
+    profile = {"Profiles": [{"Name": "zidev", "Guid": "zidev-profile", "Tags": ["zidev"],
+                             "Custom Command": "Yes", "Command": iterm_command(),
+                             "Keyboard Map": {k: {"Action": 10, "Text": seq[1:]} for k, seq in keys.items()}}]}
+    path = f"{ITERM_PROFILES}/zidev.json"
+    if read_json(path, None) != profile:
+        os.makedirs(ITERM_PROFILES, exist_ok=True)
+        with open(path, "w") as f:  # no temp file: iTerm would read that too
+            json.dump(profile, f, indent=2)
+
+def iterm_command(env=()):
+    """zidev in an interactive login shell (PATH as in your other tabs), as an iTerm command line."""
+    run = "exec " + " ".join(shlex.quote(a) for a in (sys.executable, SELF))
+    return " ".join([*(["/usr/bin/env", *map(shlex.quote, env)] if env else []), "/bin/zsh", "-lic", shlex.quote(run)])
+
+
+def iterm_open_tab():
+    """iTerm ignores the SetProfile escape, so zidev opens in a new tab that has the zidev profile."""
+    cmd = iterm_command([f"{k}={v}" for k, v in os.environ.items() if k.startswith("ZIDEV_")])
+    q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    me = os.environ.get("ITERM_SESSION_ID", "").partition(":")[2]  # the tab zidev was typed in
+    script = f'''tell application "iTerm2"
+  set target to current window
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if unique id of s is {q(me)} then set target to w
+      end repeat
+    end repeat
+  end repeat
+  tell target to create tab with profile "zidev" command {q(cmd)}
+end tell'''
+    return subprocess.run(["osascript", "-e", script], capture_output=True).returncode == 0
+
+
+def cmd_start():
+    if os.environ.get("TMUX", "").split(",")[0].endswith(f"/{SOCKET}"):
+        sys.exit("already inside zidev (ctrl-q switches between sidebar and session)")
+    ensure_server()
+    os.chdir(ANCHOR)
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+        iterm_profile()  # cmd-w / cmd-t only reach zidev in a tab with this profile
+        if os.environ.get("ITERM_PROFILE") != "zidev" and iterm_open_tab():
+            return print("zidev opened in a new tab (Profiles > zidev opens it directly)")
+    os.execvpe("tmux", ["tmux", "-L", SOCKET, "attach", "-t", SESSION], env)
+
+
+def archived():
+    return load_state().get("archived", [])
+
+
+def archive_project(cwd):
+    """Hide a project from the sidebar: its sessions and tabs stop (saved, back on unarchive)."""
+    sync_tabs(cwd)
+    with edit_state() as d:
+        if cwd not in d.setdefault("archived", []):
+            d["archived"].append(cwd)
+    if not server_running():
+        return
+    zids = {s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd}
+    wins = session_windows()
+    for t in all_tabs():
+        if t["project"] == cwd and not t["visible"]:
+            tmux("kill-pane", "-t", t["pane"])
+    mine = tmux("display", "-p", "#{window_id}") if os.environ.get("TMUX") else None
+    for wid in sorted((w for z, w in wins.items() if z in zids), key=lambda w: w == mine):
+        tmux("kill-window", "-t", wid)  # the caller's own window last
+
+
+def remove_project(cwd):
+    """A project out of the sidebar with its sessions and tabs: they stop (its folder stays)."""
+    zids = [s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd]
+    with edit_state() as d:
+        d["projects"] = [p for p in d["projects"] if p != cwd]
+        d["sessions"] = [s for s in d["sessions"] if s["cwd"] != cwd]
+        for key in ("project_tabs", "names"):
+            d.get(key, {}).pop(cwd, None)
+        d["changes_open"] = [c for c in d.get("changes_open", []) if c != cwd]
+    for zid in zids:
+        for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
+            with contextlib.suppress(OSError):
+                os.remove(path)
+    if not server_running():
+        return
+    wins = session_windows()
+    for t in all_tabs():
+        if t["project"] == cwd:
+            tmux("kill-pane", "-t", t["pane"])
+    mine = tmux("display", "-p", "#{window_id}") if os.environ.get("TMUX") else None
+    for wid in sorted((w for z, w in wins.items() if z in zids), key=lambda w: w == mine):
+        tmux("kill-window", "-t", wid)  # the caller's own window last
+
+
+def unarchive_project(cwd):
+    with edit_state() as d:
+        d["archived"] = [c for c in d.get("archived", []) if c != cwd]
+        if cwd not in d["projects"]:
+            d["projects"].append(cwd)
+    if server_running():
+        wins = session_windows()
+        for s in load_state()["sessions"]:
+            if s["cwd"] == cwd and s["id"] not in wins and os.path.isdir(cwd):
+                spawn_window(s)
+        restore_tabs()
+        ensure_project_tabs()
+
+
+def cmd_archive(args, on=True):
+    if not args:
+        sys.exit(f"usage: zidev {'' if on else 'un'}archive DIR")
+    cwd = os.path.realpath(os.path.expanduser(args[0]))
+    if on and cwd not in load_state()["projects"]:
+        sys.exit(f"not a zidev project: {cwd}")
+    if not on and cwd not in archived():
+        sys.exit(f"not archived: {cwd}")
+    (archive_project if on else unarchive_project)(cwd)
+    print(f"{'archived' if on else 'unarchived'} {project_name(cwd)}")
+
+
+def cmd_archived():
+    """The archived projects popup: type to search, ⏎ unarchives."""
+    rows = [f"{project_name(c)}\t\033[2m{c}\033[0m\t{c}" for c in archived()]
+    if not rows:
+        print("\n  \033[2mno archived projects (a on a project archives it)\033[0m")
+        time.sleep(1.5)
+        return
+    r = subprocess.run(["fzf", "--ansi", "--delimiter=\t", "--with-nth=1,2", "--layout=reverse",
+                        "--prompt=unarchive ❯ ", "--header=⏎ unarchive  esc cancel", "--info=inline-right"],
+                       input="\n".join(rows), stdout=subprocess.PIPE, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        unarchive_project(r.stdout.strip().split("\t")[-1])
+
+
+def cmd_new(args):
+    prompt = None
+    if "--prompt" in args:
+        i = args.index("--prompt")
+        if i + 1 >= len(args):
+            sys.exit("zidev new: --prompt needs a text")
+        prompt, args = args[i + 1], args[:i] + args[i + 2:]
+    s = new_session(args[0] if args else os.getcwd(), prompt=prompt)
+    print(f"new session in {s['cwd']}" + ("" if server_running() else " (starts with zidev)"))
+
+
+def cmd_list(args):
+    d = load_state()
+    if "--json" in args:
+        wins = session_windows()
+        out = [{**s, "project": project_name(s["cwd"]), "running": s["id"] in wins,
+                "status": read_status(s["id"])} for s in d["sessions"]]
+        return print(json.dumps(out, indent=2))
+    for cwd in d["projects"]:
+        print(project_name(cwd), cwd)
+        for s in d["sessions"]:
+            if s["cwd"] == cwd:
+                st = read_status(s["id"])
+                print(f"  {st.get('state', '?'):8} {title_of(s, st)}  [{s['id']}]")
+
+
+def cmd_kill():
+    tmux("kill-server")
+
+
+def cmd_reload():
+    """New code without a restart: re-read tmux.conf, respawn sidebars, welcome and commands panes.
+    Claude and terminal panes keep running (R in the sidebar restarts a Claude)."""
+    if not server_running():
+        sys.exit("zidev is not running")
+    tmux("source-file", TMUX_CONF)
+    install_tmux_hooks()
+    out = tmux("list-panes", "-s", "-t", SESSION, "-F",
+               "#{pane_id} #{pane_index} #{window_name} #{@zidev_id} #{@zidev_side}") or ""
+    n = 0
+    for line in out.splitlines():
+        pane, index, name, zid, side = (line.split(" ") + [""] * 5)[:5]
+        cmd = (self_cmd("sidebar") if index == "0" else
+               self_cmd("welcome") if name == "home" and not zid else
+               None)
+        if cmd:
+            tmux("respawn-pane", "-k", "-t", pane, cmd)
+            n += 1
+        cwd = session_of(zid).get("cwd")
+        if cwd and index == "1" and not side:  # Claude, from before it was a tab
+            mark_tab(pane, cwd, "claude", owner=zid)
+        elif side == "files" and cwd:  # from before tabs
+            mark_tab(pane, cwd, "cmds")
+    out = tmux("list-panes", "-a", "-F", "#{pane_id} #{@zidev_side} #{@zidev_owner} #{@zidev_project}") or ""
+    for pane, side, owner, project in (l.split(" ", 3) for l in out.splitlines() if l.count(" ") >= 3):
+        cwd = session_of(owner).get("cwd")
+        if side in TAB_KINDS and not project and cwd:  # from before tabs were the project's
+            tmux("set", "-p", "-t", pane, "@zidev_project", cwd)
+        if side in TAB_KINDS and side != "claude" and owner:
+            tmux("set", "-pu", "-t", pane, "@zidev_owner")
+    for t in all_tabs():
+        if t["kind"] == "cmds":
+            tmux("respawn-pane", "-k", "-t", t["pane"], "-c", t["project"], tab_cmd("cmds", t["project"]))
+            n += 1
+    for cwd in {t["project"] for t in all_tabs()}:
+        sync_tabs(cwd)
+    print(f"reloaded {n} panes; Claude sessions and terminals untouched")
+
+
+def cmd_logs(args):
+    if not os.path.exists(LOG):
+        return print("no errors logged")
+    os.execvp("tail", ["tail", "-n", "60", *(["-f"] if "-f" in args else []), LOG])
+
+
+def cmd_doctor():
+    ok = True
+
+    def check(good, what, fix=""):
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'\033[32m✓' if good else '\033[31m✗'}\033[0m {what}" + ("" if good or not fix else f"\n      → {fix}"))
+
+    print("tools")
+    for tool, fix, needed in (("tmux", "brew install tmux", True), (CLAUDE, "npm i -g @anthropic-ai/claude-code", True),
+                              ("fzf", "brew install fzf", False), ("fd", "brew install fd", False),
+                              ("bat", "brew install bat", False), ("glow", "brew install glow", False),
+                              ("delta", "brew install git-delta", False),
+                              ("micro", "brew install micro", False), ("rg", "brew install ripgrep", False)):
+        path = shutil.which(tool)
+        check(bool(path), f"{tool}" + ("" if needed else " (commands bar)") + (f"  {path}" if path else ""), fix)
+    v = subprocess.run(["tmux", "-V"], capture_output=True, text=True).stdout.split()
+    ver = v[1] if len(v) > 1 else "?"
+    check(ver >= "3.3", f"tmux {ver} (3.3+ for extended keys)", "brew upgrade tmux")
+    print("setup")
+    hooks = read_json(HOOK_SETTINGS, {}).get("hooks", {})
+    check(set(HOOK_EVENTS) <= set(hooks), f"hook settings {HOOK_SETTINGS}", "run zidev once to rewrite it")
+    check(os.access(SELF, os.X_OK), f"zidev executable {SELF}", f"chmod +x {SELF}")
+    on_path = shutil.which("zidev")
+    check(bool(on_path) and os.path.realpath(on_path) == os.path.realpath(SELF), "zidev on PATH",
+          f"ln -sf {SELF} ~/.local/bin/zidev")
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        check(True, f"state {STATE}: {len(d.get('sessions', []))} sessions")
+        for sess in d.get("sessions", []):
+            if not os.path.isdir(sess["cwd"]):
+                check(False, f"session folder missing: {sess['cwd']}", "close it in the sidebar (x)")
+    except FileNotFoundError:
+        check(True, "no sessions yet")
+    except ValueError as e:
+        check(False, f"state file unreadable: {e}", f"fix or move away {STATE}")
+    print("server")
+    running = server_running()
+    check(True, f"socket {SOCKET}: " + ("running" if running else "not running (zidev starts it)"))
+    if running:
+        wins = session_windows()
+        missing = [x for x in load_state()["sessions"] if x["id"] not in wins]
+        check(not missing, f"{len(wins)} session windows", "zidev start (restores missing windows)")
+    if os.path.exists(LOG) and os.path.getsize(LOG):
+        check(True, f"log {LOG} ({os.path.getsize(LOG)} bytes; zidev logs)")
+    sys.exit(0 if ok else 1)
+
+
+def claude_bin():
+    """claude from PATH, else its usual install places (a shell started without ~/.zshrc lacks them)."""
+    found = shutil.which(CLAUDE)
+    for p in (os.path.expanduser("~/.local/bin/claude"), os.path.expanduser("~/.claude/local/claude")):
+        if not found and os.access(p, os.X_OK):
+            found = p
+    return found or CLAUDE
+
+
+def cmd_run(zid):
+    """Pane process of a session: runs Claude, offers restart when it exits."""
+    os.environ["ZIDEV_ID"] = zid
+    while True:
+        s = next((s for s in load_state()["sessions"] if s["id"] == zid), None)
+        if not s:
+            return
+        with edit_state() as d:
+            d["last"] = zid
+        cid = read_status(zid).get("claude_id") or zid
+        # Claude saves a session only after its first message; an unused one can't be resumed
+        saved = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{cid}.jsonl"))
+        args = [claude_bin(), "--settings", HOOK_SETTINGS, "--resume" if saved else "--session-id", cid]
+        if s.get("prompt"):
+            if not saved:
+                args.append(s["prompt"])
+            with edit_state() as d:  # sent once: a restart must not repeat it
+                for x in d["sessions"]:
+                    if x["id"] == zid:
+                        x.pop("prompt", None)
+        try:
+            subprocess.call(args, cwd=s["cwd"])
+        except OSError as e:
+            print(f"\033[31mcan't start Claude: {e}\033[0m  (is `claude` on PATH? zidev doctor checks)")
+        set_status(zid, "exited")
+        print("\n\033[2mClaude exited.  \033[0m[enter] restart   [x] close session\n")
+        if read_key() in ("x", "X"):
+            close_session(zid)
+            return
+
+
+def cmd_term(zid):
+    """Pane process of a terminal tab: a login shell; when it exits the tab before it comes back."""
+    subprocess.call([os.environ.get("SHELL", "/bin/zsh"), "-l"])
+    leave_tab()
+
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's id of no files: the base before a first commit
+
+
+def changes(path=None):
+    """What changed in the working tree since the last commit, new files included, as one diff
+    (of one file: path)."""
+    git = lambda *a: subprocess.run(["git", *a], capture_output=True).stdout
+    base = "HEAD" if git("rev-parse", "-q", "--verify", "HEAD") else EMPTY_TREE
+    out = git("diff", base, "--", *([path] if path else []))
+    new = git("ls-files", "--others", "--exclude-standard", "-z", "--", *([path] if path else []))
+    for f in filter(None, new.split(b"\0")):
+        out += git("diff", "--no-index", "--", "/dev/null", f.decode())
+    return out
+
+
+_changed = {}
+
+
+def changed_path(cwd, path):
+    """The full path of a file git status lists (relative to the repository's top)."""
+    top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    return os.path.join(top or cwd, path)
+
+
+def changed_files(cwd):
+    """(status letter, path) of a project's changed files, listed under its changes tab; cached
+    a moment (the sidebar redraws often)."""
+    hit = _changed.get(cwd)
+    if hit and time.time() - hit[0] < 2:
+        return hit[1]
+    r = subprocess.run(["git", "-C", cwd, "status", "--porcelain=v1", "-z", "-uall"], capture_output=True, text=True)
+    parts, files = (r.stdout.split("\0") if r.returncode == 0 else []), []
+    while parts:
+        entry = parts.pop(0)
+        if len(entry) < 4:
+            continue
+        xy, path = entry[:2], entry[3:]
+        if xy[0] in "RC":  # the old name follows
+            parts = parts[1:]
+        files.append(("?" if xy == "??" else xy[1] if xy[1] != " " else xy[0], path))
+    _changed[cwd] = (time.time(), files[:200])
+    return files[:200]
+
+
+def cmd_git(where, file=""):
+    """Pane process of the changes tab: the diff of one changed file (delta, n / N next / previous
+    change), the one picked under it in the sidebar, else the first; scrolling never runs on into
+    another file. esc closes the tab. It is redrawn each time it is shown."""
+    if subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True).returncode:
+        diff, msg = b"", "not a git repository"
+    else:
+        files = [f for _, f in changed_files(os.getcwd())]
+        file = file if file in files else files[0] if files else ""
+        if os.environ.get("TMUX_PANE"):  # the sidebar marks the file shown
+            tmux("set", "-p", "-t", os.environ["TMUX_PANE"], "@zidev_file", file)
+        diff = changes(file or None)
+        msg = "" if diff else f"no changes in {file}" if file else "no changes since the last commit"
+    if diff:
+        numbers, top, rows, origin = False, None, [], []
+
+        def page():  # delta at the pane's width; our less keeps delta's n / N between files and hunks
+            width = columns()
+            shown = subprocess.run(["delta", "--dark", f"--syntax-theme={THEME['bat']}", "--paging=never",
+                                    "--navigate", *(["--line-numbers"] if numbers else []), f"--width={width}",
+                                    "--hunk-header-decoration-style=none"],
+                                   input=diff, capture_output=True).stdout.decode(errors="replace")
+            rows[:], origin[:] = [], []  # screen rows, and the diff line each one comes from
+            for i, l in enumerate(shown.split("\n")):
+                for r in wrap_ansi(l, width).split("\n"):
+                    rows.append(r)
+                    origin.append(i)
+            at = [f"+{origin.index(top) + 1}g", "-j1"] if top is not None and top in origin else \
+                ["-p", "^(commit|added:|copied:|Δ|removed:|renamed:|•)"]
+            prompt = re.sub(r"([%?:.\\])", r"\\\1", f"{file}   esc close  ⏎ open file  n / N next / previous change  l lines  /search")
+            return pager("\n".join(rows).encode(), ["-X", *at, f"-Ps{prompt}"],
+                         {**os.environ, "LESSKEY_CONTENT": LESSKEYS + "#command\nl quit l\n\\n quit o\n"})
+        while (status := until_resized(page)) in (108, 111):
+            top = origin[top_line(rows) - 1]  # staying where you are
+            if status == 108:  # l: line numbers on / off
+                numbers = not numbers
+                continue
+            path, zid = changed_path(os.getcwd(), file), zid_of_pane(os.environ.get("TMUX_PANE"))
+            if zid and os.path.isfile(path):  # ⏎: the file itself, as a tab
+                new_tab(zid, "file", file=path)
+    else:
+        print(f"\n  \033[2m{msg}\n\n  esc closes\033[0m")
+        with contextlib.suppress(Exception):
+            import termios
+            import tty
+            fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno())
+            try:
+                tty.setcbreak(fd)
+                while sys.stdin.read(1) not in ("\x1b", ""):
+                    pass
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    leave_tab()
+
+
+MICRO_HOME = f"{HOME}/micro"
+MICRO_SETTINGS = {"colorscheme": THEME["micro"], "tabsize": 2, "tabstospaces": True, "mkparents": True,
+                  "diffgutter": True, "savecursor": True, "scrollbar": True, "clipboard": "external",
+                  "ruler": False}
+# ctrl-q belongs to tmux (pane switching), so esc / ctrl-w leave the editor (asking "save? y / n" when
+# changed); alt-l shows line numbers
+MICRO_BINDINGS = {"Esc": "lua:zidev.leave", "CtrlW": "lua:zidev.leave", "Alt-l": "ToggleRuler",
+                  # what EDIT_KEYS send for WebStorm's keys
+                  "Alt-b": "WordLeft", "Alt-f": "WordRight", "Alt-B": "SelectWordLeft",
+                  "Alt-F": "SelectWordRight", "Home": "StartOfTextToggle", "End": "EndOfLine",
+                  "Alt-A": "SelectToStartOfTextToggle", "Alt-E": "SelectToEndOfLine",
+                  "AltBackspace": "DeleteWordLeft", "Alt-k": "DeleteLine", "CtrlD": "DuplicateLine",
+                  "Alt-K": "MoveLinesUp", "Alt-J": "MoveLinesDown", "Alt-/": "lua:comment.comment",
+                  "Alt-g": "command-edit:goto ", "Alt-r": "command-edit:replace ",
+                  "Alt-n": "FindNext", "Alt-p": "FindPrevious"}
+# micro's own svelte syntax colors nothing (its rules inside <script> regions do not apply):
+# typescript over the whole file, plus tags and {#if} / {/each} blocks
+MICRO_SVELTE = r"""filetype: svelte
+
+detect:
+    filename: "\\.svelte$"
+
+rules:
+    - include: "typescript"
+    - symbol.tag: "</?[A-Za-z][A-Za-z0-9:._-]*|/?>"
+    - statement: "\\{[#:/@](if|else if|else|each|await|then|catch|key|snippet|html|const|debug|render)\\b|\\{/(if|each|await|key|snippet)\\}"
+"""
+
+MICRO_PLUGIN = """VERSION = "1.0.0"
+local micro = import("micro")
+
+function leave(bp)
+    if not bp.Buf:Modified() then
+        bp:Quit()
+        return true
+    end
+    micro.InfoBar():YNPrompt("save? y / n", function(yes, canceled)
+        if canceled then return end
+        if yes then bp:Save() end
+        bp:ForceQuit()
+    end)
+    return true
+end
+"""
+SKIP_DIRS = [".git", "__pycache__", "node_modules", "dist", "build", ".next", ".svelte-kit", "vendor", "coverage", "tmp"]
+
+
+def is_markdown(path):
+    return path.lower().endswith((".md", ".markdown", ".mdx"))
+
+
+def is_html(path):
+    return path.lower().endswith((".html", ".htm"))
+
+
+IMAGES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tiff", ".heic", ".avif")
+
+
+def is_binary(path):
+    """Images and binary files (movies, pdfs, archives…): opened in their default app, not previewed."""
+    if path.lower().endswith(IMAGES):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return b"\0" in f.read(8192)
+    except OSError:
+        return False
+
+
+SERVERS = f"{HOME}/servers.json"
+OPENER = os.environ.get("ZIDEV_OPENER", "open")  # macOS default app / browser; override for tests
+
+
+def open_default(target):
+    subprocess.call([OPENER, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def show_file(zid, pane, path, line=None):
+    """A clicked or opened file: binary → default app, html → ask, else the floating preview."""
+    if is_binary(path):
+        open_default(path)
+    elif is_html(path):
+        ask_html(zid, pane, path, line)
+    else:
+        preview(zid, path, line)
+
+
+def port_open(port):
+    import socket
+    with socket.socket() as so:
+        so.settimeout(0.2)
+        return so.connect_ex(("127.0.0.1", port)) == 0
+
+
+def serve(path):
+    """URL of an html file on a local http server for its folder (started once, then reused)."""
+    import socket
+    import urllib.parse
+    folder = os.path.dirname(path)
+    try:
+        servers = json.load(open(SERVERS))
+    except (OSError, ValueError):
+        servers = {}
+    port = servers.get(folder)
+    if not (port and port_open(port)):
+        with socket.socket() as so:
+            so.bind(("127.0.0.1", 0))
+            port = so.getsockname()[1]
+        subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
+                          "--directory", folder], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(50):
+            if port_open(port):
+                break
+            time.sleep(0.05)
+        servers[folder] = port
+        with open(SERVERS, "w") as f:
+            json.dump(servers, f)
+    return f"http://127.0.0.1:{port}/" + urllib.parse.quote(os.path.basename(path))
+
+
+def ask_html(zid, pane, path, line=None):
+    """An html file: ask whether to open it in the browser (served locally) or preview it here."""
+    me = self_cmd("html", zid, path, line or "-").removeprefix("exec ")
+    title = f"#[align=centre] {os.path.basename(path)} "
+    subprocess.Popen(["tmux", "-L", SOCKET, "display-menu", "-M", "-O", "-t", pane, "-x", "C", "-y", "C", "-T", title,
+                      "Open in browser", "b", f'run-shell -b "{me} browser"',
+                      "Preview here", "p", f'run-shell -b "{me} preview"'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)  # waits for a pick
+
+
+def cmd_html(zid, path, line, choice):
+    if choice == "browser":
+        open_default(serve(path))
+    else:
+        preview(zid, path, None if line in ("", "-") else line)
+
+
+def cmd_cmds(where):
+    """Pane process of the commands bar: one fuzzy list of package scripts, make targets and files.
+    ⏎ runs a script in the terminal pane, opens markdown in the viewer, other files in micro;
+    `>cmd` runs any shell command."""
+    env = micro_env()
+    fzf = ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--border=none",
+           "--info=inline-right", "--prompt=❯ ", "--print-query", "--expect=ctrl-e,ctrl-v,ctrl-g",
+           "--header=⏎ run / open  ^e edit  ^v view  ^g grep  >cmd shell  esc close\n"
+                     "new name + ⏎ creates a file",
+           "--preview", self_cmd("preview") + " {1} {3} {4}",
+           "--preview-window=right,55%,border-left,<110(down,50%,border-top)",
+           "--bind=enter:accept-or-print-query", "--bind=ctrl-d:preview-half-page-down",
+           "--bind=ctrl-u:preview-half-page-up"]
+    lister = ["fd", "--type=f", "--hidden", "--follow", *(f"--exclude={d}" for d in SKIP_DIRS)]
+    cwd = where if os.path.isdir(where) else session_of(where).get("cwd") or os.getcwd()
+    while True:
+        info = project_info(load_state(), cwd)
+        found = subprocess.run(lister, capture_output=True, text=True).stdout.splitlines()
+        recent = [f for f in info["recent"] if os.path.isfile(f)]
+        runs = project_commands(found)
+        done = info["recent_cmds"]
+        runs.sort(key=lambda r: done.index(r[2]) if r[2] in done else len(done))  # last run first
+        rows = [f"run\t\033[32m▶\033[0m {label}  \033[2m{hint}\033[0m\t{d}\t{cmd}" for label, hint, cmd, d in runs]
+        rows += [f"file\t{f}\t{f}\t" for f in recent + [f for f in found if f not in recent]]
+        r = subprocess.run(fzf, input="\n".join(rows), stdout=subprocess.PIPE, text=True, env=env)
+        if r.returncode not in (0, 1):  # esc / ctrl-c
+            break
+        lines = r.stdout.split("\n")
+        query, key = lines[0], lines[1] if len(lines) > 1 else ""
+        picked = lines[2].split("\t") if len(lines) > 2 and lines[2] else None
+        if key == "ctrl-g":
+            path, line = grep(query, env)
+            if path:
+                add_recent(cwd, path)
+                subprocess.call(["micro", f"+{line}", path], env=env)
+            continue
+        if picked and picked[0] == "run":
+            run_in_term(cwd, picked[3], picked[2])
+            continue
+        if not picked and query.strip().startswith(">"):
+            if query.strip()[1:].strip():
+                run_in_term(cwd, query.strip()[1:].strip(), ".")
+            continue
+        path = picked[2] if picked else query.strip()
+        if not path:
+            continue
+        add_recent(cwd, path)
+        if key == "ctrl-v" or (key != "ctrl-e" and is_markdown(path) and os.path.exists(path)):
+            page_file(path, env=env)
+        else:
+            subprocess.call(["micro", path], env=env)
+    leave_tab()
+
+
+def package_manager(d):
+    """pnpm / yarn / bun / npm for a package folder, from the lockfile or packageManager nearest to it."""
+    d = os.path.abspath(d)
+    while True:
+        for lock, pm in (("pnpm-lock.yaml", "pnpm"), ("pnpm-workspace.yaml", "pnpm"), ("yarn.lock", "yarn"),
+                         ("bun.lock", "bun"), ("bun.lockb", "bun"), ("package-lock.json", "npm")):
+            if os.path.exists(f"{d}/{lock}"):
+                return pm
+        pm = str(read_json(f"{d}/package.json", {}).get("packageManager", "")).partition("@")[0]
+        if pm:
+            return pm
+        up = os.path.dirname(d)
+        if up == d or d == os.path.expanduser("~"):
+            return "pnpm"
+        d = up
+
+
+def workspace_globs(d):
+    """Workspace member globs of the package in folder d (package.json workspaces, pnpm-workspace.yaml)."""
+    ws = read_json(f"{d}/package.json", {}).get("workspaces") or []
+    globs = list(ws.get("packages", []) if isinstance(ws, dict) else ws)
+    with contextlib.suppress(OSError):
+        m = re.search(r"^packages:\s*\n((?:[ \t]+.*\n?|\s*\n)*)", open(f"{d}/pnpm-workspace.yaml").read(), re.M)
+        globs += re.findall(r"^\s*-\s*['\"]?([^'\"#\n]+?)['\"]?\s*$", m[1] if m else "", re.M)
+    return [g for g in globs if isinstance(g, str) and not g.startswith("!")]
+
+
+def project_packages(files):
+    """The project's own package.json files: the top two levels and their workspace members,
+    not every vendored or fixture package somewhere below."""
+    own = [f for f in files if os.path.basename(f) == "package.json" and f.count("/") <= 1]
+    members = set()
+    for f in own:
+        d = os.path.dirname(f) or "."
+        for g in workspace_globs(d):
+            members.update(os.path.normpath(p) for p in glob.glob(f"{d}/{g.rstrip('/')}/package.json"))
+    keep = set(own) | {f for f in files if os.path.normpath(f) in members}
+    return sorted(keep, key=lambda f: (f.count("/"), f))
+
+
+def project_commands(files):
+    """(label, hint, command, folder) for the package.json scripts and Makefile targets in the project."""
+    runs = []
+    for f in project_packages(files):
+        d = os.path.dirname(f) or "."
+        pm = package_manager(d)
+        where = "" if d == "." else f"{d}: "
+        run = "" if pm in ("pnpm", "yarn") else " run"
+        for name, script in (read_json(f, {}).get("scripts") or {}).items():
+            runs.append((f"{where}{name}", str(script), f"{pm}{run} {name}", d))
+        runs.append((f"{where}install", f"{pm} install", f"{pm} install", d))
+    for f in (f for f in files if os.path.basename(f) in ("Makefile", "makefile") and f.count("/") <= 1):
+        d = os.path.dirname(f) or "."
+        where = "" if d == "." else f"{d}: "
+        with contextlib.suppress(OSError):
+            for m in re.finditer(r"^([A-Za-z0-9][\w.-]*):(?!=)", open(f).read(), re.M):
+                runs.append((f"{where}make {m[1]}", "Makefile", f"make {m[1]}", d))
+    return runs
+
+
+def run_in_term(cwd, cmd, folder):
+    """Type a command into an idle terminal tab of the project (all busy: a new one) and show it
+    in this window."""
+    remember(cwd, "recent_cmds", cmd, 20)
+    zid = zid_of_pane(os.environ.get("TMUX_PANE"))
+    zid = zid if session_of(zid).get("cwd") == cwd else last_session(cwd)
+    terms = [t for t in project_tabs(cwd) if t["kind"] == "term"]
+    idle = next((t for t in sorted(terms, key=lambda t: not t["visible"]) if t["cmd"] in SHELLS), None)
+    if idle:
+        pane = idle["pane"]
+        select_tab(pane, zid)
+    else:
+        pane = new_tab(zid, "term")
+    if not pane:
+        return
+    full = cmd if folder in (".", "") else f"(cd {shlex.quote(folder)} && {cmd})"
+    tmux("send-keys", "-t", pane, "-l", full)
+    tmux("send-keys", "-t", pane, "Enter")
+    tmux("select-pane", "-t", pane)
+
+
+def micro_env():
+    os.makedirs(MICRO_HOME, exist_ok=True)
+    for name, conf in (("settings.json", MICRO_SETTINGS), ("bindings.json", MICRO_BINDINGS)):
+        if not os.path.exists(f"{MICRO_HOME}/{name}"):
+            write_json(f"{MICRO_HOME}/{name}", conf)
+    # the tool's scheme, no line numbers and its keys, also over older files
+    for name, ours in (("settings.json", {"colorscheme": THEME["micro"], "ruler": False}),
+                       ("bindings.json", MICRO_BINDINGS)):
+        conf = read_json(f"{MICRO_HOME}/{name}", {})
+        if any(conf.get(k) != v for k, v in ours.items()):
+            write_json(f"{MICRO_HOME}/{name}", {**conf, **ours})
+    for path, text in ((f"{MICRO_HOME}/plug/zidev/zidev.lua", MICRO_PLUGIN),
+                       (f"{MICRO_HOME}/syntax/svelte.yaml", MICRO_SVELTE)):
+        if not os.path.exists(path) or open(path).read() != text:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+    return {**os.environ, "MICRO_CONFIG_HOME": MICRO_HOME, "EDITOR": "micro", "VISUAL": "micro",
+            "GLOW_STYLE": THEME["glow"]}
+
+
+def leave_tab():
+    """End of a tab's process: the tab used before it takes its place."""
+    pane = os.environ.get("TMUX_PANE")
+    if pane and find_tab(pane):
+        close_tab(pane)
+
+
+def cmd_view(path, line=""):
+    """Pane process of a file tab / preview: markdown rendered (glow), code highlighted (bat + less);
+    e edits (micro), esc closes."""
+    page_file(path, line, micro_env())
+    leave_tab()
+
+
+# less everywhere: esc (sent as ^] by tmux) closes, q does nothing; in a file e quits with status 101 to edit it
+LESSKEYS = "#command\n^] quit\nq noaction\nQ noaction\nZZ noaction\n#line-edit\n^] abort\n"
+
+
+def page_file(path, line=None, env=None):
+    """A file in less until esc: markdown rendered (glow), code highlighted (bat) with the branch's changes;
+    e edits it (micro, at the line) and shows it again, l shows / hides line numbers where you are."""
+    if os.path.isdir(path):  # a folder: its tree, two levels
+        tree = subprocess.run(["eza", "--tree", "-L", "2", "--color=always", "--group-directories-first",
+                               "--git-ignore", path], capture_output=True) if shutil.which("eza") else None
+        listing = tree.stdout if tree and tree.returncode == 0 else \
+            subprocess.run(["ls", "-la", "-G", path], capture_output=True, env={**os.environ, "CLICOLOR_FORCE": "1"}).stdout
+        env = {**(env or micro_env()), "LESSKEY_CONTENT": LESSKEYS}
+        until_resized(lambda: pager(listing, ["-X", "-Ps" + view_prompt(path, "esc close  /search")], env))
+        return
+    md = is_markdown(path)
+    env = {**(env or micro_env()), "LESSKEY_CONTENT": LESSKEYS + "#command\ne quit e\n" + ("" if md else "l quit l\n")}
+    prompt = "-Ps" + view_prompt(path, "esc close  e edit  " + ("" if md else "l lines  ") + "/search")
+    numbers, top, text, origin = False, None, [], []  # origin: the file line of each screen row
+
+    def page():
+        if md:
+            text[:] = [subprocess.run(["glow", "-s", THEME["glow"], "-w", str(max(20, columns() - 4)), path],
+                                      capture_output=True, env=env).stdout.decode(errors="replace")]
+            return pager(text[0].encode(), ["-X", prompt], env)
+        shown, origin[:] = render_file(path, line, numbers)
+        text[:] = shown.split("\n")
+        row = lambda n: origin.index(n) + 1 if n in origin else 1  # a long line takes several rows
+        at = [f"+{row(top)}g", "-j1"] if top else ["-j.3", f"+{row(int(line))}g"] if line else []
+        if len(text) < shutil.get_terminal_size().lines:  # all of it fits: from its first line, never moved
+            at = []
+        return pager("\n".join(text).encode(), ["-X", prompt, *at], env)
+    while True:
+        status = until_resized(page)
+        if status == 108:  # l
+            top, numbers = origin[top_line(text) - 1], not numbers
+            continue
+        if status != 101:
+            return
+        if not md:  # the editor opens where you are; the viewer comes back there
+            top = origin[top_line(text) - 1]
+        subprocess.call(["micro", f"+{top or line or 1}", path], env=env)
+
+
+def top_line(lines):
+    """The number of the first of lines that less (-X) left on the screen when it quit; 1 if unsure."""
+    width = columns()
+    rows = subprocess.run(["tmux", "-L", SOCKET, "capture-pane", "-p", "-t", os.environ.get("TMUX_PANE", "")],
+                          capture_output=True, text=True).stdout.split("\n")[:-2]  # not the prompt row
+    plain = [ANSI.sub("", l).rstrip() for l in lines]
+
+    screen, start = [], []  # the rows less shows, folded at the width, and the line each one starts
+    for i, l in enumerate(plain):
+        cols = columns_to_index(l)
+        for a in range(0, max(1, len(cols)), width):
+            screen.append(l[cols[a]:cols[min(a + width, len(cols)) - 1] + 1].rstrip() if cols else "")
+            start.append(i + 1 if a == 0 else None)
+    for skip in range(3):  # the top row may be the end of a folded line
+        want = [r.rstrip() for r in rows[skip:skip + 6] if r.strip() != "~"]
+        if not "".join(want).strip():
+            continue
+        for k in range(len(screen)):
+            if start[k] and screen[k:k + len(want)] == want:
+                return start[k]
+    return 1
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def wrap_ansi(line, width, hang=None):
+    """A colored line folded at width (delta does not wrap): continuation rows keep the colors and
+    sit right of the line-number gutter (" 85 ⋮ 86 │"); with hang, they start that many columns in
+    (code: under its own indentation, a bit further)."""
+    line = re.sub(r"\033\[[0-9;]*[A-Za-ln-z]", "", line)  # only colors: less -R shows nothing else
+    plain = ANSI.sub("", line)
+    if len(columns_to_index(plain)) <= width:
+        return line
+    bar = plain.find("│")
+    indent = hang if hang is not None else bar + 1 if 0 <= bar < 16 else 0
+    rows, row, used, state = [], "", 0, ""
+    for seq, ch in re.findall(r"(\033\[[0-9;]*m)|(.)", line, re.S):
+        if seq:
+            row += seq
+            state = "" if seq in ("\033[0m", "\033[m") else state + seq
+            continue
+        w = 2 if len(columns_to_index(ch)) == 2 else 1
+        if used + w > width:
+            rows.append(row + "\033[0m")
+            row = state + " " * indent if hang is not None else \
+                " " * (indent - 1) + "\033[2m│\033[0m" + state if indent else state
+            used = indent
+        row += ch
+        used += w
+    rows.append(row + " " * max(0, width - used) + "\033[0m" if state else row)
+    return "\n".join(rows)
+
+
+def columns():
+    try:
+        return os.get_terminal_size(sys.__stdout__.fileno()).columns
+    except OSError:
+        return 80
+
+
+def pager(text, args, env=None):
+    """less -R showing text (bytes); its Popen, still running. Calm: painted from the top (-c), no ~ rows,
+    a gray prompt line."""
+    less = subprocess.Popen(["less", "-R", "-c", "--tilde", "--use-color", "--color=PK-", *args],
+                            stdin=subprocess.PIPE, env=env)
+    with contextlib.suppress(BrokenPipeError):
+        less.stdin.write(text)
+        less.stdin.close()
+    return less
+
+
+def until_resized(start):
+    """Run start() (a Popen drawn at the pane's width) until it ends; when the pane's width changes
+    (the tab moved, the window resized), draw it again at the new width. Its exit status."""
+    resized = []
+    old = signal.signal(signal.SIGWINCH, lambda *_: resized.append(1))
+    try:
+        while True:
+            width, proc = columns(), start()
+            while proc.poll() is None:
+                if resized:
+                    resized.clear()
+                    if columns() != width:
+                        proc.terminate()
+                        proc.wait()
+                        break
+                time.sleep(0.05)
+            else:
+                return proc.returncode
+    finally:
+        signal.signal(signal.SIGWINCH, old)
+
+
+def branch_base(cwd):
+    """(commit, name) the branch started from: merge-base with origin's default branch (else main/master).
+    On that branch itself: HEAD, so only uncommitted changes show."""
+    git = lambda *a: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True).stdout.strip()
+    names = [git("symbolic-ref", "--short", "refs/remotes/origin/HEAD"), "origin/main", "origin/master", "main", "master"]
+    for name in filter(None, names):
+        base = git("merge-base", "HEAD", name)
+        if base:
+            return base, name.removeprefix("origin/")
+    return (git("rev-parse", "--verify", "-q", "HEAD") or None), "HEAD"
+
+
+def branch_marks(path):
+    """{line: "added" | "changed" | "deleted"} of a file's changes on this branch (commits and uncommitted),
+    and the branch's base name; ({}, None) outside git."""
+    cwd = os.path.dirname(path)
+    git = lambda *a: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+    if git("rev-parse", "--git-dir").returncode:
+        return {}, None
+    base, name = branch_base(cwd)
+    if git("ls-files", "--error-unmatch", path).returncode or not base:  # new on this branch
+        with open(path, errors="replace") as f:
+            return {n: "added" for n in range(1, sum(1 for _ in f) + 1)}, name
+    marks = {}
+    diff = git("diff", "-U0", "--no-color", "--no-ext-diff", base, "--", path).stdout
+    for old, start, count in re.findall(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", diff, re.M):
+        old, start, count = int(old or 1), int(start), int(count or 1)
+        if count == 0:
+            marks.setdefault(max(start, 1), "deleted")
+        for n in range(start, start + count):
+            marks[n] = "changed" if old else "added"
+    return marks, name
+
+
+def render_file(path, line=None, numbers=False):
+    """A code file for less: line numbers (when asked), branch-change marks (like an editor gutter) and
+    the highlighted code; a long line folds under its own indentation, right of the gutter.
+    The text and the file line of each of its rows."""
+    width = columns()
+    marks, base = branch_marks(path)
+    digits = len(str(sum(1 for _ in open(path, "rb")))) + 1 if numbers else 0
+    room = max(10, width - 3 - digits)  # code columns right of the gutter, one spare
+    code = subprocess.run(["bat", "--color=always", "--paging=never", "--style=plain", "--wrap=never", "--tabs=4",
+                           f"--terminal-width={room}",
+                           *([f"--highlight-line={line}"] if line else []), path],
+                          capture_output=True, text=True, errors="replace").stdout.split("\n")
+    if code and code[-1] == "":
+        code.pop()
+    color = {"added": "\033[32m▎", "changed": "\033[33m▎", "deleted": "\033[31m▁"}
+    out, origin = [], []
+    tint, ansi = "\033[48;2;24;48;32m", re.compile(r"\033\[[0-9;]*m")
+    for n, text in enumerate(code, 1):
+        if marks.get(n) in ("added", "changed") and str(n) != str(line):  # the clicked line keeps bat's highlight
+            pad = room - len(columns_to_index(ansi.sub("", text)))
+            text = tint + text.replace("\033[0m", "\033[0m" + tint) + " " * max(0, pad) + "\033[0m"
+        number = f"\033[2m{n:>{digits - 1}}\033[0m " if numbers else ""
+        mark = color.get(marks.get(n), " ") + "\033[0m "
+        lead = len(ansi.sub("", text)) - len(ansi.sub("", text).lstrip(" "))
+        for k, part in enumerate(wrap_ansi(text, room, min(lead + 4, room // 2)).split("\n")):
+            out.append(f"{number if k == 0 else ' ' * len(ansi.sub('', number))}{mark}{part}")
+            origin.append(n)
+    return "\n".join(out) + "\n", origin
+
+
+def view_prompt(path, keys):
+    """less's prompt line: the file, what its marks compare to, the keys."""
+    rel = os.path.relpath(path)
+    name = rel if not rel.startswith("..") else path.replace(os.path.expanduser("~"), "~", 1)
+    base = branch_marks(path)[1] if not is_markdown(path) else None
+    vs = f"  ▎ changed vs {base}" if base and base != "HEAD" else "  ▎ uncommitted" if base else ""
+    return re.sub(r"([%?:.\\])", r"\\\1", f"{name}{vs}   {keys}")
+
+
+PATH_SEPARATORS = set(" \t()[]{}<>'\"`,;|│⎿⏺●•→")
+
+
+def columns_to_index(line):
+    """Map screen column → character index (wide characters take two columns)."""
+    import unicodedata
+    cols = []
+    for i, ch in enumerate(line):
+        cols += [i] * (2 if unicodedata.east_asian_width(ch) in "WF" else 1)
+    return cols
+
+
+def token_at(lines, y, x, width):
+    """The path-like words under screen position (x, y), longest first: the word itself, and joined
+    with the rows it may wrap onto (a word that ends its row goes on at the start of the next one,
+    after its indent; Claude wraps long paths at - and / and indents the rest)."""
+    if not 0 <= y < len(lines):
+        return []
+    line = lines[y]
+    cols = columns_to_index(line)
+    if x >= len(cols) or line[cols[x]] in PATH_SEPARATORS:
+        return []
+    a = b = cols[x]
+    while a > 0 and line[a - 1] not in PATH_SEPARATORS:
+        a -= 1
+    while b < len(line) and line[b] not in PATH_SEPARATORS:
+        b += 1
+    before, after = [], []  # the pieces on the rows above / below
+    row, end = y, line[b:]
+    while not end.strip() and row + 1 < len(lines) and len(after) < 3:
+        nxt = lines[row + 1]
+        start = len(nxt) - len(nxt.lstrip(" "))
+        stop = next((i for i in range(start, len(nxt)) if nxt[i] in PATH_SEPARATORS), len(nxt))
+        if stop == start:
+            break
+        after.append(nxt[start:stop])
+        row, end = row + 1, nxt[stop:]
+    row, lead = y, line[:a]
+    while not lead.strip() and row > 0 and len(before) < 3:
+        prv = lines[row - 1].rstrip(" ")
+        start = next((i + 1 for i in range(len(prv) - 1, -1, -1) if prv[i] in PATH_SEPARATORS), 0)
+        if start == len(prv):
+            break
+        before.insert(0, prv[start:])
+        row, lead = row - 1, prv[:start]
+    words = {"".join(before[len(before) - i:]) + line[a:b] + "".join(after[:j])
+             for i in range(len(before) + 1) for j in range(len(after) + 1)}
+    return sorted(words, key=len, reverse=True)
+
+
+def resolve_path(word, cwd):
+    """(path, line) of an existing file named by a word like src/a.ts:12:3, ./x.md, ~/x, file:///x."""
+    word = word.removeprefix("file://").rstrip(".:,")
+    m = re.match(r"^(.*?)(?::(\d+)(?::\d+)?|#L(\d+))?$", word)
+    path, line = m[1], m[2] or m[3]
+    for base in (cwd, ""):
+        full = os.path.normpath(os.path.join(base, os.path.expanduser(path))) if path else ""
+        if full and os.path.isfile(full):
+            return full, line
+    return None, None
+
+
+def line_in(word, path):
+    """The line a shown word like UITicket.svelte.ts:96 names, when a link to path carries none."""
+    m = re.match(r"^(.*?)(?::(\d+)(?::\d+)?|#L(\d+))[.:,]?$", word)
+    return (m[2] or m[3]) if m and os.path.basename(m[1]) == os.path.basename(path) else None
+
+
+FILE_NAME = re.compile(r"^([\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z][A-Za-z0-9]{0,7})(?::(\d+)(?::\d+)?|#L(\d+))?[.:,]?$")
+
+
+def unique_file(word, root, text=""):
+    """(path, line) of the one file a bare name names; None when no file or several have it."""
+    hits, line = files_named(word, root, text)
+    return (hits[0], line) if len(hits) == 1 else (None, None)
+
+
+def files_named(word, root, text=""):
+    """([paths], line) of the files a bare name names (before-table.png, Cart.ts:12, models/Cart.ts): the AI
+    often writes only the name. Looked for in the full paths shown earlier (text), then in the project's
+    files (git, else its folder)."""
+    m = FILE_NAME.match(word)
+    if not m:
+        return [], None
+    name, line = m[1], m[2] or m[3]
+    shown = {os.path.normpath(os.path.join(root or "/", os.path.expanduser(p)))
+             for p in re.findall(r"[\w.~@+/-]*/" + re.escape(name) + r"(?![\w.-])", text)}
+    hits = sorted(p for p in shown if os.path.isfile(p))
+    if hits or not root:
+        return hits, line
+    try:
+        top = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        files = subprocess.run(["git", "-C", top, "ls-files", "-co", "--exclude-standard"],
+                               capture_output=True, text=True, timeout=2).stdout.splitlines() if top else []
+    except (OSError, subprocess.TimeoutExpired):
+        return [], None
+    if not top:  # no repo: the folder, without hidden ones and node_modules, up to a limit
+        top, files = root, []
+        for d, dirs, names in os.walk(root):
+            dirs[:] = [x for x in dirs if not x.startswith(".") and x != "node_modules"]
+            files += [os.path.relpath(os.path.join(d, x), root) for x in names]
+            if len(files) > 20000:
+                break
+    return sorted(os.path.join(top, f) for f in files if f == name or f.endswith("/" + name)), line
+
+
+PICK_MAX = 20  # files listed when a name has several
+
+
+def pick_file(zid, pane, name, line, files):
+    """A name several files have: they list at the top of the sidebar to pick from (at most PICK_MAX);
+    the AI is asked in the background which one it meant, that one goes first."""
+    at = time.time()
+    with edit_state() as d:
+        d["pick"] = {"zid": zid, "pane": pane, "name": name, "line": line, "files": files[:PICK_MAX],
+                     "more": max(0, len(files) - PICK_MAX), "guess": None, "asking": True, "at": at}
+    wid = session_windows().get(zid)
+    if wid:
+        tmux("select-pane", "-t", f"{wid}.0")
+    subprocess.Popen([sys.executable, SELF, "guess", str(at)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_guess(at):
+    """Background: ask the AI which of the listed files the clicked name means (zidev pick_file)."""
+    c = load_state().get("pick") or {}
+    if str(c.get("at")) != at:
+        return
+    s = session_of(c["zid"]) or {}
+    root = s.get("cwd", "/")
+    rel = {(os.path.relpath(f, root) if f.startswith(root + "/") else f): f for f in c["files"]}
+    screen = (tmux("capture-pane", "-p", "-J", "-S", "-400", "-t", c["pane"]) or "")[-8000:]
+    ask = (f"Below is the end of a terminal with an AI coding assistant's output. The user clicked the file name "
+           f"`{c['name']}` in it. Which of these files is meant? Answer with one path exactly as listed, nothing "
+           f"else; NONE if you can't tell.\n\nFiles:\n" + "\n".join(rel) + f"\n\nTerminal:\n{screen}")
+    cmd = shlex.split(os.environ["ZIDEV_GUESS"]) if os.environ.get("ZIDEV_GUESS") else \
+        [CLAUDE, "-p", "--model", "haiku", "--no-session-persistence", "--tools", "",
+         "--settings", '{"disableAllHooks": true}']
+    env = {k: v for k, v in os.environ.items() if k not in ("ZIDEV_ID", "TMUX", "TMUX_PANE")}
+    try:
+        out = subprocess.run(cmd, input=ask, capture_output=True, text=True, timeout=90, env=env, cwd=root).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    words = (out.strip().splitlines() or [""])[-1].strip(" `'\".")
+    guess = rel.get(words) or (words if words in c["files"] else None)
+    with edit_state() as d:
+        if str((d.get("pick") or {}).get("at")) == at:
+            d["pick"].update(guess=guess, asking=False)
+
+
+LOOKS_LIKE_FILE = re.compile(r"^[\w.~@+-]*/[\w./@+-]*\.[A-Za-z][A-Za-z0-9]{0,7}(:\d+(:\d+)?)?[.:,]?$")
+
+
+def color_runs(row):
+    """A captured row (capture-pane -e) as runs of one color: [(first column, end column, text, color)]."""
+    import unicodedata
+    runs, state, col = [], "", 0
+    for seq, ch in re.findall(r"\033\[([0-9;]*)m|(.)", row, re.S):
+        if not ch:
+            state = "" if seq in ("", "0") else state + ";" + seq
+            continue
+        n = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if runs and runs[-1][3] == state:
+            runs[-1][1], runs[-1][2] = col + n, runs[-1][2] + ch
+        else:
+            runs.append([col, col + n, ch, state])
+        col += n
+    return [tuple(r) for r in runs]
+
+
+def bang_at(rows, y, x):
+    """The `! command` Claude suggests under (x, y), without its !: its inline-code run (one color),
+    or a row that is only "! command"; a run that ends its row goes on at the start of the next."""
+    rows = [re.sub(r"\033\]8;[^\033\a]*(\033\\|\a)", "", r) for r in rows]  # no hyperlinks
+    if not 0 <= y < len(rows):
+        return None
+    plain = ANSI.sub("", rows[y])
+    if re.match(r"\s*! ?\S", plain) and x >= len(plain) - len(plain.lstrip()):  # a line of its own
+        return plain.strip()[1:].strip()
+    run = next((r for r in color_runs(rows[y]) if r[0] <= x < r[1]), None)
+    if not run or not run[3] or not re.match(r"\s*! ?\S", run[2]):
+        return None
+    text, end = run[2], run[1]
+    for nxt in rows[y + 1:y + 3]:  # wrapped: the same color goes on after the indent
+        if end < len(plain.rstrip()):
+            break
+        lead = next((r for r in color_runs(nxt) if r[2].strip()), None)
+        if not lead or lead[3] != run[3] or lead[0] > 8:
+            break
+        text, plain, end = text.rstrip() + " " + lead[2].strip(), ANSI.sub("", nxt), lead[1]
+    return text.strip()[1:].strip().strip("`") or None
+
+
+def clicked_path(pane, x, y, link=""):
+    """What a click at (x, y) hits: (zid, path, line) for a file, (zid, None, word) for a path to a file
+    that does not exist, (zid, "url", url) for a web link, None for anything else (plain text, the sidebar)."""
+    info = tmux("display", "-p", "-t", pane, "#{pane_current_path}\t#{pane_width}\t#{pane_index}")
+    zid = zid_of_pane(pane)
+    if not info or not zid:
+        return None
+    cwd, width, index = info.split("\t")
+    if index == "0":  # the sidebar
+        return None
+    s = session_of(zid) or {}
+    if tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":  # `! cmd`: into Claude's prompt
+        cmd = bang_at((tmux("capture-pane", "-p", "-e", "-t", pane) or "").split("\n"), int(y), int(x))
+        if cmd:
+            return zid, "bang", cmd
+    words = token_at((tmux("capture-pane", "-p", "-t", pane) or "").split("\n"), int(y), int(x), int(width))
+    for w in filter(None, [link if link.startswith(("file://", "/", "~")) else "", *words]):
+        for base in (cwd, s.get("cwd", cwd)):
+            path, line = resolve_path(w, base)
+            if path:
+                return zid, path, line or next(filter(None, (line_in(v, path) for v in words)), None)
+    for w in words:  # a folder (anime/v2/): its listing; only with a / so plain words stay Claude's
+        for base in (cwd, s.get("cwd", cwd)):
+            full = os.path.normpath(os.path.join(base, os.path.expanduser(w.removeprefix("file://").rstrip(".:,"))))
+            if "/" in w and os.path.isdir(full):
+                return zid, full, None
+    for w in words[-1:]:  # only a name: the file shown earlier or in the project with it; several: pick one
+        hits, line = files_named(w, s.get("cwd", cwd), tmux("capture-pane", "-p", "-J", "-S", "-3000", "-t", pane) or "")
+        if len(hits) == 1:
+            return zid, hits[0], line
+        if hits:
+            return zid, "pick", (FILE_NAME.match(w)[1], line, hits)
+    # nothing there: the word itself, or joined where it ends in a wrap-ish character (a long link)
+    word = next((v for v in words[:-1] if re.search(r"[-/_.?=&]$", words[-1])), words[-1] if words else "")
+    if "://" not in word and LOOKS_LIKE_FILE.match(word):
+        return zid, None, word
+    url = next((u for u in (link, *(w.rstrip(".,;:)") for w in words)) if re.match(r"https?://\S+$", u or "")), None)
+    if url:  # a plain click opens it (iTerm would need cmd-click)
+        return zid, "url", url
+    return None
+
+
+def cmd_ispath(pane, x, y, link=""):
+    """Exit 0 when a click lands on a file path: zidev handles it and the app never gets the click
+    (Claude Code would open a relative path in the browser)."""
+    sys.exit(0 if clicked_path(pane, x, y, link) else 1)
+
+
+def cmd_click(pane, x, y):
+    """A click in a pane (tmux MouseUp1Pane): a file path under it opens in the preview."""
+    hit = clicked_path(pane, x, y, tmux("show", "-gv", "@zidev_link") or "")
+    if not hit:
+        return
+    zid, path, line = hit
+    if path == "pick":
+        pick_file(zid, pane, *line)
+    elif path == "bang":  # a click copies it; a double click types it into the prompt (bang_prompt)
+        copy_text(line)
+        tmux("display-message", "-d", "1500", f"copied: {line}")
+    elif path == "url":
+        subprocess.Popen([OPENER, line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif path:
+        show_file(zid, pane, path, line)
+    else:
+        tmux("display-message", "-d", "2000", f"no such file: {line}")
+
+
+def copy_text(text):
+    copy = os.environ.get("ZIDEV_COPY", "pbcopy")  # override for tests: your clipboard stays
+    if shutil.which(copy):
+        subprocess.run([copy], input=text.encode())
+    else:
+        tmux("set-buffer", "-w", text)
+
+
+def cmd_bang(pane, x, y):
+    """A double click on a `! command` in Claude: typed into its prompt, not sent (⏎ is yours).
+    Exit 1 when there is none: the double click selects a word as usual."""
+    hit = clicked_path(pane, x, y)
+    if not hit or hit[1] != "bang":
+        sys.exit(1)
+    tmux("send-keys", "-t", pane, "-l", "!")
+    time.sleep(0.15)  # Claude switches to its bash mode first
+    tmux("send-keys", "-t", pane, "-l", hit[2])
+
+
+def cmd_open(args):
+    """`zidev open FILE[:LINE] [--tab]` from any zidev pane: preview it (or open it as a tab)."""
+    names = [a for a in args if a != "--tab"]
+    zid = zid_of_pane(os.environ.get("TMUX_PANE"))
+    if not names or not zid:
+        sys.exit("usage (inside zidev): zidev open FILE[:LINE] [--tab]")
+    path, line = resolve_path(names[0], os.getcwd())
+    if not path:
+        sys.exit(f"no such file: {names[0]}")
+    if "--tab" in args:
+        new_tab(zid, "file", file=path, line=line)
+    else:
+        show_file(zid, os.environ["TMUX_PANE"], path, line)
+
+
+def cmd_tab(args):
+    """`zidev tab ACTION [PANE]`: the ctrl-q menu and keys."""
+    action, pane = args[0], (args[1] if len(args) > 1 else os.environ.get("TMUX_PANE", ""))
+    zid = zid_of_pane(pane)
+    if action == "select":
+        select_tab(pane)
+    elif action == "close":
+        t = find_tab(pane) or (shown_in(session_windows().get(zid)) if zid else None)
+        if t:
+            close_tab(t["pane"])
+    elif action == "claude" and zid:
+        claude = claude_tab(zid)
+        if claude:
+            select_tab(claude["pane"])
+    elif action == "close-key":  # cmd-w: the focused tab, else the preview; never a tab you don't see focused
+        t = find_tab(pane) or (floating_in(session_windows().get(zid)) if zid else None)
+        if t:
+            close_tab(t["pane"])
+    elif action == "git" and zid:
+        show_kind(zid, "git")
+    elif action in ("esc", "enter"):  # in the floating preview, a file or changes tab, the commands tab
+        tty = tmux("display", "-p", "-t", pane, "#{pane_tty}") or ""
+        ps = subprocess.run(["ps", "-t", tty.removeprefix("/dev/"), "-o", "comm="], capture_output=True, text=True)
+        running = {os.path.basename(c) for c in ps.stdout.split()}
+        t = find_tab(pane)
+        if action == "esc" and "less" in running:  # less closes on ^] (a plain esc would also end arrow keys)
+            tmux("send-keys", "-t", pane, "C-]")
+        elif not (t and t["float"]) or "micro" in running:
+            tmux("send-keys", "-t", pane, "Escape" if action == "esc" else "Enter")
+        elif action == "esc":
+            close_tab(pane)
+        else:
+            pin_tab(pane)
+    elif action == "pin":
+        pin_tab(pane)
+    elif action in ("next", "prev"):
+        cycle_tab(pane, 1 if action == "next" else -1)
+    elif action in ("up", "down"):
+        cycle_tab(pane, 1 if action == "down" else -1, items=True)
+    elif action == "sidebar":
+        toggle_sidebar()
+    elif action == "split":
+        toggle_split(pane)
+    elif action in ("term", "cmds") and zid:
+        new_tab(zid, action)
+
+
+def cmd_tabsync():
+    """After a pane exits: fill windows whose shown tab died, drop orphaned tabs."""
+    repair_tabs()
+    settle()
+    ensure_project_tabs()
+    for cwd in {t["project"] for t in all_tabs()} | set(load_state().get("project_tabs", {})):
+        sync_tabs(cwd)
+
+
+MENU = [("Sidebar ⇄ tab", "C-q", "set -g @zidev_hidden 0 ; select-pane -t :.+"),
+        ("Sidebar", "b", "set -g @zidev_hidden 0 ; select-pane -t :.0"), ("Hide / show sidebar (cmd-b)", "h", "tab sidebar"),
+        ("Terminal next to Claude (cmd-t)", "s", "tab split"),
+        ("Claude", "a", "tab claude"), ("",),
+        ("New terminal tab (cmd-shift-t)", "t", "tab term"), ("Commands tab", "c", "tab cmds"), ("Changes (diff)", "g", "tab git"),
+        ("Next tab", "n", "tab next"), ("Previous tab", "p", "tab prev"),
+        ("Item below (cmd-↓)", "j", "tab down"), ("Item above (cmd-↑)", "k", "tab up"), ("Close tab", "w", "tab close"),
+        ("Preview → tab", "d", "tab pin")]
+
+
+USER_KEYS = [("\x1b[5;30100~", "close-key"), ("\x1b[5;30101~", "split"), ("\x1b[5;30102~", "sidebar"),
+             ("\x1b[5;30103~", "up"), ("\x1b[5;30104~", "down"), ("\x1b[5;30105~", "term")]
+ZED_KEYS = {"context": "Terminal && screen == alt",  # tmux (zidev) uses the alternate screen; plain shells don't
+            "bindings": {"cmd-w": ["terminal::SendText", USER_KEYS[0][0]],
+                         "cmd-t": ["terminal::SendText", USER_KEYS[1][0]],
+                         "cmd-b": ["terminal::SendText", USER_KEYS[2][0]],
+                         "cmd-up": ["terminal::SendText", USER_KEYS[3][0]],
+                         "cmd-down": ["terminal::SendText", USER_KEYS[4][0]],
+                         "cmd-shift-t": ["terminal::SendText", USER_KEYS[5][0]]}}
+# mac / WebStorm keys: in the editor micro's keys (MICRO_BINDINGS); elsewhere what a shell or Claude's
+# prompt knows (word / line moves, delete word / line), copy a selection, find in a viewer
+COPY = "if-shell -F '#{pane_in_mode}' 'send-keys -X copy-selection-and-cancel'"
+EDIT_KEYS = [(key, micro, other) for key, micro, other in (
+    ("cmd-x", "C-x", COPY), ("cmd-c", "C-c", COPY),
+    ("cmd-f", "C-f", "if-shell -F '#{m:*|#{@zidev_side}|*,|file|git|cmds|}' 'send-keys /'"),
+    ("cmd-a", "C-a", ""), ("cmd-s", "C-s", ""), ("cmd-z", "C-z", ""), ("cmd-shift-z", "C-y", ""),
+    # micro reads no modified arrows from tmux (it types "1;3D"): alt-letters, bound in MICRO_BINDINGS
+    ("alt-left", "M-b", "send-keys M-b"), ("alt-right", "M-f", "send-keys M-f"),  # a word
+    ("alt-shift-left", "M-B", "send-keys M-b"), ("alt-shift-right", "M-F", "send-keys M-f"),
+    ("cmd-left", "Home", "send-keys C-a"), ("cmd-right", "End", "send-keys C-e"),  # the line's start / end
+    ("cmd-shift-left", "M-A", "send-keys C-a"), ("cmd-shift-right", "M-E", "send-keys C-e"),
+    ("alt-backspace", "M-BSpace", "send-keys C-w"), ("cmd-backspace", "M-k", "send-keys C-u"),
+    ("alt-up", "Up", "send-keys Up"), ("alt-down", "Down", "send-keys Down"),
+    ("alt-shift-up", "M-K", ""), ("alt-shift-down", "M-J", ""),  # move the line
+    ("cmd-shift-up", "M-K", ""), ("cmd-shift-down", "M-J", ""),
+    ("cmd-d", "C-d", ""), ("cmd-y", "M-k", ""), ("cmd-/", "M-/", ""),  # duplicate, delete, comment the line
+    ("cmd-l", "M-g", ""), ("cmd-r", "M-r", ""),  # go to line, replace
+    ("cmd-g", "M-n", ""), ("cmd-shift-g", "M-p", ""))]  # next / previous match
+EDIT_KEYS = [(f"\x1b[5;{30106 + n}~", *k) for n, k in enumerate(EDIT_KEYS)]
+ITERM_KEYS = {"x": (0x78, 0x7), "c": (0x63, 0x8), "f": (0x66, 0x3), "a": (0x61, 0x0), "s": (0x73, 0x1),
+              "z": (0x7a, 0x6), "d": (0x64, 0x2), "y": (0x79, 0x10), "l": (0x6c, 0x25), "r": (0x72, 0xf),
+              "g": (0x67, 0x5), "/": (0x2f, 0x2c), "backspace": (0x7f, 0x33),
+              "left": (0xf702, 0x7b), "right": (0xf703, 0x7c), "up": (0xf700, 0x7e), "down": (0xf701, 0x7d)}
+
+
+def iterm_keys(key):
+    """iTerm keyboard-map entries (char-modifiers-keycode) for a key like cmd-shift-z or alt-left."""
+    *mods, name = key.split("-") if not key.endswith("/") else [*key[:-2].split("-"), "/"]
+    char, code = ITERM_KEYS[name]
+    flags = sum({"cmd": 0x100000, "alt": 0x80000, "shift": 0x20000}[m] for m in mods)
+    flags |= 0x200000 if name in ("left", "right", "up", "down") else 0  # arrows: the numeric pad flag
+    chars = {char, ord(chr(char).upper())} if "shift" in mods and len(name) == 1 else {char}
+    extra = ["0x2f-0x120000-0x1a"] if name == "/" else []  # German layout: / is shift-7
+    return [f"0x{c:x}-0x{flags:x}-0x{code:x}" for c in chars] + extra
+ZED_KEYS["bindings"].update({key: ["terminal::SendText", seq] for seq, key, _, _ in EDIT_KEYS})
+
+
+def install_tmux_hooks():
+    me = " ".join(shlex.quote(a) for a in (sys.executable, SELF))
+    tmux("set-hook", "-gu", "window-layout-changed")  # older versions
+    tmux("set-hook", "-g", "pane-exited", f"run-shell -b \"{me} tabsync\"")
+    # -M: clicks work in a menu opened from a key; -O: moving the mouse never closes or picks
+    menu = ["display-menu", "-M", "-O", "-T", "#[align=centre] zidev ", "-x", "C", "-y", "C"]
+    for item in MENU:
+        if len(item) == 1:
+            menu.append("")
+            continue
+        name, key, cmd = item
+        menu += [name, key, cmd if not cmd.startswith("tab ") else f"run-shell -b \"{me} {cmd} '#{{pane_id}}'\""]
+    tmux("bind", "-n", "C-q", *menu)
+    # keys Zed sends for cmd-w / cmd-t while a terminal shows zidev (see ZED_KEYS)
+    for n, (seq, action) in enumerate(USER_KEYS):
+        tmux("set", "-s", f"user-keys[{n}]", seq)
+        tmux("bind", "-n", f"User{n}", "run-shell", "-b", f"{me} tab {action} '#{{pane_id}}'")
+    for n, (seq, _, ctrl, otherwise) in enumerate(EDIT_KEYS, len(USER_KEYS)):
+        tmux("set", "-s", f"user-keys[{n}]", seq)
+        tmux("bind", "-n", f"User{n}", "if-shell", "-F", "#{==:#{pane_current_command},micro}",
+             f"send-keys {ctrl}", *([otherwise] if otherwise else []))
+    # in the floating preview esc closes it, enter docks it as a tab (passed on while editing the file)
+    # esc closes file, changes and commands views too (they run less); claude gets its esc straight
+    for key, action in (("Escape", "esc"), ("Enter", "enter")):
+        where = "#{pane_floating_flag}" if key == "Enter" else \
+            "#{||:#{pane_floating_flag},#{m:*|#{@zidev_side}|*,|file|git|cmds|}}"
+        tmux("bind", "-n", key, "if-shell", "-F", where,
+             f"run-shell -b \"{me} tab {action} '#{{pane_id}}'\"", f"send-keys {key}")
+    tmux("unbind", "-n", "MouseDown1Status")  # the tab bar of older versions
+    # a click on a file path opens it (preview, browser or default app); the app under it never gets
+    # that click, other clicks reach it as usual. The sidebar is skipped without asking zidev.
+    at = "'#{pane_id}' '#{mouse_x}' '#{mouse_y}'"
+    ispath = f"{me} ispath {at} '#{{mouse_hyperlink}}'"
+    tmux("bind", "-n", "MouseDown1Pane", "select-pane", "-t", "=", "\\;", "if-shell", "-F", "#{==:#{pane_index},0}",
+         "send-keys -M", f"if-shell \"{ispath}\" '' 'send-keys -M'")
+    # a double click on a `! command` in Claude types it into its prompt; elsewhere it selects a word
+    word = ("select-pane -t = ; if-shell -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send-keys -M } "
+            "{ copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }")
+    tmux("bind", "-n", "DoubleClick1Pane", "if-shell", "-F", "#{==:#{@zidev_side},claude}",
+         f"if-shell \"{me} bang {at}\" '' {{ {word} }}", word)
+    tmux("bind", "-n", "MouseUp1Pane", "set", "-gF", "@zidev_link", "#{mouse_hyperlink}", "\\;",
+         "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M",
+         f"if-shell \"{ispath}\" \"run-shell -b \\\"{me} click {at}\\\"\" 'send-keys -M'")
+    # the wheel scrolls everywhere: apps with mouse support get the event, full-screen apps
+    # without it (glow, bat / less) get arrow keys, a plain shell scrolls its history
+    # always the pane under the mouse (-t =), never the focused one; over the sidebar: its scroll keys
+    for wheel, arrow, otherwise, side in (("WheelUpPane", "Up", "copy-mode -e -t =", "C-y"),
+                                          ("WheelDownPane", "Down", "", "C-e")):
+        less = (f"if-shell -t = -F '#{{||:#{{alternate_on}},#{{m:*|#{{@zidev_side}}|*,|file|git|cmds|}}}}' "
+                f"'send-keys -t = -N 3 {arrow}' '{otherwise}'")  # file / changes views: less -X, no alternate screen
+        tmux("bind", "-n", wheel, "if-shell", "-t", "=", "-F", "#{&&:#{==:#{pane_index},0},#{@zidev_id}}",
+             f"send-keys -t = {side}",
+             "if-shell -t = -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' { " + less + " }")
+    tmux("set", "-g", "status", "off")  # no tab bar: tabs are listed in the sidebar
+
+
+def grep(query, env):
+    """Search file contents (ripgrep, live); (path, line) of the picked match, or (None, None)."""
+    rg = ("[ -n {q} ] && rg --line-number --no-heading --color=always --smart-case --hidden "
+          "-g '!.git' -- {q} || true")
+    r = subprocess.run(
+        ["fzf", "--disabled", "--ansi", "--layout=reverse", "--border=none", "--info=inline-right",
+         "--prompt=grep ❯ ", f"--query={query}", "--delimiter=:", "--header=⏎ edit at line  esc back",
+         f"--bind=start:reload:{rg}", f"--bind=change:reload:sleep 0.1; {rg}",
+         "--preview=bat --color=always --style=plain --highlight-line {2} {1}",
+         "--preview-window=down,65%,border-top,+{2}-/2"],
+        stdout=subprocess.PIPE, text=True, env=env)
+    path, _, rest = r.stdout.strip().partition(":")
+    line = rest.partition(":")[0]
+    return (path, line) if r.returncode == 0 and line.isdigit() else (None, None)
+
+
+def session_of(zid):
+    return next((s for s in load_state()["sessions"] if s["id"] == zid), {})
+
+
+def project_info(d, cwd):
+    """A project's recent files and commands; from before they were the project's: its sessions'."""
+    old = [s for s in d["sessions"] if s["cwd"] == cwd]
+    info = d.get("project_info", {}).get(cwd) or {
+        k: list(dict.fromkeys(x for s in old for x in s.get(k, []))) for k in ("recent", "recent_cmds")}
+    info.setdefault("recent", [])
+    info.setdefault("recent_cmds", [])
+    return info
+
+
+def remember(cwd, key, item, keep):
+    with edit_state() as d:
+        info = d.setdefault("project_info", {}).setdefault(cwd, project_info(d, cwd))
+        info[key] = [item] + [x for x in info.get(key, []) if x != item][: keep - 1]
+
+
+def add_recent(cwd, path):
+    remember(cwd, "recent", path, 10)
+
+
+def cmd_preview(kind, target, cmd=""):
+    width = os.environ.get("FZF_PREVIEW_COLUMNS", "80")
+    if kind == "run":
+        print(f"\033[1m$ {cmd}\033[0m\n\033[2min {os.path.abspath(target)}\033[0m\n\n⏎ runs it in the terminal pane")
+    elif not os.path.isfile(target):
+        print("\033[2mnew file\033[0m")
+    elif is_markdown(target):
+        subprocess.call(["glow", "-s", THEME["glow"], "-w", width, target])
+    else:
+        subprocess.call(["bat", "--color=always", "--style=changes", "--line-range=:400",
+                         f"--terminal-width={width}", target])
+
+
+def read_key():
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def cmd_welcome():
+    print("""
+  \033[1mzidev\033[0m — Claude Code sessions
+
+  \033[1mn\033[0m        new session in the selected project
+  \033[1mp\033[0m        new project (asks for a folder)
+  \033[1m⏎\033[0m        open session (a project: its first one) · space folds
+  \033[1mr\033[0m        rename session / project
+  \033[1mx\033[0m        close session
+  \033[1mw\033[0m        jump to next session that needs you
+  \033[1mt\033[0m        terminal tab
+  \033[1mg\033[0m        changes tab: the diff of what changed
+  \033[1mc\033[0m        commands tab: run scripts, open files
+  \033[1m/\033[0m        filter sessions
+  \033[1m?\033[0m        all keys
+  \033[1mctrl-q\033[0m   menu (again: sidebar ⇄ tab)
+
+  Sessions keep running when Zed quits and are
+  restored after a reboot.
+""")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    while True:
+        signal.pause()
+
+
+def cmd_hook():
+    """Claude Code hook: record the session's status. Must stay fast and silent."""
+    zid = os.environ.get("ZIDEV_ID")
+    if not zid:
+        return
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    os.makedirs(STATUS_DIR, exist_ok=True)
+    name = ev.get("hook_event_name")
+    tool = ev.get("tool_name", "")
+    state = detail = None
+    if name == "SessionStart":
+        state = "idle"
+    elif name == "UserPromptSubmit":
+        state = "working"
+    elif name == "PreToolUse":
+        state, detail = ("waiting", ASKING_TOOLS[tool]) if tool in ASKING_TOOLS else ("working", "")
+    elif name == "PostToolUse":
+        state = "working"
+    elif name == "PermissionRequest":
+        state, detail = "waiting", ASKING_TOOLS.get(tool) or (f"allow {tool}?" if tool else "needs permission")
+    elif name == "Notification":
+        kind = ev.get("notification_type", "")
+        msg = ev.get("message", "")
+        if kind in ("permission_prompt", "elicitation_dialog") or (not kind and "permission" in msg.lower()):
+            state, detail = "waiting", msg
+    elif name == "Stop":
+        state = "done"
+    elif name == "StopFailure":
+        state, detail = "error", str(ev.get("error") or ev.get("message") or "failed")
+    elif name == "SessionEnd":
+        state = "exited"
+
+    path = f"{STATUS_DIR}/{zid}.json"
+    st = read_json(path, {})
+    if ev.get("session_id"):
+        st["claude_id"] = ev["session_id"]  # changes on /clear; resume must follow it
+    if ev.get("transcript_path"):  # Claude's names for the session are in there
+        st["transcript"] = ev["transcript_path"]
+    if name == "UserPromptSubmit" and not st.get("prompt"):
+        st["prompt"] = " ".join(str(ev.get("prompt", "")).split())[:80]
+    if state:
+        if state != st.get("state"):
+            st["since"] = time.time()
+            if state in ("waiting", "done", "error"):
+                notify(zid, st, state, detail)
+        st["state"], st["detail"] = state, detail or ""
+    write_json(path, st)
+
+
+def notify(zid, st, state, detail):
+    """macOS notification, unless that session is on screen."""
+    # ZIDEV_NOTIFY=0: the host shows its own notifications (the Neovim Claude panel does)
+    if os.environ.get("ZIDEV_NOTIFY") == "0" or not read_json(CONFIG, {}).get("notify", True):
+        return
+    on_screen = tmux("display", "-p", "-t", os.environ.get("TMUX_PANE", ""),
+                     "#{&&:#{window_active},#{session_attached}}")
+    if on_screen == "1":
+        return
+    s = next((s for s in load_state()["sessions"] if s["id"] == zid), {"cwd": "", "title": ""})
+    body = {"waiting": detail or "needs your input", "done": "finished", "error": detail}[state]
+    title = f"{project_name(s['cwd'])} · {title_of(s, st)}"
+    if os.environ.get("ZIDEV_NOTIFY") == "log":  # the selftest reads them
+        with open(f"{HOME}/notifications", "a") as f:
+            f.write(f"{title}\t{body}\n")
+        return
+    script = f"display notification {json.dumps(body)} with title {json.dumps(title)}"
+    subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+_titles = {}  # transcript -> (bytes read, /rename name, Claude's own title)
+
+
+def claude_titles(path):
+    """The session's names in Claude Code, from its transcript: (/rename name, Claude's own title).
+    Reads on from where it stopped last time (the sidebar asks on every draw)."""
+    try:
+        size = os.path.getsize(path) if path else 0
+    except OSError:
+        size = 0
+    at, custom, ai = _titles.get(path, (0, None, None))
+    if size < at:
+        at, custom, ai = 0, None, None
+    if size > at:
+        with open(path, "rb") as f:
+            f.seek(at)
+            chunk = f.read(size - at)
+        end = chunk.rfind(b"\n") + 1  # a line still being written: next time
+        for line in chunk[:end].split(b"\n"):
+            if b'"custom-title"' in line or b'"ai-title"' in line:
+                with contextlib.suppress(ValueError, AttributeError):
+                    e = json.loads(line)
+                    custom = e.get("customTitle") or custom if e.get("type") == "custom-title" else custom
+                    ai = e.get("aiTitle") or ai if e.get("type") == "ai-title" else ai
+        _titles[path] = (at + end, custom, ai)
+    return custom, ai
+
+
+def title_of(s, st):
+    """The name r gave it, until a /rename in Claude after that; else Claude's names, else the first prompt."""
+    custom, ai = claude_titles(st.get("transcript"))
+    if s.get("title") and custom == s.get("title_over"):
+        return s["title"]
+    return custom or ai or s.get("title") or st.get("prompt") or "new session"
+
+
+# ── sidebar ────────────────────────────────────────────────────────────────
+
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def age(ts):
+    if not ts:
+        return ""
+    s = int(time.time() - ts)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+class Sidebar:
+    def __init__(self, scr, message=""):
+        self.scr = scr
+        self.pane = os.environ.get("TMUX_PANE", "")
+        self.my_id = tmux("display", "-p", "-t", self.pane, "#{@zidev_id}") or ""
+        self.items = []    # ("project", cwd) | ("session", session dict) | ("tab", tab dict)
+        self.cursor = 0
+        self.top = 0
+        self.max_top = 0  # the last line can't go higher than the bottom
+        self.pick_at = None  # the pick list the cursor was put on
+        self.scrolled = False  # the wheel moved the list: the cursor may be off screen
+        self.view_seen = None
+        self.rows = {}     # screen y -> item index
+        self.visible = False
+        self.win_w = 0  # window width at the last size check: same width, other sidebar width = a drag
+        self.focused = False
+        self.frame = 0
+        self.message = message
+        self.help = False
+        self.filter = ""
+        self.footer = []   # (y, x from, x to, key) of the clickable footer hints
+        self.term_seen = {}  # pane -> (its last rows, since when): a script that stopped on a question
+        self.waits = set()   # panes of terminal tabs that wait for you
+
+    # data
+
+    def load(self):
+        self.data = load_state()
+        self.status = {s["id"]: read_status(s["id"]) for s in self.data["sessions"]}
+        self.windows = session_windows()
+        self.tabs = all_tabs()
+        gone = set(self.data.get("archived", []))  # archived: not listed (A finds them)
+        self.data["projects"] = [c for c in self.data["projects"] if c not in gone]
+        self.data["sessions"] = [s for s in self.data["sessions"] if s["cwd"] not in gone]
+        key = self.ident(self.items[self.cursor]) if self.items else None
+        by_cwd = {}
+        for s in self.data["sessions"]:
+            if self.matches(s):
+                by_cwd.setdefault(s["cwd"], []).append(s)
+        projects = self.data["projects"] + [c for c in by_cwd if c not in self.data["projects"]]
+        self.items, self.changes = [], {}  # changes: project -> its changed files
+        pick = self.data.get("pick")
+        if pick and pick["zid"] == self.my_id:  # a name several files have: pick one (guess first)
+            files = sorted(pick["files"], key=lambda f: f != pick["guess"])
+            self.items += [("pick", pick)] + [("pickfile", f) for f in files]
+            if pick["more"]:
+                self.items.append(("pickmore", pick))
+            if pick["at"] != self.pick_at:  # new: the cursor on its first file
+                self.pick_at, key, self.scrolled = pick["at"], ("pickfile", files[0]), False
+        for cwd in projects:
+            if self.filter and cwd not in by_cwd:
+                continue
+            self.items.append(("project", cwd))
+            if cwd not in self.data["collapsed"] or self.filter:
+                self.items += [("session", s) for s in by_cwd.get(cwd, [])]  # a session is its Claude
+                for t in project_tabs(cwd, self.tabs):  # shared by its sessions
+                    self.items.append(("tab", t))
+                    if t["kind"] == "git":  # its changed files under it, when unfolded
+                        self.changes[cwd] = changed_files(cwd)
+                        if cwd in self.data["changes_open"]:
+                            self.items += [("change", (t, st, path)) for st, path in self.changes[cwd]]
+        self.waits = {t["pane"] for t in self.tabs if self.term_waits(t)}
+        self.select(key)
+
+    ASKS = re.compile(r"([?:\])›])\s*$|\b(y/n|yes/no|password|passphrase|press (any key|enter|return))\b", re.I)
+
+    def term_waits(self, t):
+        """A terminal tab running something (not its shell) that went still on a question: it needs you."""
+        if t["kind"] != "term" or t["cmd"] in SHELLS:
+            self.term_seen.pop(t["pane"], None)
+            return False
+        rows = [r for r in (tmux("capture-pane", "-p", "-t", t["pane"]) or "").split("\n") if r.strip()]
+        last = rows[-1] if rows else ""
+        seen = self.term_seen.get(t["pane"])
+        if not seen or seen[0] != rows[-3:]:
+            self.term_seen[t["pane"]] = (rows[-3:], time.time())
+            return False
+        return time.time() - seen[1] >= 2 and bool(self.ASKS.search(last))
+
+    def save_view(self):
+        """Cursor and scroll for every window's sidebar: switching windows shows the same list."""
+        if self.items:
+            self.view_seen = {"top": self.top, "item": json.dumps(self.ident(self.current())),
+                              "scrolled": self.scrolled}
+            write_json(VIEW, self.view_seen)
+
+    def adopt_view(self):
+        v = read_json(VIEW, {})
+        if not v or v == self.view_seen:
+            return
+        self.view_seen, self.top, self.scrolled = v, v.get("top", 0), v.get("scrolled", False)
+        at = next((i for i, item in enumerate(self.items) if json.dumps(self.ident(item)) == v.get("item")), None)
+        me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
+        if at is not None and me and self.is_mine(self.items[at], me):  # else about another window
+            self.cursor = at
+
+    def is_mine(self, item, me):
+        """A row about this window: its session, or its project and the project's tabs."""
+        kind, v = item
+        if kind == "session":
+            return v["id"] == me["id"]
+        return kind.startswith("pick") or self.project_of(kind, v) == me["cwd"]
+
+    @staticmethod
+    def ident(item):
+        kind, v = item
+        return kind, (v if kind in ("project", "pickfile") else v["id"] if kind == "session" else
+                      v["at"] if kind in ("pick", "pickmore") else
+                      (v[0]["pane"], v[2]) if kind == "change" else v["pane"])
+
+    def session_of_item(self, kind, v):
+        """The session a row's t / g / c open in: its own; a project or tab row: here()."""
+        return v if kind == "session" else self.here(self.project_of(kind, v)) if kind and "pick" not in kind else None
+
+    @staticmethod
+    def project_of(kind, v):
+        return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"],
+                "change": lambda: v[0]["project"]}[kind]()
+
+    def here(self, cwd):
+        """Where a project's tab shows: this window when it is the project's, else its window used last."""
+        me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
+        zid = self.my_id if me and me["cwd"] == cwd else last_session(cwd, self.tabs, self.windows)
+        return next((s for s in self.data["sessions"] if s["id"] == zid), None)
+
+    def matches(self, s):
+        words = self.filter.lower().split()
+        text = f"{title_of(s, self.status.get(s['id'], {}))} {project_name(s['cwd'])}".lower()
+        return all(w in text for w in words)
+
+    def select(self, key):
+        for i, item in enumerate(self.items):
+            if key == self.ident(item):
+                self.cursor = i
+                return
+        self.cursor = min(self.cursor, max(len(self.items) - 1, 0))
+
+    def current(self):
+        return self.items[self.cursor] if self.items else (None, None)
+
+    def state_of(self, s):
+        """(state, needs attention) of a session."""
+        st = self.status.get(s["id"], {})
+        state = st.get("state", "idle")
+        if s["id"] not in self.windows:
+            state = "stopped"
+        unseen = st.get("since", 0) > seen_at(s["id"]) and s["id"] != self.my_id
+        return state, state == "waiting" or (state in ("done", "error") and unseen)
+
+    # drawing
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            with contextlib.suppress(curses.error):
+                self.scr.addnstr(y, x, text, w - x, attr)
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        if self.help:
+            return self.draw_help(h, w)
+        dim, bold = curses.A_DIM, curses.A_BOLD
+        c = lambda n: curses.color_pair(n)
+
+        need = sum(1 for k, v in self.items if k == "session" and self.state_of(v)[1]) + len(self.waits)
+        self.put(0, 1, "zidev", bold)
+        if need:
+            label = f"{need} need you"
+            self.put(0, w - len(label) - 1, label, c(3) | bold)
+
+        lines = []  # (item index, draw fn)
+        for i, (kind, v) in enumerate(self.items):
+            lines.append((i, kind, v, 0))
+            if kind == "session":
+                st = self.status.get(v["id"], {})
+                if self.state_of(v)[0] in ("waiting", "error") and st.get("detail"):
+                    lines.append((i, "detail", f"{st['detail']} · {age(st.get('since'))}", 1))
+
+        body_top, body_h = 2, max(h - 4, 1)
+        cur_line = next((n for n, l in enumerate(lines) if l[0] == self.cursor), 0)
+        if self.scrolled:
+            pass
+        elif cur_line < self.top:
+            self.top = cur_line
+        elif cur_line >= self.top + body_h:
+            self.top = cur_line - body_h + 1
+        self.max_top = max(0, len(lines) - body_h)
+        self.top = max(0, min(self.top, self.max_top))
+        self.rows = {}
+        for n, (i, kind, v, _) in enumerate(lines[self.top:self.top + body_h]):
+            y = body_top + n
+            self.rows[y] = i
+            sel = i == self.cursor  # always shown; dimmer while the focus is elsewhere
+            base = curses.A_REVERSE | (0 if self.focused else curses.A_DIM) if sel else 0
+            if sel:
+                self.put(y, 0, " " * w, base)
+            if kind == "project":
+                folded = v in self.data["collapsed"]
+                self.put(y, 1, ("▸ " if folded else "▾ ") + project_name(v), base | bold)
+                sessions = [s for s in self.data["sessions"] if s["cwd"] == v]
+                waiting = sum(1 for s in sessions if self.state_of(s)[1]) + \
+                    sum(1 for t in self.tabs if t["pane"] in self.waits and t["project"] == v)
+                if folded and waiting:
+                    self.put(y, w - 3, f"{waiting} ", base | c(3) | bold)
+            elif kind == "session":
+                self.draw_session(y, w, v, base)
+            elif kind == "tab":
+                self.draw_tab(y, w, v, base)
+            elif kind == "change":
+                self.draw_change(y, w, v, base)
+            elif kind == "pick":
+                self.put(y, 1, f"which {v['name']}?"[: w - 2], base | c(3) | bold)
+                if v["asking"]:
+                    self.put(y, w - 8, "asking…", base | dim)
+            elif kind == "pickfile":
+                pick = self.data["pick"]
+                cwd = (session_of(pick["zid"]) or {}).get("cwd", "/")
+                name = os.path.relpath(v, cwd) if v.startswith(cwd + "/") else v.replace(os.path.expanduser("~"), "~", 1)
+                name = name if len(name) <= w - 5 else "…" + name[-(w - 6):]
+                self.put(y, 1, ("✦ " if v == pick["guess"] else "  ") + name, base | (bold if v == pick["guess"] else 0))
+            elif kind == "pickmore":
+                self.put(y, 3, f"… {v['more']} more", base | dim)
+            else:
+                self.put(y, 5, v[: w - 6], base | c(3) | dim)
+
+        if not self.items:
+            self.put(body_top, 1, "no match — esc clears the filter" if self.filter
+                     else "no sessions — n: new session", dim)
+        self.draw_footer(h, w)
+        self.scr.refresh()
+
+    FOOTER = ([("⏎ open", 10), ("n new", "n"), ("t term", "t"), ("c cmds", "c")],
+              [("w next", "w"), ("/ find", "/"), ("? keys", "?"), ("x close", "x")])
+
+    def draw_footer(self, h, w):
+        self.footer = []
+        rows = list(self.FOOTER)
+        if self.filter:
+            rows[0] = [(f"/{self.filter}", "/"), ("esc clear", 27)]
+        for y, row in zip((h - 2, h - 1), rows):
+            x = 1
+            for label, key in row:
+                self.put(y, x, label, curses.A_DIM if not self.filter or y == h - 1 else curses.A_BOLD)
+                self.footer.append((y, x, x + len(label), key))
+                x += len(label) + 2
+        if self.message:
+            self.put(h - 2, 0, " " * w)
+            self.put(h - 2, 1, self.message[: w - 2], curses.color_pair(3))
+
+    HELP = [("⏎ / click", "show session (Claude) / tab; a project: its first session"),
+            ("space / ▸", "fold / unfold project or changes"), ("wheel", "scrolls the list"), ("right click", "menu: close, rename, …"), ("n", "new session in project"),
+            ("p", "new project (folder)"), ("r", "rename session / project"), ("x", "close session / tab"),
+            ("R", "restart Claude"), ("J / K", "move session down / up"), ("t", "terminal tab"),
+            ("g", "changes tab: diff (n / N file)"), ("c", "commands tab: run, open, grep"), ("w", "next that needs you"),
+            ("/", "filter sessions"), ("esc", "clear filter"), ("h / ←", "go up: session, project"),
+            ("a", "archive project"), ("A", "archived: search, unarchive"),
+            ("ctrl-q", "menu (again: sidebar ⇄ tab)"), ("cmd-b", "hide / show the sidebar"),
+            ("cmd-↑ / ↓", "item above / below"), ("cmd-t", "terminal next to Claude"), ("", ""),
+            ("", "any key closes this")]
+
+    def draw_help(self, h, w):
+        self.put(0, 1, "zidev keys", curses.A_BOLD)
+        for y, (k, text) in enumerate(self.HELP, 2):
+            self.put(y, 1, k, curses.A_BOLD)
+            self.put(y, 11, text[: w - 12], curses.A_DIM if not k else 0)
+        self.scr.refresh()
+
+    def draw_session(self, y, w, s, base):
+        state, attention = self.state_of(s)
+        st = self.status.get(s["id"], {})
+        c = curses.color_pair
+        glyph, color, label = {
+            "working": (SPIN[self.frame % len(SPIN)], c(4), age(st.get("since"))),
+            "waiting": ("●", c(3) | curses.A_BOLD, "needs you"),
+            "done": ("●" if attention else "○", c(2) if attention else curses.A_DIM,
+                     "done" if attention else age(st.get("since"))),
+            "error": ("✗", c(1), "error"),
+            "exited": ("■", curses.A_DIM, "exited"),
+            "stopped": ("–", curses.A_DIM, "stopped"),
+        }.get(state, ("○", curses.A_DIM, ""))
+        gx, tx = (1, 3) if w < 20 else (3, 5)  # a narrow sidebar: less indent
+        if s["id"] == self.my_id:
+            self.put(y, 0, "▌", base | c(5))
+        self.put(y, gx, glyph, base | color)
+        if w - tx - len(label) - 2 < 8:  # the title first; the glyph still shows the state
+            label = ""
+        room = w - tx - 1 - (len(label) + 1 if label else 0)
+        title = title_of(s, st)
+        title = title if len(title) <= room else title[: room - 1] + "…"
+        self.put(y, tx, title, base | (curses.A_BOLD if attention else 0))
+        self.put(y, w - len(label) - 1, label, base | (color if state == "waiting" else curses.A_DIM))
+
+    TAB_GLYPHS = {"term": "$", "cmds": "≡", "git": "±", "file": "·"}
+
+    def draw_tab(self, y, w, t, base):
+        """A project's tab, under its sessions; bright while a window shows it."""
+        gx, tx = (1, 3) if w < 20 else (3, 5)
+        label = t["cmd"] if t["kind"] == "term" and t["cmd"] not in SHELLS else t["label"]
+        self.put(y, gx, self.TAB_GLYPHS.get(t["kind"], "·"), base | curses.A_DIM)
+        self.put(y, tx, label[: w - tx - 1], base | (curses.A_BOLD if t["visible"] else curses.A_DIM))
+        if t["kind"] == "git":  # folds like a project: how many files changed, ▸ / ▾
+            n = len(self.changes.get(t["project"], []))
+            fold = "▾" if t["project"] in self.data["changes_open"] else "▸"
+            self.put(y, w - len(str(n)) - 3, f"{n} {fold}", base | curses.A_DIM)
+        elif t["pane"] in self.waits:  # a script asks something
+            self.put(y, w - 3, "●", base | curses.color_pair(3) | curses.A_BOLD)
+
+    CHANGE_COLORS = {"M": 3, "?": 2, "A": 2, "D": 1, "U": 1}
+
+    def draw_change(self, y, w, change, base):
+        """A changed file, under the changes tab; bright while that tab shows its diff."""
+        t, st, path = change
+        tx = 5 if w < 20 else 7
+        room = w - tx - 3
+        name = path if len(path) <= room else "…" + path[-room + 1:]
+        shown = t["visible"] and t["file"] == path
+        self.put(y, tx, st, base | curses.color_pair(self.CHANGE_COLORS.get(st, 3)))
+        self.put(y, tx + 2, name, base | (curses.A_BOLD if shown else curses.A_DIM))
+
+    # input
+
+    def prompt(self, label, text="", complete=False, live=None):
+        h, w = self.scr.getmaxyx()
+        curses.curs_set(1)
+        self.scr.timeout(-1)
+        try:
+            while True:
+                if live:
+                    live(text)
+                self.put(h - 2, 0, " " * w)
+                self.put(h - 1, 0, " " * w)
+                shown = (label + text)[-(w - 2):]
+                self.put(h - 2, 1, shown, curses.A_BOLD)
+                self.put(h - 1, 1, "⏎ ok  esc cancel" + ("  tab complete" if complete else ""), curses.A_DIM)
+                self.scr.move(h - 2, min(1 + len(shown), w - 1))
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return text.strip()
+                if ch == "\x1b":
+                    return None
+                if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    text = text[:-1]
+                elif ch == "\x15":  # ctrl-u
+                    text = ""
+                elif ch == "\t" and complete:
+                    text = complete_dir(text)
+                elif isinstance(ch, str) and ch.isprintable():
+                    text += ch
+        finally:
+            curses.curs_set(0)
+
+    def confirm(self, question, again=None):
+        """One key: y (or the key that asked again: x x, a a, R R) is yes, any other no."""
+        h, w = self.scr.getmaxyx()
+        self.put(h - 2, 0, " " * w)
+        self.put(h - 1, 0, " " * w)
+        self.put(h - 2, 1, question[:w - 2], curses.A_BOLD)
+        self.put(h - 1, 1, f"{again + ' / ' if again else ''}y yes  any key no"[:w - 2], curses.A_DIM)
+        self.scr.timeout(-1)
+        ch = self.scr.get_wch()
+        return ch == "y" or ch == again
+
+    def follow(self):
+        """The cursor on a changed file while the changes tab shows: that file's diff (focus stays here)."""
+        kind, v = self.current()
+        if kind == "change" and v[0]["visible"] and v[0]["file"] != v[2]:
+            s = self.here(v[0]["project"])
+            if s and self.windows.get(s["id"]) == v[0]["window"]:
+                show_changes(v[0], v[2], s["id"], focus=False)
+
+    def move(self, delta):
+        if self.items:
+            self.cursor = max(0, min(len(self.items) - 1, self.cursor + delta))
+
+    def open(self, item, click=False):
+        kind, v = item
+        if kind == "pickfile":  # the file meant: its preview, the pick list goes
+            with edit_state() as d:
+                pick = d.pop("pick", None)
+            if pick:
+                show_file(pick["zid"], pick["pane"], v, pick["line"])
+        elif kind == "project":  # its main session: the first; folded or not, it stays so
+            main = next((s for s in self.data["sessions"] if s["cwd"] == v), None)
+            if main:
+                self.open(("session", main))
+            else:
+                self.message = "no session: n starts one"
+        elif kind == "session":  # its Claude
+            wid = self.windows.get(v["id"])
+            if not wid and (wid := spawn_window(v)):  # shown once its sidebar has drawn: no blank flash
+                end = time.time() + 1.5
+                while time.time() < end and "zidev" not in (tmux("capture-pane", "-p", "-t", f"{wid}.0") or ""):
+                    time.sleep(0.03)
+            if wid:
+                show_window(wid)
+                claude = claude_tab(v["id"])
+                if claude:
+                    select_tab(claude["pane"])
+        elif kind in ("tab", "change"):  # in this window when it is the project's
+            t = v[0] if kind == "change" else v
+            s = self.here(t["project"])
+            if not s:
+                self.message = "no session: n starts one"
+            elif kind == "change" and not click and os.path.isfile(changed_path(t["project"], v[2])):
+                new_tab(s["id"], "file", file=changed_path(t["project"], v[2]))  # ⏎: the file, as a tab
+            elif kind == "tab" and v["kind"] == "git" and v["visible"] and not click:  # shown: ⏎ folds its files
+                self.fold_changes(t["project"])
+            elif kind == "change":  # a click: its diff
+                if show_changes(t, v[2], s["id"]):
+                    show_window(self.windows[s["id"]])
+                    tmux("select-pane", "-t", t["pane"])
+            elif select_tab(v["pane"], s["id"]):
+                show_window(self.windows[s["id"]])
+                tmux("select-pane", "-t", v["pane"])
+                if v["kind"] == "git":  # shown, with its files
+                    with edit_state() as d:
+                        if t["project"] not in d["changes_open"]:
+                            d["changes_open"].append(t["project"])
+
+    def fold(self, cwd, folded=None):
+        """Fold / unfold a project's rows (None: the other way round); its session keeps running."""
+        with edit_state() as d:
+            now = cwd in d["collapsed"]
+            want = not now if folded is None else folded
+            if want and not now:
+                d["collapsed"].append(cwd)
+            elif now and not want:
+                d["collapsed"].remove(cwd)
+
+    def fold_changes(self, cwd):
+        with edit_state() as d:
+            if cwd in d["changes_open"]:
+                d["changes_open"].remove(cwd)
+            else:
+                d["changes_open"].append(cwd)
+
+    def side(self, s, kind):
+        """Show the project's terminal / commands / git tab in the session's window, a new one if none."""
+        wid = self.windows.get(s["id"]) or spawn_window(s)
+        if wid:
+            show_window(wid)
+            show_kind(s["id"], kind)
+
+    def new_in(self, cwd):
+        if not cwd:
+            return self.new_project()
+        if not os.path.isdir(cwd):
+            self.message = f"missing: {cwd}"
+            return
+        new_session(cwd)
+
+    def new_project(self):
+        kind, v = self.current()
+        cwd = v if kind == "project" else v and v["cwd"]
+        default = (os.path.dirname(cwd) if cwd else os.path.expanduser("~/projects")) + "/"
+        path = self.prompt("folder: ", default.replace(os.path.expanduser("~"), "~", 1), complete=True)
+        if path:
+            self.new_in(os.path.realpath(os.path.expanduser(path)))
+
+    def next_attention(self):
+        """Open the next session that needs you: waiting ones first, then finished unseen ones."""
+        n = len(self.items)
+        for wanted in (lambda st: st[0] == "waiting", lambda st: st[1]):
+            for step in range(1, n + 1):
+                kind, v = self.items[(self.cursor + step) % n]
+                if kind == "session" and wanted(self.state_of(v)):
+                    self.cursor = (self.cursor + step) % n
+                    return self.open(self.items[self.cursor])
+        self.message = "nothing needs you"
+
+    def reorder(self, kind, v, delta):
+        """Move a session within its project, or a project in the list."""
+        with edit_state() as d:
+            if kind == "project":
+                lst, i = d["projects"], d["projects"].index(v) if v in d["projects"] else -1
+                j = i + delta
+            else:
+                lst = d["sessions"]
+                i = next((n for n, s in enumerate(lst) if s["id"] == v["id"]), -1)
+                same = [n for n, s in enumerate(lst) if s["cwd"] == v["cwd"]]
+                pos = same.index(i) + delta if i in same else -1
+                j = same[pos] if 0 <= pos < len(same) else -1
+            if i >= 0 and 0 <= j < len(lst):
+                lst[i], lst[j] = lst[j], lst[i]
+
+    def find(self):
+        def live(text):
+            self.filter = text
+            self.load()
+            self.draw()
+        before, kind, v = self.filter, *self.current()
+        text = self.prompt("/", self.filter, live=live)
+        self.filter = before if text is None else text
+        self.load()
+        if self.filter:  # first match
+            self.cursor = next((i for i, (k, _) in enumerate(self.items) if k == "session"), 0)
+        elif kind:
+            self.select(self.ident((kind, v)))
+
+    def key(self, ch):
+        if ch == curses.KEY_RESIZE:  # not a key: keeps the help open
+            return self.fix_width(drag=True)
+        self.message = ""
+        if self.help:
+            self.help = False
+            return
+        kind, v = self.current()
+        sess = self.session_of_item(kind, v)
+        if (kind or "").startswith("pick") and ch in (27, ord("x"), ord("X")):  # no pick
+            with edit_state() as d:
+                d.pop("pick", None)
+            return
+        if (kind or "").startswith("pick") and ch not in (curses.KEY_DOWN, ord("j"), curses.KEY_UP, ord("k"),
+                                                          10, 13, curses.KEY_ENTER, ord(" ")):
+            return
+        if ch in (25, 5):  # ctrl-y / ctrl-e: the wheel over the sidebar scrolls it, the cursor stays
+            self.top, self.scrolled = max(0, min(self.top + (3 if ch == 5 else -3), self.max_top)), True
+            return
+        if ch != curses.KEY_MOUSE:
+            self.scrolled = False
+        if ch in (curses.KEY_DOWN, ord("j"), curses.KEY_UP, ord("k")):
+            self.move(1 if ch in (curses.KEY_DOWN, ord("j")) else -1)
+            self.follow()
+        elif ch in (ord(" "), ord("l"), curses.KEY_RIGHT) and kind == "project":  # space folds, l unfolds
+            self.fold(v, None if ch == ord(" ") else False)
+        elif ch == ord(" ") and kind == "tab" and v["kind"] == "git":
+            self.fold_changes(v["project"])
+        elif ch in (10, 13, curses.KEY_ENTER, ord("l"), curses.KEY_RIGHT, ord(" ")) and kind:
+            self.open((kind, v))
+        elif ch in (ord("h"), curses.KEY_LEFT) and kind:
+            cwd = self.project_of(kind, v)
+            self.fold(cwd, True)
+            self.select(("project", cwd))
+        elif ch == ord("n"):
+            self.new_in(self.project_of(kind, v) if kind else None)
+        elif ch == ord("p"):
+            self.new_project()
+        elif ch == ord("r") and kind == "session":
+            st = self.status.get(v["id"], {})
+            shown = title_of(v, st)  # a name to edit; not the first prompt, that one is long
+            title = self.prompt("name: ", "" if shown in (st.get("prompt"), "new session") else shown)
+            if title is not None:
+                with edit_state() as d:
+                    for s in d["sessions"]:
+                        if s["id"] == v["id"]:  # "" gives back Claude's name
+                            s["title"], s["title_over"] = title, claude_titles(st.get("transcript"))[0]
+        elif ch == ord("r") and kind == "project":
+            name = self.prompt("name: ", project_name(v))
+            if name is not None:
+                rename_project(v, name)
+        elif ch in (ord("x"), ord("X")) and kind == "tab":  # X: from the right-click menu, no question
+            if v["kind"] == "term" and v["cmd"] not in SHELLS and ch == ord("x") \
+                    and not self.confirm(f"stop {v['cmd'][:14]}?", "x"):
+                return
+            close_tab(v["pane"])
+        elif ch in (ord("x"), ord("X")) and kind == "session":
+            if ch == ord("X") or self.confirm(f"close '{title_of(v, self.status.get(v['id'], {}))[:14]}'?", "x"):
+                close_session(v["id"])
+        elif ch in (ord("x"), ord("X")) and kind == "project":
+            n = sum(s["cwd"] == v for s in self.data["sessions"])
+            if ch == ord("X") or not n or self.confirm(
+                    f"remove {project_name(v)[:14]} and {n} session{'s' * (n > 1)}?", "x"):
+                remove_project(v)
+        elif ch == ord("w"):
+            self.next_attention()
+        elif ch == ord("a") and kind:
+            cwd = self.project_of(kind, v)
+            if self.confirm(f"archive {project_name(cwd)[:16]}?", "a"):
+                archive_project(cwd)
+        elif ch == ord("A"):
+            tmux("display-popup", "-E", "-t", self.pane, "-w", "70%", "-h", "60%", "-T", " archived projects ",
+                 self_cmd("archived"))
+        elif ch == ord("t") and sess:
+            self.side(sess, "term")
+        elif ch == ord("g") and sess:
+            self.side(sess, "git")
+        elif ch in (ord("c"), ord("f")) and sess:
+            self.side(sess, "cmds")
+        elif ch in (ord("J"), ord("K")) and kind in ("project", "session"):
+            self.reorder(kind, v, 1 if ch == ord("J") else -1)
+        elif ch == ord("R") and kind == "session":
+            if self.confirm("restart Claude?", "R"):
+                wid = self.windows.get(v["id"])
+                if wid:
+                    restart_claude(v, wid)
+                    show_window(wid)
+                else:
+                    self.open((kind, v))
+        elif ch == ord("/"):
+            self.find()
+        elif ch == 27 and self.filter:
+            self.filter = ""
+        elif ch == ord("?"):
+            self.help = True
+        elif ch in (ord("t"), ord("g"), ord("c"), ord("f"), ord("x"), ord("r"), ord("R"), ord("J"), ord("K")):
+            self.message = "select a session first"
+        elif ch == curses.KEY_MOUSE:
+            self.mouse()
+
+    def mouse(self):
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if bstate & curses.BUTTON1_PRESSED:
+            self.pressed = time.time()
+        elif bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED):
+            if time.time() - getattr(self, "pressed", 0) < 1:
+                return  # the end of a press already handled: a fold must not fold back
+            bstate |= curses.BUTTON1_CLICKED  # its press went elsewhere (focus moving here): the release is the click
+        if bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            if self.help:
+                self.help = False
+            elif y in self.rows:
+                self.cursor = self.rows[y]
+                kind, v = self.items[self.cursor]
+                w = self.scr.getmaxyx()[1]
+                self.save_view()  # before open: the window it switches to shows the list just like this
+                if kind == "project" and x <= 2:  # its ▸ / ▾
+                    self.fold(v)
+                elif kind == "tab" and v["kind"] == "git" and x >= w - 3:
+                    self.fold_changes(v["project"])
+                else:
+                    self.open((kind, v), click=True)
+            else:
+                key = next((k for fy, x0, x1, k in self.footer if fy == y and x0 <= x < x1), None)
+                if key is not None:
+                    self.key(ord(key) if isinstance(key, str) else key)
+        elif bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED) and y in self.rows and not self.help:
+            self.cursor = self.rows[y]
+            self.context_menu(x, y)
+
+    CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X closes without asking)
+               "session": [("Rename", "r", "r"), ("Restart Claude", "R", "R"), ("Close", "x", "X")],
+               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Archive", "a", "a"),
+                           ("Remove", "x", "X")]}
+
+    def context_menu(self, x, y):
+        """Right click on a row: its actions as a menu; each one is the row's key, sent to the sidebar."""
+        items = self.CONTEXT.get(self.items[self.cursor][0])
+        if not items:
+            return
+        top = tmux("display", "-p", "-t", self.pane, "#{pane_top}")
+        below = int(top or 0) + y + len(items) + 3  # -y is the menu's bottom: it opens just under the row
+        menu = ["display-menu", "-M", "-O", "-t", self.pane, "-x", str(x + 1), "-y", str(below)]
+        for name, key, sent in items:
+            menu += [name, key, f"send-keys -t {self.pane} {sent}"]
+        subprocess.Popen(["tmux", "-L", SOCKET, *menu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def fix_width(self, drag=False):
+        """Keep the sidebar at its saved width. A resize while the window keeps its width is a drag
+        of the border: that width is saved (for every session) instead."""
+        size = tmux("display", "-p", "-t", self.pane, "#{pane_width} #{window_width}")
+        if not size:
+            return
+        pane_w, win_w = map(int, size.split())
+        if sidebar_hidden():  # zoomed away or a sliver next to Claude's terminal; resize-pane would unzoom
+            self.win_w = win_w
+            return
+        want = sidebar_width()
+        if drag and win_w == self.win_w and pane_w != want:
+            conf = read_json(CONFIG, {})
+            conf["sidebar_w"] = want = max(SIDEBAR_MIN, min(pane_w, win_w - 20))
+            write_json(CONFIG, conf)
+        if pane_w != want and win_w > want + 20:
+            tmux("resize-pane", "-t", self.pane, "-x", str(want))
+        self.win_w = win_w
+
+    def run(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for n, color in enumerate((curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                                   curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
+            curses.init_pair(n, color, -1)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        self.scr.keypad(True)
+        while True:
+            flags = (tmux("display", "-p", "-t", self.pane,
+                          "#{window_active} #{session_attached} #{pane_active}") or "0 0 0").split()
+            if flags[0] != "1" or flags[1] == "0":  # not shown: kept drawn, so a switch here shows it as it is
+                self.visible = self.focused = False
+                self.load()
+                self.adopt_view()
+                self.draw()
+                self.scr.timeout(500)
+                self.scr.getch()
+                continue
+            self.focused = flags[2] == "1"
+            self.load()
+            if not self.visible:
+                self.visible = True
+                self.fix_width()
+                self.adopt_view()
+                me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
+                if me and not (self.items and self.is_mine(self.current(), me)):
+                    self.select(("session", self.my_id))
+            if self.my_id:
+                mark_seen(self.my_id)
+            self.frame += 1
+            self.draw()
+            self.scr.timeout(250)
+            ch = self.scr.getch()
+            if ch != -1:
+                self.key(ch)
+                self.save_view()
+
+
+def complete_dir(text):
+    path = os.path.expanduser(text)
+    matches = sorted(p for p in glob.glob(glob.escape(path) + "*") if os.path.isdir(p))
+    if not matches:
+        return text
+    common = os.path.commonprefix(matches)
+    if len(matches) == 1:
+        common += "/"
+    home = os.path.expanduser("~")
+    return common.replace(home, "~", 1) if text.startswith("~") else common
+
+
+def cmd_sidebar():
+    os.environ.setdefault("ESCDELAY", "25")  # esc reacts at once, not after a second
+    message = ""
+    while True:
+        try:
+            curses.wrapper(lambda scr: Sidebar(scr, message).run())
+        except KeyboardInterrupt:
+            message = ""
+        except Exception as e:
+            log(traceback.format_exc())
+            message = f"crashed: {type(e).__name__} (zidev logs)"
+            time.sleep(1)
+
+
+# ── selftest ───────────────────────────────────────────────────────────────
+
+FAKE_CLAUDE = """#!/bin/sh
+# stands in for claude: records its arguments, reports hook events like the real one
+echo "$@" >> "$ZIDEV_HOME/claude-args"
+echo "fake claude $*"
+printf '{"hook_event_name":"SessionStart","session_id":"%s"}' "$ZIDEV_TEST_CID" | "$ZIDEV_SELF" hook
+exec sleep 3600
+"""
+
+
+@contextlib.contextmanager
+def edit_state_at(home):
+    path = f"{home}/sessions.json"
+    d = read_json(path, {})
+    yield d
+    write_json(path, d)
+
+
+def cmd_selftest():
+    """End to end on a throwaway server (own socket and home, fake claude): start, new session,
+    hook states, side panes, reload, restore after kill. Exit status 1 if anything fails."""
+    import tempfile
+    root = tempfile.mkdtemp(prefix="zidev-selftest-")
+    home, proj = f"{root}/home", f"{root}/proj"
+    os.makedirs(proj)
+    with open(f"{proj}/README.md", "w") as f:
+        f.write("# hello\n")
+    with open(f"{proj}/package.json", "w") as f:
+        f.write('{"scripts": {"greet": "echo hi-from-script"}}')
+    open(f"{proj}/pnpm-lock.yaml", "w").close()
+    with open(f"{proj}/page.html", "w") as f:
+        f.write("<h1>served</h1>")
+    subprocess.run(["git", "init", "-q", proj], check=True)
+    browser = f"{root}/browser"
+    with open(browser, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$1\" > {root}/opened\n")
+    os.chmod(browser, 0o755)
+    with open(f"{root}/copy", "w") as f:  # stands in for pbcopy
+        f.write(f"#!/bin/sh\ncat > {root}/copied\n")
+    os.chmod(f"{root}/copy", 0o755)
+    with open(f"{root}/guess", "w") as f:  # stands in for the AI asked which file a name means
+        f.write("#!/bin/sh\ncat >/dev/null\nsleep 1\necho lib/Dup.ts\n")
+    os.chmod(f"{root}/guess", 0o755)
+    fake = f"{root}/claude"
+    with open(fake, "w") as f:
+        f.write(FAKE_CLAUDE)
+    os.chmod(fake, 0o755)
+    sock = f"zidev-selftest-{os.getpid()}"
+    env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
+           "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
+           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy"}
+    env.pop("TMUX", None)
+    failed = []
+
+    def z(*a, stdin=None, extra=None):
+        return subprocess.run([sys.executable, SELF, *a], env={**env, **(extra or {})}, input=stdin,
+                              capture_output=True, text=True)
+
+    def t(*a):
+        r = subprocess.run(["tmux", "-L", sock, *a], capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def wait(cond, timeout=6.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            with contextlib.suppress(Exception):
+                if cond():
+                    return True
+            time.sleep(0.15)
+        return False
+
+    def check(name, good):
+        print(f"  {'\033[32mok' if good else '\033[31mFAIL'}\033[0m  {name}")
+        if not good:
+            failed.append(name)
+
+    def state():
+        return read_json(f"{home}/sessions.json", {}).get("sessions", [{}])[0]
+
+    def status(zid):
+        return read_json(f"{home}/status/{zid}.json", {})
+
+    def kinds():
+        saved = read_json(f"{home}/sessions.json", {}).get("project_tabs", {})
+        return [x["kind"] for x in saved.get(os.path.realpath(proj), [])]
+
+    def panes(wid):
+        return t("list-panes", "-t", wid, "-F", "#{@zidev_side}").splitlines()
+
+    client = None
+    try:
+        r = z("new", proj)
+        if r.returncode:
+            print(r.stderr)
+        check("new session saved while stopped", state().get("cwd") == os.path.realpath(proj))
+        zid = state().get("id", "")
+        z("start")
+        wins = lambda: {z_: w for w, _, z_ in (l.partition(" ") for l in t(
+            "list-windows", "-t", "zidev", "-F", "#{window_id} #{@zidev_id}").splitlines()) if z_}
+        check("server starts with the session window", wait(lambda: zid in wins()))
+        skill = lambda: open(f"{root}/skill/SKILL.md").read() if os.path.exists(f"{root}/skill/SKILL.md") else ""
+        check("start writes the agent skill (keys and CLI from this source)",
+              "name: zidev" in skill() and "rename-project" in skill() and "cmd-b" in skill() and SELF in skill())
+        wid = wins().get(zid, "")
+        args = lambda: open(f"{home}/claude-args").read()
+        check("claude runs with hook settings", wait(lambda: "--settings" in args()))
+        check("fresh session uses --session-id", wait(lambda: f"--session-id {zid}" in args()))
+        check("SessionStart hook: idle + claude id",
+              wait(lambda: status(zid).get("claude_id") == "cid-1" and status(zid)["state"] == "idle"))
+
+        hook = lambda ev: z("hook", stdin=json.dumps(ev), extra={"ZIDEV_ID": zid})
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "fix the   login bug", "session_id": "cid-1"})
+        check("prompt → working, title from prompt",
+              status(zid).get("state") == "working" and status(zid).get("prompt") == "fix the login bug")
+        hook({"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+        check("permission → waiting 'allow Bash?'", status(zid).get("detail") == "allow Bash?")
+        hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion"})
+        check("question → waiting 'has a question'", status(zid).get("detail") == "has a question")
+        hook({"hook_event_name": "Stop"})
+        check("stop → done", status(zid).get("state") == "done")
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "second", "session_id": "cid-2"})
+        check("/clear: claude id followed, title kept",
+              status(zid).get("claude_id") == "cid-2" and status(zid).get("prompt") == "fix the login bug")
+        check("list --json", json.loads(z("list", "--json").stdout)[0]["status"]["state"] == "working")
+
+        # the sidebar reacts only while a client looks at it
+        client = subprocess.Popen(["script", "-q", "/dev/null", "sh", "-c",  # as big as the window: clicks land
+                                   f"stty cols 200 rows 51; exec tmux -T mouse -L {sock} attach -t zidev:{wid}"],
+                                  stdin=subprocess.PIPE, stdout=open(f"{root}/client.out", "wb"), stderr=subprocess.DEVNULL,
+                                  env=env)
+        check("client attaches", wait(lambda: t("list-clients")))
+        t("resize-window", "-t", wid, "-x", "200", "-y", "50")
+        side = f"{wid}.0"
+        check("sidebar draws", wait(lambda: "proj" in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "?")
+        check("? shows the keys", wait(lambda: "zidev keys" in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "Escape")
+        check("any key closes the keys", wait(lambda: "zidev keys" not in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "q")
+        time.sleep(0.5)
+        check("q does nothing (no detach)", t("list-clients"))
+        # a project's display name: sidebar row and notification title; "" gives back the folder's
+        z("rename-project", proj, "Shop UI")
+        check("rename-project: the sidebar shows the name",
+              wait(lambda: "Shop UI" in t("capture-pane", "-p", "-t", side)))
+        z("hook", stdin=json.dumps({"hook_event_name": "Stop"}), extra={"ZIDEV_ID": zid, "ZIDEV_NOTIFY": "log", "TMUX_PANE": "%999"})  # not on screen
+        check("rename-project: notifications use the name",
+              open(f"{home}/notifications").read().startswith("Shop UI · "))
+        z("rename-project", proj, "")
+        check("rename-project '': the folder's name again", wait(lambda: "Shop UI" not in (
+            cap := t("capture-pane", "-p", "-t", side)) and "proj" in cap))
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "second", "session_id": "cid-2"})
+        # right click on a row: its actions as a menu (here the session's: r renames)
+        row = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "fix the login" in l)
+        top = 1 if t("show", "-gv", "status") == "on" and t("show", "-gv", "status-position") == "top" else 0
+        for end in "Mm":
+            client.stdin.write(f"\x1b[<2;4;{row + top + 1}{end}".encode())
+            client.stdin.flush()
+            time.sleep(0.1)
+        check("right click on a row: a menu with its actions",
+              wait(lambda: b"Rename" in open(f"{root}/client.out", "rb").read()))
+        client.stdin.write(b"r")
+        client.stdin.flush()
+        check("the menu's item runs on that row (r: name prompt)",
+              wait(lambda: "name:" in t("capture-pane", "-p", "-t", side)))
+        check("r: not the long first prompt to edit, an empty name",
+              any(l.strip() == "name:" for l in t("capture-pane", "-p", "-t", side).splitlines()))
+        t("send-keys", "-t", side, "Escape")
+        wait(lambda: "name:" not in t("capture-pane", "-p", "-t", side))
+        # Claude's names for the session (its own title, /rename) from its transcript; r wins until a later /rename
+        tr = f"{root}/transcript.jsonl"
+        say = lambda e: open(tr, "a").write(json.dumps(e) + "\n")
+        shows = lambda text: wait(lambda: text in t("capture-pane", "-p", "-t", side))
+        say({"type": "user", "message": "hi"})
+        say({"type": "ai-title", "aiTitle": "Login bug hunt"})
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "more", "transcript_path": tr})
+        check("Claude's own title names the session", shows("Login bug hunt"))
+        say({"type": "custom-title", "customTitle": "Auth fix"})
+        check("/rename in Claude renames it in the sidebar", shows("Auth fix"))
+        t("select-pane", "-t", side)  # the cursor is still on the session (the right click put it there)
+        t("send-keys", "-t", side, "r")
+        wait(lambda: "name: Auth fix" in t("capture-pane", "-p", "-t", side))
+        t("send-keys", "-t", side, "C-u")
+        t("send-keys", "-t", side, "-l", "Mine")
+        t("send-keys", "-t", side, "Enter")
+        check("r renames it over Claude's name", wait(lambda: "Mine" in (cap := t("capture-pane", "-p", "-t", side))
+                                                       and "Auth fix" not in cap and "name:" not in cap))
+        say({"type": "custom-title", "customTitle": "Later name"})
+        check("a later /rename wins again", shows("Later name"))
+        open(f"{root}/empty.jsonl", "w").close()
+        t("send-keys", "-t", side, "r")  # "": no name of its own
+        wait(lambda: "name: Later name" in t("capture-pane", "-p", "-t", side))
+        t("send-keys", "-t", side, "C-u")
+        t("send-keys", "-t", side, "Enter")
+        wait(lambda: "name:" not in t("capture-pane", "-p", "-t", side))
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "more", "transcript_path": f"{root}/empty.jsonl"})
+        check("no names: the first prompt", shows("fix the login bug"))
+        # tabs: one fills the window (never split), the others wait in the park; the sidebar lists them
+        def cursor_to(text):  # the sidebar's cursor to the first row with text
+            t("select-pane", "-t", side)  # focused: the cursor shows
+            t("send-keys", "-t", side, *["k"] * 30)
+            time.sleep(0.5)
+            lit = lambda: next((l for l in t("capture-pane", "-p", "-e", "-t", side).splitlines() if "\x1b[7m" in l), "")
+            for _ in range(40):
+                row = lit()
+                if text in row:
+                    return
+                t("send-keys", "-t", side, "j")
+                wait(lambda: lit() != row, 2)  # one step at a time: a slow redraw must not make it overshoot
+
+        pane_of = lambda kind: next((p for p, k in (l.split(" ") for l in t(
+            "list-panes", "-a", "-F", "#{pane_id} #{@zidev_side}").splitlines() if " " in l) if k == kind), "")
+        main = lambda: t("display", "-p", "-t", f"{wid}.1", "#{@zidev_side}")
+        docked = lambda: len(t("list-panes", "-t", wid, "-f", "#{!=:#{pane_floating_flag},1}", "-F", "x").split())
+        check("claude is the first tab", main() == "claude")
+        t("send-keys", "-t", side, "t")
+        check("t opens a terminal tab, full size", wait(lambda: main() == "term" and docked() == 2 and "term" in kinds()))
+        check("the sidebar lists it under the project", wait(lambda: "terminal" in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "c")
+        check("c: the commands tab takes its place", wait(lambda: main() == "cmds" and docked() == 2))
+        check("commands tab lists scripts and files",
+              wait(lambda: all(x in t("capture-pane", "-p", "-t", f"{wid}.1") for x in ("greet", "README.md"))))
+        t("send-keys", "-t", f"{wid}.1", "-l", "greet")
+        t("send-keys", "-t", f"{wid}.1", "Enter")
+        check("⏎ on a script runs it in the terminal tab",
+              wait(lambda: main() == "term" and "hi-from-script" in t("capture-pane", "-p", "-t", f"{wid}.1")
+                   and "pnpm greet" in t("capture-pane", "-p", "-t", f"{wid}.1"), 20))
+        check("the same terminal, not a new one", kinds().count("term") == 1)
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on the session shows Claude", wait(lambda: main() == "claude"))
+        t("send-keys", "-t", side, "j")
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on a tab row shows that tab", wait(lambda: main() == "term"))
+        z("tab", "next", pane_of("term"))
+        check("next tab", wait(lambda: main() == "git"))
+        z("tab", "prev", pane_of("git"))
+        check("previous tab", wait(lambda: main() == "term"))
+        z("tab", "up", pane_of("term"))
+        check("cmd-↑: the item above (Claude)", wait(lambda: main() == "claude"))
+        z("tab", "up", pane_of("claude"))
+        check("cmd-↑ at the top stays", main() == "claude")
+        z("tab", "down", pane_of("claude"))
+        check("cmd-↓: the item below (terminal)", wait(lambda: main() == "term"))
+        z("tab", "down", pane_of("term"))
+        time.sleep(0.5)
+        check("cmd-↓ skips the changes tab", main() == "term")
+        zoomed = lambda: t("display", "-p", "-t", wid, "#{window_zoomed_flag}") == "1"
+        z("tab", "sidebar", pane_of("term"))
+        check("cmd-b hides the sidebar", wait(zoomed))
+        z("tab", "up", pane_of("term"))
+        check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(zoomed))
+        t("resize-window", "-t", wid, "-x", "180", "-y", "50")
+        time.sleep(1)
+        t("resize-window", "-t", wid, "-x", "200", "-y", "50")
+        time.sleep(1)
+        check("it stays hidden when the window resizes", zoomed())
+        z("tab", "sidebar", pane_of("claude"))
+        check("cmd-b shows it again", wait(lambda: not zoomed()))
+        sides = lambda: t("list-panes", "-t", wid, "-F", "#{@zidev_side}").split()
+        width = t("display", "-p", "-t", f"{wid}.0", "#{pane_width}")
+        z("tab", "split", pane_of("claude"))
+        check("cmd-t: a terminal next to Claude", wait(lambda: sides()[-2:] == ["claude", "split"]))
+        z("tab", "down", pane_of("claude"))
+        check("another tab: the terminal is away", wait(lambda: main() == "term" and "split" not in sides()))
+        z("tab", "up", pane_of("term"))
+        check("Claude again: its terminal is back", wait(lambda: main() == "claude" and "split" in sides()))
+        z("tab", "sidebar", pane_of("claude"))
+        check("hidden sidebar keeps the terminal",
+              wait(lambda: t("display", "-p", "-t", f"{wid}.0", "#{pane_width}") == "1") and "split" in sides())
+        z("tab", "sidebar", pane_of("claude"))
+        check("shown again, its width as before", wait(lambda: t("display", "-p", "-t", f"{wid}.0", "#{pane_width}") == width))
+        z("tab", "split", pane_of("claude"))
+        check("cmd-t again: away", wait(lambda: "split" not in sides()))
+        z("tab", "down", pane_of("claude"))
+        wait(lambda: main() == "term")
+        z("tab", "select", pane_of("cmds"))
+        wait(lambda: main() == "cmds")
+        z("tab", "close", pane_of("cmds"))
+        check("closing a tab: the one used before comes back", wait(lambda: main() == "term" and "cmds" not in kinds()))
+
+        term = pane_of("term")
+        z("open", "README.md", extra={"TMUX_PANE": f"{wid}.1"})
+        floats = lambda: t("list-panes", "-t", wid, "-f", "#{pane_floating_flag}", "-F", "#{pane_id} #{@zidev_label}")
+        check("zidev open: floating preview", wait(lambda: "README.md" in floats()))
+        time.sleep(0.5)
+        fl = floats().split()[0]
+        left, top = map(int, t("display", "-p", "-t", fl, "#{pane_left} #{pane_top}").split())
+        for b in (65, 64, 65):  # wheel: arrow keys to less, which must not read them as esc
+            client.stdin.write(f"\x1b[<{b};{left + 5};{top + 3}M".encode())
+            client.stdin.flush()
+            time.sleep(0.2)
+        time.sleep(0.5)
+        check("the wheel scrolls the preview, does not close it", "README.md" in floats())
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
+        check("esc closes the preview", wait(lambda: not floats()))
+        z("tab", "git", term)
+        git = lambda: t("list-panes", "-t", wid, "-f", "#{&&:#{==:#{@zidev_side},git},#{!=:#{pane_floating_flag},1}}",
+                        "-F", "#{pane_id}")
+        check("g: changes tab shows the diff",
+              wait(lambda: git() and "git" in kinds() and "README.md" in t("capture-pane", "-p", "-t", git())))
+        check("its changed files are folded, their number shown",
+              wait(lambda: any(re.search(r"changes +\d+ ▸", l) for l in t("capture-pane", "-p", "-t", side).splitlines()))
+              and "? README.md" not in t("capture-pane", "-p", "-t", side))
+        cursor_to("changes")
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on the shown changes tab unfolds them",
+              wait(lambda: all(f in t("capture-pane", "-p", "-t", side) for f in ("? README.md", "? package.json"))))
+        check("one file at a time: scrolling never runs into the next",
+              "package.json" not in t("capture-pane", "-p", "-S", "-", "-t", git()))
+        cursor_to("package.json")
+        check("the cursor on a changed file: the diff of just that file",
+              wait(lambda: "package.json" in t("capture-pane", "-p", "-t", git())
+                   and "README.md" not in t("capture-pane", "-p", "-t", git())))
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on a changed file: it opens as a file tab",
+              wait(lambda: main() == "file" and "package.json" in t("display", "-p", "-t", pane_of("file"), "#{@zidev_file}")))
+        z("tab", "close", pane_of("file"))
+        wait(lambda: "file" not in kinds())
+        z("tab", "git", term)
+        wait(lambda: bool(git()) and "package.json" in t("capture-pane", "-p", "-t", git()))
+        t("send-keys", "-t", git(), "Enter")
+        check("⏎ in a file's diff: the file as a tab",
+              wait(lambda: main() == "file" and "package.json" in t("display", "-p", "-t", pane_of("file"), "#{@zidev_file}")))
+        z("tab", "close", pane_of("file"))
+        wait(lambda: "file" not in kinds())
+        z("tab", "git", term)
+        wait(lambda: bool(git()))
+        t("select-pane", "-t", git())
+        time.sleep(0.5)
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
+        time.sleep(0.5)
+        check("esc closes it; it stays, parked", wait(lambda: not git() and kinds().count("git") == 1))
+        z("tab", "git", term)
+        check("g again: the same tab, no second one", wait(lambda: bool(git())) and kinds().count("git") == 1)
+        z("tab", "close", git())
+        check("closing it shows the terminal again; it stays, parked",
+              wait(lambda: main() == "term" and kinds().count("git") == 1))
+        z("open", f"{proj}/README.md", extra={"TMUX_PANE": f"{wid}.1"})
+        wait(lambda: "hello" in t("capture-pane", "-p", "-t", (floats() or "x").split()[0]))
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Enter")
+        check("enter docks a markdown preview, still rendered",
+              wait(lambda: not floats() and "hello" in t("capture-pane", "-p", "-t", pane_of("file"))))
+        z("open", f"{proj}/README.md", extra={"TMUX_PANE": f"{wid}.1"})
+        check("opening a docked file again shows its tab, no preview",
+              wait(lambda: not floats() and main() == "file") and kinds().count("file") == 1)
+        z("open", f"{proj}/README.md", "--tab", extra={"TMUX_PANE": f"{wid}.1"})
+        time.sleep(0.5)
+        check("a file is never two tabs", kinds().count("file") == 1)
+        z("tab", "close", pane_of("file"))
+        wait(lambda: "file" not in kinds())
+        t("send-keys", "-t", term, "-l", "clear; seq 200")
+        t("send-keys", "-t", term, "Enter")
+        t("select-pane", "-t", side)
+        still = lambda: re.sub(r"[\u2800-\u28ff]|\d+[smhd]\b", "", t("capture-pane", "-p", "-t", side))  # no spinner, age
+        wait(lambda: still() == (time.sleep(0.6) or still()))  # settled
+        before = still()
+        left, top = map(int, t("display", "-p", "-t", term, "#{pane_left} #{pane_top}").split())
+        client.stdin.write(f"\x1b[<64;{left + 5};{top + 5}M".encode())  # wheel up over the terminal
+        client.stdin.flush()
+        check("the wheel scrolls the pane under the mouse, not the focused sidebar",
+              wait(lambda: t("display", "-p", "-t", term, "#{pane_in_mode}") == "1") and still() == before)
+        wait(lambda: t("send-keys", "-t", term, "-X", "cancel") is not None
+             and t("display", "-p", "-t", term, "#{pane_in_mode}") == "0")  # a late wheel may enter it again
+        t("send-keys", "-t", term, "-l", "clear; echo 'Read(package.json) and more'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: any(l.startswith("Read(") for l in t("capture-pane", "-p", "-t", term).split("\n")))
+        screen = t("capture-pane", "-p", "-t", term).split("\n")
+        y = next(i for i, l in enumerate(screen) if l.startswith("Read("))
+        def mouse_click(pane, x, y):  # a real click through the client, so the tmux bindings run
+            left, top = map(int, t("display", "-p", "-t", pane, "#{pane_left} #{pane_top}").split())
+            top += 1 if t("show", "-gv", "status") == "on" and t("show", "-gv", "status-position") == "top" else 0
+            for end in "Mm":
+                client.stdin.write(f"\x1b[<0;{left + x + 1};{top + y + 1}{end}".encode())
+                client.stdin.flush()
+                time.sleep(0.1)
+        mouse_click(term, 7, y)
+        check("click on a path: preview shows that file", wait(lambda: "package.json" in floats()))
+        z("click", term, "1", str(y))
+        check("click beside a path: nothing", "package.json" in floats())
+        esc = lambda: t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
+        esc()
+        wait(lambda: not floats())
+        os.makedirs(f"{root}/work-todos/open", exist_ok=True)
+        open(f"{root}/work-todos/open/wrapnote.md", "w").write("# wrapped\n")
+        t("send-keys", "-t", term, "-l", f"clear; printf '• Chat: {root}/work-\\n  todos/open/wrapnote.md and on\\n'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "  todos/open/wrapnote.md" in t("capture-pane", "-p", "-t", term))
+        screen = t("capture-pane", "-p", "-t", term).split("\n")
+        wy = next(i for i, l in enumerate(screen) if l.startswith("• Chat"))
+        mouse_click(term, 12, wy)
+        check("click on the first row of a wrapped path: the whole file",
+              wait(lambda: "wrapnote.md" in floats()))
+        esc()
+        wait(lambda: not floats())
+        mouse_click(term, 6, wy + 1)
+        check("click on its indented second row (wrapped at a -): the whole file",
+              wait(lambda: "wrapnote.md" in floats()))
+        esc()
+        wait(lambda: not floats())
+        t("send-keys", "-t", term, "-l", "clear; echo 'Read(package.json) and more'")  # its preview again, for below
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "Read(package.json)" in t("capture-pane", "-p", "-t", term))
+        mouse_click(term, 7, y)
+        wait(lambda: "package.json" in floats())
+        check("a click on a web link is zidev's (it opens the browser)",
+              z("ispath", term, "1", str(y), "https://example.com/issues/181").returncode == 0
+              and z("ispath", term, "1", str(y), "").returncode == 1)
+        esc()
+        wait(lambda: not floats())
+        t("send-keys", "-t", term, "-l", "clear; printf 'type \\033[34m! echo bang-ran\\033[39m in the prompt\\n'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "type ! echo bang-ran in" in t("capture-pane", "-p", "-t", term))
+        by = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", term).split("\n")) if l.startswith("type !"))
+        t("set", "-p", "-t", term, "@zidev_side", "claude")  # Claude's pane, for this click
+        mouse_click(term, 9, by)
+        check("click on a `! command` in Claude: copied",
+              wait(lambda: open(f"{root}/copied").read() == "echo bang-ran"))
+        typed = lambda: t("capture-pane", "-p", "-t", term).rstrip().endswith("!echo bang-ran")
+        for _ in range(3):  # the client may not see two clicks in time as one double click
+            time.sleep(0.6)  # not a double click with the one before
+            mouse_click(term, 9, by)
+            mouse_click(term, 9, by)
+            if wait(typed, 3):
+                break
+        check("double click on it: typed into Claude's prompt, not sent", typed())
+        t("set", "-p", "-t", term, "@zidev_side", "term")
+        t("send-keys", "-t", term, "C-u")
+        t("send-keys", "-t", term, "-l", "clear; python3 -c \"input('Deploy now? (y/N) ')\"")
+        t("send-keys", "-t", term, "Enter")
+        side_now = lambda: t("capture-pane", "-p", "-t", side)
+        asks = lambda: any("terminal" in l or "python" in l.lower() for l in side_now().split("\n") if l.rstrip().endswith("●"))
+        check("a script asking something: its terminal tab is marked in the sidebar",
+              wait(asks, 8) and "need you" in side_now())
+        t("send-keys", "-t", term, "y", "Enter")
+        check("answered: the mark goes", wait(lambda: not asks()))
+        uq = f"{root}/uniq"
+        os.makedirs(f"{uq}/src/deep", exist_ok=True)
+        os.makedirs(f"{uq}/lib", exist_ok=True)
+        for f in ("src/deep/Only.ts", "src/Twice.ts", "lib/Twice.ts"):
+            open(f"{uq}/{f}", "w").write("x\n")
+        subprocess.run(["git", "-C", uq, "init", "-q"], check=True)
+        check("a bare name only one file has: that file (with its line)",
+              unique_file("Only.ts:3", uq) == (f"{os.path.realpath(uq)}/src/deep/Only.ts", "3")
+              and unique_file("deep/Only.ts", uq)[0] is not None)
+        check("a name two files share, or none has: nothing",
+              unique_file("Twice.ts", uq) == (None, None) and unique_file("Nope.ts", uq) == (None, None)
+              and unique_file("hello", uq) == (None, None))
+        os.makedirs(f"{root}/shots/a")
+        open(f"{root}/shots/a/before-table.png", "wb").write(b"\x89PNG")
+        check("a bare name: the full path shown earlier with it, also outside the project",
+              unique_file("before-table.png", uq, f"saved {root}/shots/a/before-table.png\nsee before-table.png")
+              == (f"{root}/shots/a/before-table.png", None))
+        nogit = f"{root}/nogit"
+        os.makedirs(f"{nogit}/img")
+        open(f"{nogit}/img/before-table.png", "wb").write(b"\x89PNG")
+        check("a bare name in a folder without git: its one file",
+              unique_file("before-table.png", nogit) == (f"{nogit}/img/before-table.png", None))
+        os.makedirs(f"{root}/anime/v2_persisch", exist_ok=True)
+        open(f"{root}/anime/v2_persisch/ep1.txt", "w").write("x\n")
+        t("send-keys", "-t", term, "-l", f"clear; cd {root}; echo 'see anime/v2_persisch/ there'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "see anime" in t("capture-pane", "-p", "-t", term))
+        ay = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", term).split("\n")) if l.startswith("see anime"))
+        check("a click on a folder path is zidev's (not a web link)",
+              wait(lambda: z("ispath", term, "8", str(ay), "").returncode == 0))
+        check("its listing shows in the preview",
+              wait(lambda: z("click", term, "8", str(ay)) and "v2_persisch" in floats())
+              and wait(lambda: "ep1.txt" in t("capture-pane", "-p", "-t", floats().split()[0])))
+        esc()
+        wait(lambda: not floats())
+        for f in ("src/Dup.ts", "lib/Dup.ts"):
+            os.makedirs(os.path.dirname(f"{proj}/{f}"), exist_ok=True)
+            open(f"{proj}/{f}", "w").write(f"// {f}\n")
+        t("send-keys", "-t", term, "-l", "clear; echo 'see Dup.ts here'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: any(l.startswith("see Dup") for l in t("capture-pane", "-p", "-t", term).split("\n")))
+        dy = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", term).split("\n")) if l.startswith("see Dup"))
+        mouse_click(term, 6, dy)
+        bar = lambda: t("capture-pane", "-p", "-t", side)
+        check("a name several files have: they list in the sidebar to pick",
+              wait(lambda: "which Dup.ts?" in bar() and "src/Dup.ts" in bar() and "lib/Dup.ts" in bar()))
+        check("the AI's guess goes first, marked",
+              wait(lambda: "✦ lib/Dup.ts" in bar()) and bar().index("lib/Dup.ts") < bar().index("src/Dup.ts"))
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on one: its preview, the list goes",
+              wait(lambda: "Dup.ts" in floats() and "which Dup.ts?" not in bar()))
+        esc()
+        wait(lambda: not floats())
+        t("send-keys", "-t", term, "-l", "cd - >/dev/null; clear; echo 'Read(package.json) and more'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "Read(package.json)" in t("capture-pane", "-p", "-t", term))
+        mouse_click(term, 7, y)
+        wait(lambda: "package.json" in floats())
+        check("a link without a line takes the line shown: UITicket.svelte.ts:96",
+              line_in("UITicket.svelte.ts:96", "/p/src/UITicket.svelte.ts") == "96"
+              and line_in("Other.ts:9", "/p/src/UITicket.svelte.ts") is None)
+        repo, g = f"{root}/branchy", ["git", "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t"]
+        os.makedirs(repo)
+        with open(f"{repo}/a.ts", "w") as f:
+            f.write("".join(f"{n}\n" for n in range(1, 11)))
+        for c in (["init", "-q", "-b", "main"], ["add", "."], ["commit", "-qm", "i"], ["checkout", "-qb", "feat"]):
+            subprocess.run([*g, "-C", repo, *c], check=True)
+        with open(f"{repo}/a.ts", "w") as f:
+            f.write("1\n2\nthree\n4\n5\n6\n8\n9\n10\n11\n")
+        subprocess.run([*g, "-C", repo, "commit", "-qam", "f"], check=True)
+        with open(f"{repo}/a.ts", "a") as f:
+            f.write("12\n")
+        check("preview marks the branch's changes (committed and not) against main",
+              branch_marks(f"{repo}/a.ts") == ({3: "changed", 6: "deleted", 10: "added", 11: "added"}, "main"))
+        shown = re.sub(r"\033\[[0-9;]*m", "", render_file(f"{repo}/a.ts", "3")[0]).split("\n")
+        check("file line n is screen line n, no line numbers (less +ng lands on it)",
+              shown[2].split() == ["▎", "three"] and "changed vs main" in view_prompt(f"{repo}/a.ts", ""))
+        with open(f"{root}/long.py", "w") as f:
+            f.write("def f():\n    x = [" + ", ".join(f"item_{i}" for i in range(40)) + "]\n    return x\n")
+        shown, origin = render_file(f"{root}/long.py")
+        rows = re.sub(r"\033\[[0-9;]*m", "", shown).split("\n")[:-1]
+        check("a long line folds under its indentation, the rows know their file line",
+              len(rows) > 3 and rows[2].startswith(" " * 10) and origin[:3] == [1, 2, 2] and origin[-1] == 3
+              and all(len(r) <= 80 for r in rows))
+        t("send-keys", "-t", term, "-l", "clear; echo 'Read(page.html) and more'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "Read(page.html)" in t("capture-pane", "-p", "-t", term))
+        screen = t("capture-pane", "-p", "-t", term).split("\n")
+        z("click", term, "7", str(next(i for i, l in enumerate(screen) if l.startswith("Read("))))
+        time.sleep(0.5)
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "b")
+        def served():
+            import urllib.request
+            try:
+                url = open(f"{root}/opened").read().strip()
+                return urllib.request.urlopen(url, timeout=1).read() == b"<h1>served</h1>"
+            except (OSError, ValueError):
+                return False
+        check("html click → menu → b: served and opened in the browser", wait(served))
+        with open(f"{proj}/clip.mp4", "wb") as f:
+            f.write(b"\0\0\0 ftypisom")
+        t("send-keys", "-t", term, "-l", "clear; echo 'Read(clip.mp4) and more'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: "Read(clip.mp4)" in t("capture-pane", "-p", "-t", term))
+        screen = t("capture-pane", "-p", "-t", term).split("\n")
+        z("click", term, "7", str(next(i for i, l in enumerate(screen) if l.startswith("Read("))))
+        check("click on a binary file: opened in its default app",
+              wait(lambda: open(f"{root}/opened").read().strip().endswith("/clip.mp4")))
+        subprocess.call(["pkill", "-f", f"http.server .*{os.path.basename(root)}/proj"])
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Enter")
+        check("enter docks the preview as a tab",
+              wait(lambda: not floats() and "file" in panes(wid) and "file" in kinds()))
+        check("the docked tab still shows the file",
+              wait(lambda: "scripts" in t("capture-pane", "-p", "-t", pane_of("file"))))
+        z("tab", "close", pane_of("file"))
+        check("closing the file tab shows the terminal again", wait(lambda: main() == "term" and "file" not in kinds()))
+
+        cursor_to("terminal")
+        t("send-keys", "-t", side, "x")
+        check("x on the terminal: the tab before comes back, the terminal stays (fresh, parked)",
+              wait(lambda: main() == "git" and kinds().count("term") == 1))
+        z("tab", "claude", f"{wid}.1")
+        cursor_to("fix the login bug")
+        t("send-keys", "-t", side, "/")
+        t("send-keys", "-t", side, "-l", "nomatch")
+        check("/ filters", wait(lambda: "no match" in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "Escape")
+        check("esc cancels the filter", wait(lambda: "no match" not in t("capture-pane", "-p", "-t", side)))
+
+        z("tab", "select", pane_of("term"))
+        wait(lambda: main() == "term")
+        z("tab", "claude", f"{wid}.1")
+        wait(lambda: main() == "claude")
+
+        z("new", proj, "--prompt", "task from todo")
+        ids = lambda: [x["id"] for x in read_json(f"{home}/sessions.json", {})["sessions"]]
+        check("second session", wait(lambda: len(ids()) == 2 and len(wins()) == 2))
+        check("--prompt is Claude's first message, sent once",
+              wait(lambda: "task from todo" in open(f"{home}/claude-args").read()
+                   and not any("prompt" in x for x in read_json(f"{home}/sessions.json", {})["sessions"])))
+        t("select-window", "-t", wid)  # `new` switched to the new session
+        time.sleep(1.2)
+        t("send-keys", "-t", side, "J")
+        check("J moves a session down", wait(lambda: ids()[1] == zid))
+        t("send-keys", "-t", side, "K")
+        check("K moves it back up", wait(lambda: ids()[0] == zid))
+        wid2 = wins()[ids()[1]]
+        main2 = lambda: t("display", "-p", "-t", f"{wid2}.1", "#{@zidev_side}")
+        t("select-window", "-t", wid2)
+        time.sleep(1)
+        t("send-keys", "-t", f"{wid2}.0", "t")
+        check("tabs are the project's: the second session shows the same terminal",
+              wait(lambda: main2() == "term" and kinds().count("term") == 1))
+        check("the sidebar lists it once",
+              wait(lambda: t("capture-pane", "-p", "-t", f"{wid2}.0").count("terminal") == 1))
+        side2 = f"{wid2}.0"
+        prow = lambda: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side2).splitlines()) if "proj" in l)
+        active = lambda: t("display", "-p", "#{window_id}")
+        mouse_click(side2, 6, prow())
+        check("click on a project: its first session, the project stays unfolded",
+              wait(lambda: active() == wid) and "▾ proj" in t("capture-pane", "-p", "-t", side))
+        t("select-window", "-t", wid2)
+        time.sleep(1)
+        mouse_click(side2, 1, prow())
+        check("click on its ▾: folds it, nothing opens",
+              wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side2)) and active() == wid2)
+        mouse_click(side2, 6, prow())
+        check("a folded project opens its first session too, stays folded",
+              wait(lambda: active() == wid) and wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side)))
+        mouse_click(side, 1, next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l))
+        wait(lambda: "▾ proj" in t("capture-pane", "-p", "-t", side))
+        left, top = map(int, t("display", "-p", "-t", side, "#{pane_left} #{pane_top}").split())
+        client.stdin.write(f"\x1b[<65;{left + 3};{top + 5}M".encode())  # wheel down over the sidebar
+        client.stdin.flush()
+        time.sleep(0.5)
+        check("the wheel over the sidebar scrolls it (no copy mode)",
+              t("display", "-p", "-t", side, "#{pane_in_mode}") == "0" and "proj" in t("capture-pane", "-p", "-t", side))
+        t("select-window", "-t", wid)
+        time.sleep(1)
+        t("send-keys", "-t", side, "t")
+        check("t in the first session moves it there; the second shows its Claude",
+              wait(lambda: main() == "term" and main2() == "claude"))
+        z("tab", "claude", f"{wid}.1")
+        wait(lambda: main() == "claude")
+        cursor_to("fix the login bug")  # the cursor stays where it was (switching windows keeps it)
+        t("send-keys", "-t", side, "R")
+        t("send-keys", "-t", side, "R")
+        check("R R restarts claude", wait(lambda: sum(zid in l or "cid-2" in l for l in args().splitlines()) == 2))
+        z("hook", stdin=json.dumps({"hook_event_name": "SessionEnd"}), extra={"ZIDEV_ID": ids()[1]})
+        t("kill-window", "-t", wins()[ids()[1]])
+        with edit_state_at(home) as d:
+            d["sessions"] = [x for x in d["sessions"] if x["id"] == zid]
+
+        # the usual mac keys in the editor: cmd-a, cmd-x, cmd-z reach micro as its ctrl keys
+        with open(f"{root}/edit.txt", "w") as f:
+            f.write("mac keys work\n")
+        os.makedirs(f"{root}/micro", exist_ok=True)
+        write_json(f"{root}/micro/bindings.json",  # zidev's, without its plugin's
+                   {k: v for k, v in MICRO_BINDINGS.items() if not v.startswith("lua:")})
+        ed = t("new-window", "-P", "-F", "#{pane_id}", "-t", "zidev", "-e", f"MICRO_CONFIG_HOME={root}/micro",
+               f"micro -clipboard internal {root}/edit.txt")
+        screen = lambda: t("capture-pane", "-p", "-t", ed)
+        check("editor runs", wait(lambda: "mac keys work" in screen()))
+        def cmd_key(name):
+            client.stdin.write(next(q for q, k, _, _ in EDIT_KEYS if k == name).encode())
+            client.stdin.flush()
+            time.sleep(0.4)
+        for name in ("cmd-a", "cmd-x"):
+            cmd_key(name)
+        check("cmd-a cmd-x: cut all", wait(lambda: "mac keys work" not in screen()))
+        cmd_key("cmd-z")
+        check("cmd-z: undo", wait(lambda: "mac keys work" in screen()))
+        cmd_key("cmd-right")
+        t("send-keys", "-t", ed, "-l", "!")
+        cmd_key("alt-left")
+        t("send-keys", "-t", ed, "-l", "_")
+        check("cmd-→ line end, alt-← a word back (WebStorm keys)", wait(lambda: "mac keys _work!" in screen()))
+        cmd_key("cmd-backspace")
+        check("cmd-backspace deletes the line", wait(lambda: "mac keys" not in screen()))
+        t("kill-pane", "-t", ed)
+        t("select-window", "-t", wid)
+
+        out = z("reload").stdout
+        check("reload respawns sidebars and commands", "reloaded" in out)
+        check("reload keeps claude running", wait(lambda: len(args().splitlines()) == 3))
+
+        proj3 = f"{root}/proj3"
+        os.makedirs(proj3)
+        z("new", proj3)
+        z("new", proj3)
+        t("select-window", "-t", wid)
+        wait(lambda: "proj3" in t("capture-pane", "-p", "-t", side))
+        n_wins = len(wins())
+        cursor_to("proj3")
+        t("send-keys", "-t", side, "x")
+        check("x on a project with sessions asks", wait(lambda: "and 2 sessions?" in t("capture-pane", "-p", "-t", side)))
+        t("send-keys", "-t", side, "x")
+        check("x x removes it with its sessions",
+              wait(lambda: len(wins()) == n_wins - 2 and "proj3" not in t("capture-pane", "-p", "-t", side)
+                   and not any(x["cwd"] == proj3 for x in json.load(open(f"{home}/sessions.json"))["sessions"])))
+        n_args = len(args().splitlines())
+        t("kill-server")
+        z("start")
+        check("restore after kill: window back", wait(lambda: zid in wins()))
+        wid = wins().get(zid, "")
+        check("restore: terminal tab back, parked", wait(lambda: pane_of("term") and main() == "claude"))
+        check("restore restarts claude on its claude id",
+              wait(lambda: len(args().splitlines()) == n_args + 1 and status(zid)["claude_id"] in args().splitlines()[-1]))
+        proj2 = f"{root}/proj2"
+        os.makedirs(proj2)
+        z("new", proj2)
+        n_wins = len(wins())
+        check("archive: its sessions stop, it leaves the sidebar",
+              "archived" in z("archive", proj2).stdout and wait(lambda: len(wins()) == n_wins - 1
+                  and "proj2" not in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        check("archive: its tabs stop too", wait(lambda: not any(
+            l.endswith("proj2") for l in t("list-panes", "-a", "-F", "#{@zidev_project}").splitlines())))
+        z("unarchive", proj2)
+        check("unarchive: session and terminal back",
+              wait(lambda: len(wins()) == n_wins and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        check("doctor runs", "tools" in z("doctor").stdout)
+    finally:
+        if client:
+            client.kill()
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"\n{'all passed' if not failed else f'{len(failed)} failed'}")
+    sys.exit(1 if failed else 0)
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd == "hook":
+        return cmd_hook()
+    if cmd == "width":  # a hook of older versions
+        return
+    if cmd == "ispath":  # every click in a pane: keep it light
+        return cmd_ispath(*args[1:5])
+    if cmd in ("click", "bang", "tab", "tabsync", "html"):  # tmux bindings and hooks
+        try:
+            {"click": lambda: cmd_click(*args[1:4]), "bang": lambda: cmd_bang(*args[1:4]), "tab": lambda: cmd_tab(args[1:]),
+             "tabsync": cmd_tabsync, "html": lambda: cmd_html(*args[1:5])}[cmd]()
+        except Exception:
+            log(f"{cmd}: {traceback.format_exc()}")
+        return
+    migrate_home()
+    setup_dirs()
+    if cmd in ("", "start") and old_server_running():
+        sys.exit("the old zmux server is still running with the same sessions.\n"
+                 "stop it first (sessions are saved; Claude resumes): tmux -L zmux kill-server")
+    if cmd == "":
+        cmd_start()
+    elif cmd == "start":
+        ensure_server()
+    elif cmd == "new":
+        cmd_new(args[1:])
+    elif cmd == "rename-project":
+        cmd_rename_project(args[1:])
+    elif cmd in ("archive", "unarchive"):
+        cmd_archive(args[1:], cmd == "archive")
+    elif cmd == "archived":
+        cmd_archived()
+    elif cmd == "list":
+        cmd_list(args[1:])
+    elif cmd == "status":
+        cmd_list(["--json"])
+    elif cmd == "kill":
+        cmd_kill()
+    elif cmd == "reload":
+        cmd_reload()
+    elif cmd == "doctor":
+        cmd_doctor()
+    elif cmd == "guess":
+        cmd_guess(args[1])
+    elif cmd == "logs":
+        cmd_logs(args[1:])
+    elif cmd == "selftest":
+        cmd_selftest()
+    elif cmd == "run":
+        cmd_run(args[1])
+    elif cmd == "term":
+        cmd_term(args[1])
+    elif cmd == "git":
+        cmd_git(*args[1:3])
+    elif cmd in ("cmds", "files"):
+        cmd_cmds(args[1])
+    elif cmd == "view":
+        cmd_view(*args[1:3])
+    elif cmd == "open":
+        cmd_open(args[1:])
+    elif cmd == "preview":
+        cmd_preview(*args[1:4])
+    elif cmd == "sidebar":
+        cmd_sidebar()
+    elif cmd == "welcome":
+        cmd_welcome()
+    elif cmd in ("--version", "version"):
+        print(f"zidev {VERSION}")
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
