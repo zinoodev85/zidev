@@ -58,7 +58,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -988,7 +988,7 @@ def cmd_open_dir(path):
 
 
 def cmd_app():
-    """zidev.app (built by brew next to zidev, or by app/build.sh) into ~/Applications, then opened."""
+    """zidev.app (brew puts it next to zidev; from source app/build.sh builds it) into ~/Applications, then opened."""
     src = next((p for p in (os.path.join(HERE, "..", "zidev.app"), os.path.join(HERE, "app", "build", "zidev.app"))
                 if os.path.isdir(p)), None)
     if not src:

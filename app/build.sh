@@ -2,6 +2,8 @@
 # Builds zidev.app (its own window and Dock icon for zidev) into build/, signed for this Mac only
 # (no Apple developer account: macOS runs apps you built yourself without asking).
 # ./build.sh icon  redraws zidev.icns from icon.swift first.
+# ./build.sh zip   for a release: one app for Apple silicon and Intel, zipped as build/zidev-app.zip
+#                  (brew installs that one: no Swift, no Command Line Tools needed)
 set -e
 cd "$(dirname "$0")"
 if [ "$1" = icon ]; then
@@ -16,7 +18,13 @@ fi
 swift build -c release --disable-sandbox  # no nested sandbox: brew builds in one
 rm -rf build/zidev.app
 mkdir -p build/zidev.app/Contents/MacOS build/zidev.app/Contents/Resources
-cp .build/release/zidev-app build/zidev.app/Contents/MacOS/zidev
+if [ "$1" = zip ]; then
+  swift build -c release --disable-sandbox --triple x86_64-apple-macosx13.0 --scratch-path .build-x86
+  lipo -create .build/arm64-apple-macosx/release/zidev-app .build-x86/x86_64-apple-macosx/release/zidev-app \
+    -output build/zidev.app/Contents/MacOS/zidev
+else
+  cp .build/release/zidev-app build/zidev.app/Contents/MacOS/zidev
+fi
 cp zidev.icns build/zidev.app/Contents/Resources/zidev.icns
 VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../zidev)
 cat > build/zidev.app/Contents/Info.plist <<PLIST
@@ -37,3 +45,8 @@ cat > build/zidev.app/Contents/Info.plist <<PLIST
 PLIST
 codesign --force --sign - build/zidev.app
 echo "built $(pwd)/build/zidev.app"
+if [ "$1" = zip ]; then
+  rm -f build/zidev-app.zip
+  ditto -c -k --keepParent build/zidev.app build/zidev-app.zip
+  echo "zipped $(pwd)/build/zidev-app.zip"
+fi

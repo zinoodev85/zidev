@@ -51,5 +51,5 @@ Decisions on how zidev should be. Only these.
 - `zidev .` opens zidev on that folder's project, like `code .`.
 - zidev looks good in every terminal theme, light or dark: the selection is a quiet gray bar, never a glaring block.
 - zidev is its own Mac app with a nice icon, its own window and Dock entry; no paying Apple.
-- The app comes with brew: `brew install` builds it, `zidev app` puts it into Applications.
+- The app comes with brew, ready built (no Command Line Tools); `zidev app` puts it into Applications.
 - In the app, cmd-click on a `! command` runs it.
