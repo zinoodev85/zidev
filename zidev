@@ -22,6 +22,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev open FILE[:LINE] [--tab]   (inside zidev) show a file in the preview, or as a tab
 """
 
+import collections
 import contextlib
 import curses
 import fcntl
@@ -29,6 +30,7 @@ import glob
 import json
 import os
 import re
+import resource
 import shlex
 import shutil
 import signal
@@ -189,10 +191,13 @@ def server_running():
     return tmux("has-session", "-t", SESSION) is not None
 
 
-def session_windows():
-    """{zidev id: tmux window id} for every session window."""
-    out = tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{@zidev_id}") or ""
+def session_windows(strict=False):
+    """{zidev id: tmux window id} for every session window; strict: None when tmux did not answer."""
+    out = tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{@zidev_id}")
+    if out is None and strict:
+        return None
     wins = {}
+    out = out or ""
     for line in out.splitlines():
         wid, _, zid = line.partition(" ")
         if zid:
@@ -243,8 +248,12 @@ def tmux_all(*cmds):
     return tmux(*args[:-1]) if args else ""
 
 
-def all_tabs():
-    out = tmux("list-panes", "-a", "-F", "\t".join(f"#{{{f}}}" for f in TAB_FIELDS.values())) or ""
+def all_tabs(strict=False):
+    """Every tab; strict: None when tmux did not answer (not: there are none)."""
+    out = tmux("list-panes", "-a", "-F", "\t".join(f"#{{{f}}}" for f in TAB_FIELDS.values()))
+    if out is None and strict:
+        return None
+    out = out or ""
     tabs = []
     for line in out.splitlines():
         t = dict(zip(TAB_FIELDS, line.split("\t")))
@@ -563,9 +572,24 @@ def close_tab(pane):
 ALWAYS = ("term", "git")  # every project has a terminal and (in a git repo) a changes tab
 
 
+@contextlib.contextmanager
+def tabs_lock():
+    """One zidev at a time makes tabs: two starting together (iTerm and the app) would each make them all."""
+    with open(f"{HOME}/tabs.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def ensure_project_tabs():
     """Give each project its terminal and changes tab, parked, when it has none."""
-    tabs = all_tabs()
+    with tabs_lock():
+        _ensure_project_tabs()
+
+
+def _ensure_project_tabs():
+    tabs = all_tabs(strict=True)
+    if tabs is None:  # tmux did not answer: that is not "no tabs"
+        return
     d = load_state()
     for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
         if not os.path.isdir(cwd) or cwd in d.get("archived", []):
@@ -666,7 +690,9 @@ def sync_tabs(cwd, tabs=None):
     """Save a project's tabs (restored after a restart). An archived one's stay as saved."""
     if cwd in archived():
         return
-    tabs, wins = all_tabs() if tabs is None else tabs, session_windows()
+    tabs, wins = all_tabs(strict=True) if tabs is None else tabs, session_windows(strict=True)
+    if tabs is None or wins is None:  # tmux did not answer: keep what is saved
+        return
     saved = [{"kind": t["kind"], "file": t["file"] or None,
               "shown_in": window_zid(t["window"], wins) if t["visible"] else None} for t in project_tabs(cwd, tabs)]
     with edit_state() as d:
@@ -690,14 +716,41 @@ def saved_tabs(d, cwd):
     return list({(t["kind"], t["file"]): t for t in reversed(old)}.values())[::-1]  # one of each
 
 
+def one_of(tabs):
+    """A project has one changes tab and each file once: the rest of them are extra."""
+    seen = set()
+    for t in tabs:
+        key = ("git",) if t["kind"] == "git" else ("file", t.get("file")) if t["kind"] == "file" else None
+        if key and key in seen:
+            yield t
+        seen.add(key)
+
+
 def restore_tabs():
     """After a start: every project's saved tabs, parked or shown where they were."""
-    d, tabs = load_state(), all_tabs()
+    with tabs_lock():
+        _restore_tabs()
+
+
+def _restore_tabs():
+    d, tabs = load_state(), all_tabs(strict=True)
+    if tabs is None:  # tmux did not answer: that is not "no tabs"
+        return
     for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
+        have = [t for t in project_tabs(cwd, tabs) if not t["visible"]]
+        extra = list(one_of(have))
+        for t in extra:  # made twice before: one is enough
+            tmux("kill-pane", "-t", t["pane"])
+        if extra:
+            sync_tabs(cwd)
         if project_tabs(cwd, tabs) or not os.path.isdir(cwd) or cwd in d.get("archived", []):
             continue
         shown = set()
-        for t in saved_tabs(d, cwd):
+        saved = saved_tabs(d, cwd)
+        extra = list(one_of(saved))
+        for t in saved:
+            if any(t is e for e in extra):
+                continue
             if t["kind"] not in TAB_KINDS[1:] or (t["kind"] == "file" and not os.path.isfile(t.get("file") or "")):
                 continue
             pane = spawn_parked(cwd, t["kind"], t.get("file"))
@@ -2591,8 +2644,10 @@ class Sidebar:
     def load(self):
         self.data = load_state()
         self.status = {s["id"]: read_status(s["id"]) for s in self.data["sessions"]}
-        self.windows = session_windows()
-        self.tabs = all_tabs()
+        # tmux did not answer: keep what was there, the sessions did not stop
+        wins, tabs = session_windows(strict=True), all_tabs(strict=True)
+        self.windows = wins if wins is not None else getattr(self, "windows", {})
+        self.tabs = tabs if tabs is not None else getattr(self, "tabs", [])
         gone = set(self.data.get("archived", []))  # archived: not listed (A finds them)
         self.data["projects"] = [c for c in self.data["projects"] if c not in gone]
         self.data["sessions"] = [s for s in self.data["sessions"] if s["cwd"] not in gone]
@@ -4026,10 +4081,20 @@ def cmd_selftest():
                    and not any(x["cwd"] == proj3 for x in json.load(open(f"{home}/sessions.json"))["sessions"])))
         n_args = len(args().splitlines())
         t("kill-server")
-        z("start")
+        start = lambda: subprocess.Popen([sys.executable, SELF, "start"], env=env, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        first = start()  # iTerm and the app at once: the second comes while the first restores
+        end = time.time() + 10
+        while not t("list-windows", "-t", "zidev-park") and time.time() < end:
+            time.sleep(0.01)
+        second = start()
+        first.wait(), second.wait()
         check("restore after kill: window back", wait(lambda: zid in wins()))
         wid = wins().get(zid, "")
         check("restore: terminal tab back, parked", wait(lambda: pane_of("term") and main() == "claude"))
+        check("two zidevs starting at once restore each tab once", not any(
+            n > 1 for n in collections.Counter(l for l in t("list-panes", "-a", "-F", "#{@zidev_side} #{@zidev_project}")
+                                   .splitlines() if l.startswith(("term ", "git "))).values()))
         check("restore restarts claude on its claude id",
               wait(lambda: len(args().splitlines()) == n_args + 1 and status(zid)["claude_id"] in args().splitlines()[-1]))
         proj2 = f"{root}/proj2"
@@ -4057,6 +4122,12 @@ def cmd_selftest():
 # ── main ───────────────────────────────────────────────────────────────────
 
 def main():
+    # tmux keeps a file open per pane: macOS allows a process 256, tmux started from here gets more
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(hard, 10240)), hard))
+    except (ValueError, OSError):
+        pass
     args = sys.argv[1:]
     cmd = args[0] if args else ""
     if cmd == "hook":
