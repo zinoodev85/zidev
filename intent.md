@@ -48,3 +48,4 @@ Decisions on how zidev should be. Only these.
 - The sidebar stays still: a click opens, never folds or closes anything else; cursor and scroll stay the same when the window changes; no redraw flash.
 - A project's first session is its main one: click / ⏎ on the project opens it, folded or not. Folding: click ▸ / ▾, or space.
 - zidev ships on Homebrew: one `brew install` brings it with everything it needs.
+- `zidev .` opens zidev on that folder's project, like `code .`.

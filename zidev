@@ -6,6 +6,7 @@ terminal quits. Each session is a tmux window: sidebar pane on the left, Claude 
 right. Claude Code hooks report each session's status to ~/.zidev/status.
 
   zidev              start (restoring saved sessions) or attach
+  zidev DIR          the same, showing DIR's project (its first session); a new project if it is none
   zidev start        start the server in the background, without attaching
   zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
@@ -954,7 +955,7 @@ end tell'''
 
 
 def cmd_start():
-    if os.environ.get("TMUX", "").split(",")[0].endswith(f"/{SOCKET}"):
+    if in_zidev():
         sys.exit("already inside zidev (ctrl-q switches between sidebar and session)")
     ensure_server()
     os.chdir(ANCHOR)
@@ -964,6 +965,25 @@ def cmd_start():
         if os.environ.get("ITERM_PROFILE") != "zidev" and iterm_open_tab():
             return print("zidev opened in a new tab (Profiles > zidev opens it directly)")
     os.execvpe("tmux", ["tmux", "-L", SOCKET, "attach", "-t", SESSION], env)
+
+
+def in_zidev():
+    return os.environ.get("TMUX", "").split(",")[0].endswith(f"/{SOCKET}")
+
+
+def cmd_open_dir(path):
+    """zidev DIR (zidev .): zidev showing that folder's project, on its first session; new if it is none."""
+    cwd = os.path.realpath(os.path.expanduser(path))
+    ensure_server()
+    if cwd in archived():
+        unarchive_project(cwd)
+    first = next((s for s in load_state()["sessions"] if s["cwd"] == cwd), None)
+    if not first:
+        new_session(cwd)  # shows its window
+    elif wid := session_windows().get(first["id"]) or spawn_window(first):
+        show_window(wid)
+    if not in_zidev():
+        cmd_start()
 
 
 def archived():
@@ -3914,8 +3934,19 @@ def cmd_selftest():
 
         proj3 = f"{root}/proj3"
         os.makedirs(proj3)
+        inside = {"TMUX": f"/tmp/{sock},1,0"}
+        active = lambda: next((l.split()[1] for l in t("list-windows", "-F", "#{window_active} #{window_id}")
+                               .splitlines() if l.startswith("1 ")), "")
+        sessions3 = lambda: [x["id"] for x in json.load(open(f"{home}/sessions.json"))["sessions"]
+                             if x["cwd"] == os.path.realpath(proj3)]
+        z(proj3, extra=inside)
+        check("zidev DIR on a new folder: a project with one session, shown",
+              wait(lambda: len(sessions3()) == 1 and active() == wins().get(sessions3()[0])))
         z("new", proj3)
-        z("new", proj3)
+        t("select-window", "-t", wid)
+        z(proj3, extra=inside)
+        check("zidev DIR on a project: its first session shown, no new one",
+              wait(lambda: len(sessions3()) == 2 and active() == wins().get(sessions3()[0])))
         t("select-window", "-t", wid)
         wait(lambda: "proj3" in t("capture-pane", "-p", "-t", side))
         n_wins = len(wins())
@@ -4027,6 +4058,8 @@ def main():
         cmd_welcome()
     elif cmd in ("--version", "version"):
         print(f"zidev {VERSION}")
+    elif os.path.isdir(os.path.expanduser(cmd)):
+        cmd_open_dir(cmd)
     else:
         print(__doc__)
 

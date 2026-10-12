@@ -21,6 +21,7 @@ Needs macOS and iTerm. Brings tmux, Python and the viewers (bat, delta, glow, mi
 
 - `zidev` in iTerm: opens zidev in a new tab with the `zidev` profile (installed by zidev; *Profiles > zidev*
   opens it directly). The profile sends the cmd keys below to zidev; other tabs keep iTerm's own.
+- `zidev .` (or any folder): opens zidev on that project, its first session; a new project if it is none.
 - `zidev new [dir] [--prompt TEXT]` from any terminal: a new session (and project) for that folder; TEXT is sent as Claude's first message.
 
 ## Sidebar
