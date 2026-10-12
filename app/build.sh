@@ -26,6 +26,7 @@ else
   cp "$(swift build -c release --show-bin-path)/zidev-app" build/zidev.app/Contents/MacOS/zidev
 fi
 cp zidev.icns build/zidev.app/Contents/Resources/zidev.icns
+cp -R fonts build/zidev.app/Contents/Resources/fonts  # MesloLGS NF (Apache 2.0): the look, on Macs without it
 VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../zidev)
 cat > build/zidev.app/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +42,7 @@ cat > build/zidev.app/Contents/Info.plist <<PLIST
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>ATSApplicationFontsPath</key><string>fonts</string>
 </dict></plist>
 PLIST
 codesign --force --sign - build/zidev.app

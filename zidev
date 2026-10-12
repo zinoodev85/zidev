@@ -58,7 +58,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -2768,8 +2768,12 @@ class Sidebar:
                 sessions = [s for s in self.data["sessions"] if s["cwd"] == v]
                 waiting = sum(1 for s in sessions if self.state_of(s)[1]) + \
                     sum(1 for t in self.tabs if t["pane"] in self.waits and t["project"] == v)
+                # folded: what is inside still shows, a spinner while one of its sessions works
+                working = folded and any(self.state_of(s)[0] == "working" for s in sessions)
+                if working:
+                    self.put(y, w - 2, SPIN[self.frame % len(SPIN)], base | c(4))
                 if folded and waiting:
-                    self.put(y, w - 3, f"{waiting} ", base | c(3) | bold)
+                    self.put(y, w - (5 if working else 3), f"{waiting} ", base | c(3) | bold)
             elif kind == "session":
                 self.draw_session(y, w, v, base)
             elif kind == "tab":
@@ -3932,6 +3936,11 @@ def cmd_selftest():
         mouse_click(side2, 6, prow())
         check("a folded project opens its first session too, stays folded",
               wait(lambda: active() == wid) and wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side)))
+        hook({"hook_event_name": "UserPromptSubmit", "prompt": "fix the login bug"})
+        spins = lambda: re.search(r"▸ proj.*[\u2800-\u28ff]\s*$", t("capture-pane", "-p", "-t", side), re.M)
+        check("a folded project shows a spinner while a session in it works", wait(spins))
+        hook({"hook_event_name": "Stop"})
+        check("and none once it is done", wait(lambda: not spins()))
         mouse_click(side, 1, next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l))
         wait(lambda: "▾ proj" in t("capture-pane", "-p", "-t", side))
         left, top = map(int, t("display", "-p", "-t", side, "#{pane_left} #{pane_top}").split())
