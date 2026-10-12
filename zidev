@@ -2099,27 +2099,68 @@ def color_runs(row):
     return [tuple(r) for r in runs]
 
 
-def bang_at(rows, y, x):
+def fg_of(state):
+    """The text color a color_runs state ends on ("" for the default)."""
+    codes, fg = [c for c in state.split(";") if c], ""
+    while codes:
+        c = codes.pop(0)
+        if c == "38" and codes:
+            n = 4 if codes[0] == "2" else 2
+            fg, codes = ";".join(["38", *codes[:n]]), codes[n:]
+        elif c in ("39", "0"):
+            fg = ""
+        elif c.isdigit() and (30 <= int(c) <= 37 or 90 <= int(c) <= 97):
+            fg = c
+        elif c == "48" and codes:
+            codes = codes[4 if codes[0] == "2" else 2:]
+    return fg
+
+
+def bang_at(rows, y, x, width=None):
     """The `! command` Claude suggests under (x, y), without its !: its inline-code run (one color),
-    or a row that is only "! command"; a run that ends its row goes on at the start of the next."""
+    or a row that is only "! command"; one that fills its row goes on at the start of the next
+    (a long path wraps mid-word: joined without a space). A click on a wrapped part counts too."""
     rows = [re.sub(r"\033\]8;[^\033\a]*(\033\\|\a)", "", r) for r in rows]  # no hyperlinks
     if not 0 <= y < len(rows):
         return None
-    plain = ANSI.sub("", rows[y])
-    if re.match(r"\s*! ?\S", plain) and x >= len(plain) - len(plain.lstrip()):  # a line of its own
-        return plain.strip()[1:].strip()
-    run = next((r for r in color_runs(rows[y]) if r[0] <= x < r[1]), None)
-    if not run or not run[3] or not re.match(r"\s*! ?\S", run[2]):
+    hit = bang_from(rows, y, x, width)
+    if hit:
+        return hit[0]
+    lead = next((r for r in color_runs(rows[y]) if r[2].strip()), None)
+    if not lead or not lead[0] <= x < lead[1]:
         return None
-    text, end = run[2], run[1]
-    for nxt in rows[y + 1:y + 3]:  # wrapped: the same color goes on after the indent
-        if end < len(plain.rstrip()):
+    for up in range(1, 5):  # a wrapped part: the command starts a row or more above
+        plain = ANSI.sub("", rows[max(y - up, 0)])
+        hit = y - up >= 0 and bang_from(rows, y - up, len(plain.rstrip()) - 1, width)
+        if hit and hit[1] >= y:
+            return hit[0]
+    return None
+
+
+def bang_from(rows, y, x, width):
+    """bang_at at its first row: (the command, the last row it wraps onto), or None."""
+    plain = ANSI.sub("", rows[y])
+    runs = color_runs(rows[y])
+    indent = len(plain) - len(plain.lstrip())
+    if re.match(r"\s*! ?\S", plain) and x >= indent:  # a line of its own
+        first = next((r for r in runs if r[2].strip()), None)
+        run = (indent, len(plain.rstrip()), plain.strip(), first[3] if first else "")
+    else:
+        run = next((r for r in runs if r[0] <= x < r[1]), None)
+        if not run or not run[3] or not re.match(r"\s*! ?\S", run[2]):
+            return None
+    text, end, last = run[2], run[1], y
+    for nxt in rows[y + 1:y + 5]:  # wrapped: the same color goes on after the indent
+        if end < len(plain.rstrip()) or (width and end < width - 20):
             break
         lead = next((r for r in color_runs(nxt) if r[2].strip()), None)
-        if not lead or lead[3] != run[3] or lead[0] > 8:
+        if not lead or fg_of(lead[3]) != fg_of(run[3]) or lead[0] > 8 or lead[2].lstrip().startswith("!"):
             break
-        text, plain, end = text.rstrip() + " " + lead[2].strip(), ANSI.sub("", nxt), lead[1]
-    return text.strip()[1:].strip().strip("`") or None
+        full = width and end >= width - 2  # cut mid-word at the edge, not at a space
+        text = text.rstrip() + ("" if full else " ") + lead[2].strip()
+        plain, end, last = ANSI.sub("", nxt), lead[1], last + 1
+    cmd = text.strip()[1:].strip().strip("`")
+    return (cmd, last) if cmd else None
 
 
 def clicked_path(pane, x, y, link=""):
@@ -2134,7 +2175,7 @@ def clicked_path(pane, x, y, link=""):
         return None
     s = session_of(zid) or {}
     if tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":  # `! cmd`: into Claude's prompt
-        cmd = bang_at((tmux("capture-pane", "-p", "-e", "-t", pane) or "").split("\n"), int(y), int(x))
+        cmd = bang_at((tmux("capture-pane", "-p", "-e", "-t", pane) or "").split("\n"), int(y), int(x), int(width))
         if cmd:
             return zid, "bang", cmd
     words = token_at((tmux("capture-pane", "-p", "-t", pane) or "").split("\n"), int(y), int(x), int(width))
@@ -2203,8 +2244,8 @@ def cmd_bang(pane, x, y, run=""):
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
     if not hit or hit[1] != "bang":
-        if run:
-            cmd_click(pane, x, y)
+        if run:  # cmd-click on anything else: a plain click (an exit 1 would show tmux's "returned 1")
+            return cmd_click(pane, x, y)
         sys.exit(1)
     tmux("send-keys", "-t", pane, "-l", "!")
     time.sleep(0.15)  # Claude switches to its bash mode first
@@ -3816,6 +3857,14 @@ def cmd_selftest():
         sent = lambda: any(l.rstrip().endswith("!echo bang-ran")
                            for l in t("capture-pane", "-p", "-t", term).rstrip().split("\n")[by + 1:-1])
         check("cmd-click on it (zidev app): typed and sent", wait(sent))
+        check("cmd-click on plain text: a plain click, no \"returned 1\"",
+              z("bang", term, "30", str(by), "run").returncode == 0)
+        blue = "\033[38;2;87;105;247m"
+        wrapped = [f"  {blue}! sh /tmp/a-very-long/pa", f"\033[39m  {blue}th/vars.sh go-auth GA\033[39m", "",
+                   "  Auch dieses Passwort"]
+        check("a `! command` wrapped over rows: all of it, from either row",
+              bang_at(wrapped, 0, 4, 28) == bang_at(wrapped, 1, 5, 28) == "sh /tmp/a-very-long/path/vars.sh go-auth GA"
+              and bang_at(wrapped, 3, 4, 28) is None)
         t("set", "-p", "-t", term, "@zidev_side", "term")
         t("send-keys", "-t", term, "C-u")
         t("send-keys", "-t", term, "-l", "clear; python3 -c \"input('Deploy now? (y/N) ')\"")
