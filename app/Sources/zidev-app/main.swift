@@ -1,5 +1,6 @@
 // zidev.app: a window of its own for zidev (a terminal running `zidev`), with its own Dock icon.
 // The cmd / alt keys zidev knows (`zidev keys`) go straight to it; the rest stay the app's (cmd-q, cmd-v).
+// cmd-click on a `! command` Claude suggests runs it.
 import AppKit
 import SwiftTerm
 
@@ -64,6 +65,20 @@ final class ZidevView: LocalProcessTerminalView {
             (shift ? "shift-" : "") + key
     }
 
+    /// cmd-click: sent to tmux as a ctrl-alt-click (a terminal can't report cmd), zidev's binding
+    /// runs a `! command` there; SwiftTerm would open a link itself
+    func cmdClick(_ e: NSEvent) -> Bool {
+        guard e.modifierFlags.contains(.command), e.window === window else { return false }
+        let p = convert(e.locationInWindow, from: nil)
+        guard bounds.contains(p) else { return false }
+        // the cell size as SwiftTerm measures it
+        let w = font.advancement(forGlyph: font.glyph(withName: "W")).width
+        let h = ceil(font.ascender - font.descender + font.leading)
+        let col = Int(p.x / w) + 1, row = Int((bounds.height - p.y) / h) + 1
+        send(txt: "\u{1b}[<24;\(col);\(row)" + (e.type == .leftMouseDown ? "M" : "m"))
+        return true
+    }
+
     /// a key zidev knows: sent to it, not handled by the terminal or the menu
     func zidevKey(_ e: NSEvent) -> Bool {
         guard window?.isKeyWindow == true, window?.firstResponder === self,
@@ -78,6 +93,7 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
     var term: ZidevView!
     var look: NSKeyValueObservation?
     var keyWatch: Any?
+    var clickWatch: Any?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         menu()
@@ -100,6 +116,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         window.makeFirstResponder(term)
         keyWatch = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.term.zidevKey(e) == true ? nil : e  // before the menu and the terminal see it
+        }
+        clickWatch = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] e in
+            self?.term.cmdClick(e) == true ? nil : e
         }
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global().async {

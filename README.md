@@ -19,9 +19,10 @@ Needs macOS and iTerm. Brings tmux, Python and the viewers (bat, delta, glow, mi
 
 ## App
 
-`app/build.sh` builds **zidev.app**: zidev in a window of its own, with its own Dock icon. Every cmd / alt key
-reaches zidev directly (no iTerm profile needed); light or dark follows macOS. Built on your Mac, it runs
-without an Apple developer account. Copy it to `~/Applications`. Closing it leaves the sessions running.
+**zidev.app**: zidev in a window of its own, with its own Dock icon. `brew install` builds it; `zidev app` puts it
+into `~/Applications` and opens it (from source: `app/build.sh` first). Every cmd / alt key reaches zidev directly
+(no iTerm profile needed); light or dark follows macOS; cmd-click on a `! command` runs it. Built on your Mac, it
+runs without an Apple developer account. Closing it leaves the sessions running.
 
 ## Start
 
@@ -79,7 +80,7 @@ Tabs are full screen; only Claude can have a terminal next to it (`cmd-t`).
   Relative paths resolve in the session folder. A bare name (`before-table.png`, `Cart.ts:12`) opens when one file has it: a full path shown earlier, else in the project.
   Several files with it: they list at the top of the sidebar (at most 20); Claude (haiku, in the background) guesses
   which one is meant, that one goes first with `✦`. `⏎` opens, `esc` drops the list. A folder (`anime/v2/`) shows its tree. A plain click on a web link opens the browser.
-  A `! command` Claude suggests: a click copies it, a double click types it into Claude's prompt (bash mode), `⏎` is yours.
+  A `! command` Claude suggests: a click copies it, a double click types it into Claude's prompt (bash mode), `⏎` is yours. In zidev.app a cmd-click runs it.
 - Preview: `esc` closes, `⏎` keeps it as a tab, `e` edits (back to the preview after), `l` line numbers,
   `/` search. Lines changed on this branch (vs main, incl. uncommitted) are marked. Text starts at the top, keys in a gray line at the bottom.
 - A file is open at most once in the sidebar; opening it again shows its tab.

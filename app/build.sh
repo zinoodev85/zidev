@@ -1,18 +1,23 @@
 #!/bin/sh
 # Builds zidev.app (its own window and Dock icon for zidev) into build/, signed for this Mac only
 # (no Apple developer account: macOS runs apps you built yourself without asking).
+# ./build.sh icon  redraws zidev.icns from icon.swift first.
 set -e
 cd "$(dirname "$0")"
-swift build -c release
-rm -rf build/zidev.app build/zidev.iconset
-mkdir -p build/zidev.app/Contents/MacOS build/zidev.app/Contents/Resources build/zidev.iconset
+if [ "$1" = icon ]; then
+  rm -rf build/zidev.iconset && mkdir -p build/zidev.iconset
+  swift icon.swift build/icon.png
+  for s in 16 32 128 256 512; do
+    sips -z $s $s build/icon.png --out build/zidev.iconset/icon_${s}x${s}.png >/dev/null
+    sips -z $((s * 2)) $((s * 2)) build/icon.png --out build/zidev.iconset/icon_${s}x${s}@2x.png >/dev/null
+  done
+  iconutil -c icns build/zidev.iconset -o zidev.icns
+fi
+swift build -c release --disable-sandbox  # no nested sandbox: brew builds in one
+rm -rf build/zidev.app
+mkdir -p build/zidev.app/Contents/MacOS build/zidev.app/Contents/Resources
 cp .build/release/zidev-app build/zidev.app/Contents/MacOS/zidev
-swift icon.swift build/icon.png
-for s in 16 32 128 256 512; do
-  sips -z $s $s build/icon.png --out build/zidev.iconset/icon_${s}x${s}.png >/dev/null
-  sips -z $((s * 2)) $((s * 2)) build/icon.png --out build/zidev.iconset/icon_${s}x${s}@2x.png >/dev/null
-done
-iconutil -c icns build/zidev.iconset -o build/zidev.app/Contents/Resources/zidev.icns
+cp zidev.icns build/zidev.app/Contents/Resources/zidev.icns
 VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' ../zidev)
 cat > build/zidev.app/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

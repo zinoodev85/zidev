@@ -14,6 +14,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev list [--json]  print sessions and their status
   zidev kill         stop the tmux server (sessions stay saved, restored on next start)
   zidev reload       load new zidev code into a running server (Claude sessions keep running)
+  zidev app          put zidev.app (its own window and icon) into ~/Applications and open it
   zidev --version    print the version
   zidev doctor       check the setup: tools, hook settings, saved state
   zidev logs [-f]    show (or follow) the error log
@@ -57,7 +58,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -984,6 +985,20 @@ def cmd_open_dir(path):
         show_window(wid)
     if not in_zidev():
         cmd_start()
+
+
+def cmd_app():
+    """zidev.app (built by brew next to zidev, or by app/build.sh) into ~/Applications, then opened."""
+    src = next((p for p in (os.path.join(HERE, "..", "zidev.app"), os.path.join(HERE, "app", "build", "zidev.app"))
+                if os.path.isdir(p)), None)
+    if not src:
+        sys.exit("no zidev.app built: run app/build.sh")
+    dst = os.path.expanduser("~/Applications/zidev.app")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, symlinks=True)
+    subprocess.run(["open", dst])
+    print(f"zidev.app is in {os.path.dirname(dst)} (Spotlight, Launchpad, Dock)")
 
 
 def archived():
@@ -2129,15 +2144,21 @@ def copy_text(text):
         tmux("set-buffer", "-w", text)
 
 
-def cmd_bang(pane, x, y):
+def cmd_bang(pane, x, y, run=""):
     """A double click on a `! command` in Claude: typed into its prompt, not sent (⏎ is yours).
-    Exit 1 when there is none: the double click selects a word as usual."""
+    cmd-click (the zidev app, `run`): typed and sent. Exit 1 when there is none: the double click
+    selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
     if not hit or hit[1] != "bang":
+        if run:
+            cmd_click(pane, x, y)
         sys.exit(1)
     tmux("send-keys", "-t", pane, "-l", "!")
     time.sleep(0.15)  # Claude switches to its bash mode first
     tmux("send-keys", "-t", pane, "-l", hit[2])
+    if run:
+        time.sleep(0.1)
+        tmux("send-keys", "-t", pane, "Enter")
 
 
 def cmd_open(args):
@@ -2308,6 +2329,11 @@ def install_tmux_hooks():
             "{ copy-mode -H ; send-keys -X select-word ; run-shell -d 0.3 ; send-keys -X copy-pipe-and-cancel }")
     tmux("bind", "-n", "DoubleClick1Pane", "if-shell", "-F", "#{==:#{@zidev_side},claude}",
          f"if-shell \"{me} bang {at}\" '' {{ {word} }}", word)
+    # cmd-click: the zidev app sends it as ctrl-alt-click (a terminal can't report cmd); on a
+    # `! command` in Claude it runs it, elsewhere it is a plain click
+    tmux("bind", "-n", "C-M-MouseDown1Pane", "select-pane", "-t", "=", "\\;", "if-shell", "-F",
+         "#{==:#{@zidev_side},claude}", f"run-shell -b \"{me} bang {at} run\"", f"run-shell -b \"{me} click {at}\"")
+    tmux("bind", "-n", "C-M-MouseUp1Pane", "select-pane", "-t", "=")  # its release: not for the app
     tmux("bind", "-n", "MouseUp1Pane", "set", "-gF", "@zidev_link", "#{mouse_hyperlink}", "\\;",
          "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M",
          f"if-shell \"{ispath}\" \"run-shell -b \\\"{me} click {at}\\\"\" 'send-keys -M'")
@@ -3665,11 +3691,11 @@ def cmd_selftest():
         wait(lambda: any(l.startswith("Read(") for l in t("capture-pane", "-p", "-t", term).split("\n")))
         screen = t("capture-pane", "-p", "-t", term).split("\n")
         y = next(i for i, l in enumerate(screen) if l.startswith("Read("))
-        def mouse_click(pane, x, y):  # a real click through the client, so the tmux bindings run
+        def mouse_click(pane, x, y, button=0):  # a real click through the client, so the tmux bindings run
             left, top = map(int, t("display", "-p", "-t", pane, "#{pane_left} #{pane_top}").split())
             top += 1 if t("show", "-gv", "status") == "on" and t("show", "-gv", "status-position") == "top" else 0
             for end in "Mm":
-                client.stdin.write(f"\x1b[<0;{left + x + 1};{top + y + 1}{end}".encode())
+                client.stdin.write(f"\x1b[<{button};{left + x + 1};{top + y + 1}{end}".encode())
                 client.stdin.flush()
                 time.sleep(0.1)
         mouse_click(term, 7, y)
@@ -3722,6 +3748,11 @@ def cmd_selftest():
             if wait(typed, 3):
                 break
         check("double click on it: typed into Claude's prompt, not sent", typed())
+        t("send-keys", "-t", term, "C-u")
+        mouse_click(term, 9, by, button=24)  # the zidev app's cmd-click
+        sent = lambda: any(l.rstrip().endswith("!echo bang-ran")
+                           for l in t("capture-pane", "-p", "-t", term).rstrip().split("\n")[by + 1:-1])
+        check("cmd-click on it (zidev app): typed and sent", wait(sent))
         t("set", "-p", "-t", term, "@zidev_side", "term")
         t("send-keys", "-t", term, "C-u")
         t("send-keys", "-t", term, "-l", "clear; python3 -c \"input('Deploy now? (y/N) ')\"")
@@ -4026,7 +4057,7 @@ def main():
         return cmd_ispath(*args[1:5])
     if cmd in ("click", "bang", "tab", "tabsync", "html"):  # tmux bindings and hooks
         try:
-            {"click": lambda: cmd_click(*args[1:4]), "bang": lambda: cmd_bang(*args[1:4]), "tab": lambda: cmd_tab(args[1:]),
+            {"click": lambda: cmd_click(*args[1:4]), "bang": lambda: cmd_bang(*args[1:5]), "tab": lambda: cmd_tab(args[1:]),
              "tabsync": cmd_tabsync, "html": lambda: cmd_html(*args[1:5])}[cmd]()
         except Exception:
             log(f"{cmd}: {traceback.format_exc()}")
@@ -4082,6 +4113,8 @@ def main():
         cmd_sidebar()
     elif cmd == "welcome":
         cmd_welcome()
+    elif cmd == "app":
+        cmd_app()
     elif cmd == "keys":  # for the zidev app: which key sends what (the iTerm profile's map, by name)
         print(json.dumps({**{k: v[1] for k, v in ZED_KEYS["bindings"].items()},
                           **{key: seq for seq, key, _, _ in EDIT_KEYS}}))
