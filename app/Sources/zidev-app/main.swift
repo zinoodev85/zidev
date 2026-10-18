@@ -123,6 +123,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         paint()
         look = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in self?.paint() }
         window.makeKeyAndOrderFront(nil)
+        // the GPU draws the text: CoreGraphics lays out every changed row on the CPU, ~8% of a core for a
+        // Claude spinner alone; without Metal it stays on CoreGraphics
+        try? term.setUseMetal(true)
         window.makeFirstResponder(term)
         keyWatch = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.term.zidevKey(e) == true ? nil : e  // before the menu and the terminal see it
