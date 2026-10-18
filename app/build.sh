@@ -45,7 +45,15 @@ cat > build/zidev.app/Contents/Info.plist <<PLIST
   <key>ATSApplicationFontsPath</key><string>fonts</string>
 </dict></plist>
 PLIST
-codesign --force --sign - build/zidev.app
+# "zidev local" (./signing.sh, once) keeps one identity across builds, and with it macOS's Input Monitoring
+# permission for cmd-cmd; without it ad-hoc: a new app to macOS each build
+ID=$(security find-identity -p codesigning 2>/dev/null | sed -n 's/.*) \([0-9A-F]\{40\}\) "zidev local".*/\1/p' | head -1)
+if [ -n "$ID" ] && [ "$1" != zip ]; then
+  security unlock-keychain -p zidev "$HOME/Library/Keychains/zidev.keychain-db" 2>/dev/null || true
+  codesign --force --sign "$ID" build/zidev.app
+else
+  codesign --force --sign - build/zidev.app
+fi
 echo "built $(pwd)/build/zidev.app"
 if [ "$1" = zip ]; then
   rm -f build/zidev-app.zip

@@ -102,7 +102,21 @@ struct DoubleTap {
 func registerDoubleTap(_ mod: CGEventFlags, _ action: @escaping () -> Void) {
     hotkeyAction = action
     DoubleTap.mod = mod
-    if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
+    // without Input Monitoring a tap sees only this app's keys: cmd-cmd hides zidev but never shows it again.
+    // Asked once; the tap comes as soon as it is allowed, no restart
+    if !CGPreflightListenEventAccess() {
+        CGRequestListenEventAccess()
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { timer in
+            guard CGPreflightListenEventAccess() else { return }
+            timer.invalidate()
+            createTap()
+        }
+        return
+    }
+    createTap()
+}
+
+func createTap() {
     let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
     guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
                                       eventsOfInterest: CGEventMask(mask), callback: { _, type, e, _ in
@@ -197,8 +211,16 @@ final class ZidevView: LocalProcessTerminalView {
                 }
             }
         }
+        if let keys = try? String(contentsOfFile: dir + "probe-keys", encoding: .utf8) {  // "cmd none cmd key none"
+            try? FileManager.default.removeItem(atPath: dir + "probe-keys")
+            for k in keys.split(whereSeparator: \.isWhitespace) {  // as the event tap sees them; key: a key press
+                if k == "key" { DoubleTap.key() } else { DoubleTap.flags(k == "none" ? [] : tapMods[String(k)] ?? []) }
+            }
+        }
+        let shown = NSApp.isActive && !NSApp.isHidden && window?.isVisible == true
         guard let t = emulator else { return }
-        var out = "rows \(t.rows) yDisp \(t.buffer.yDisp)\n"
+        var out = "shown \(shown) floating \(window?.level == .floating) rows \(t.rows) yDisp \(t.buffer.yDisp) inputMonitoring \(CGPreflightListenEventAccess()) " +
+            "tap \(DoubleTap.tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false)\n"
         for r in 0..<t.rows {
             out += String(format: "%2d ", r) + (t.getLine(row: r)?.translateToString(trimRight: true) ?? "-") + "\n"
         }

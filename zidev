@@ -19,6 +19,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev doctor       check the setup: tools, hook settings, saved state
   zidev logs [-f]    show (or follow) the error log
   zidev selftest     run the end-to-end test on a throwaway tmux server
+  zidev apptest      check the running zidev.app against spec.md (clicks, cmd-cmd) on a throwaway window
   zidev open FILE[:LINE] [--tab]   (inside zidev) show a file in the preview, or as a tab
 """
 
@@ -699,7 +700,7 @@ def repair_tabs():
         if t["kind"] == "claude" and t["owner"] not in wins and not t["visible"]:
             tmux("kill-pane", "-t", t["pane"])
     for line in (tmux("list-panes", "-t", PARK, "-s", "-F", "#{pane_id}\t#{@zidev_side}\t#{@zidev_owner}") or "").splitlines():
-        p, kind, owner = line.split("\t")
+        p, kind, owner = (line.split("\t") + ["", ""])[:3]  # tmux() strips an empty owner's tab
         if kind == "split" and owner not in wins:  # its session is gone
             tmux("kill-pane", "-t", p)
     for zid, wid in wins.items():
@@ -2388,16 +2389,18 @@ def clicked_path(pane, x, y, link=""):
     that does not exist, (zid, "url", url) for a web link, None for anything else (plain text, the sidebar)."""
     info = tmux("display", "-p", "-t", pane, "#{pane_current_path}\t#{pane_width}\t#{pane_index}")
     zid = zid_of_pane(pane)
-    if not info or not zid:
+    if not info:
         return None
     cwd, width, index = info.split("\t")
     if index == "0":  # the sidebar
         return None
-    s = session_of(zid) or {}
     if tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":  # `! cmd`: into Claude's prompt
         cmd = bang_at(screen(pane, ansi=True), int(y), int(x), int(width))
         if cmd:
             return zid, "bang", cmd
+    if not zid:
+        return None
+    s = session_of(zid) or {}
     words = token_at(screen(pane), int(y), int(x), int(width))
     for w in filter(None, [link if link.startswith(("file://", "/", "~")) else "", *words]):
         for base in (cwd, s.get("cwd", cwd)):
@@ -3764,6 +3767,90 @@ def edit_state_at(home):
     write_json(path, d)
 
 
+APPTEST_LINES = ["", "  21 y n ? : an item with choices", "  7. an item without", "  see 3y and k 4 here",
+                 "  ! echo apptest-ran"]
+
+
+def cmd_apptest():
+    """spec.md, the app rows: drives the running zidev.app through its probe (notifyutil -p zidev.probe) on a
+    throwaway window of this server: real cmd-clicks on cells, cmd-cmd fed to its double-tap detector."""
+    failed = []
+
+    def check(name, good):
+        print(f"  {'\033[32mok' if good else '\033[31mFAIL'}\033[0m  {name}")
+        if not good:
+            failed.append(name)
+
+    def probe(click=None, keys=None):
+        if click:
+            with open(f"{HOME}/probe-click", "w") as f:
+                f.write(f"{click[0]} {click[1]}")
+        if keys:
+            with open(f"{HOME}/probe-keys", "w") as f:
+                f.write(keys)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(f"{HOME}/probe-screen.txt")
+        subprocess.run(["notifyutil", "-p", "zidev.probe"])
+        end = time.time() + 3
+        while time.time() < end and not os.path.exists(f"{HOME}/probe-screen.txt"):
+            time.sleep(0.05)
+        time.sleep(0.3)  # the click's zidev call, the toggle
+        with contextlib.suppress(FileNotFoundError):
+            return open(f"{HOME}/probe-screen.txt").read()
+        return ""
+
+    client = (tmux("list-clients", "-F", "#{client_name} #{client_termtype}") or "").split("\n")
+    client = next((c.split(" ")[0] for c in client if "SwiftTerm" in c), None)
+    head = probe() if client else ""
+    if not head:
+        sys.exit("zidev.app is not running (or not attached to zidev): open it first")
+    check("cmd-cmd is live: Input Monitoring allowed, its event tap on",
+          "inputMonitoring true" in head and "tap true" in head)
+    back = tmux("display", "-p", "-c", client, "#{window_id}")
+    text = "\\n".join(APPTEST_LINES)
+    wid = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", f"{SESSION}:", "sh -c 'exec cat'")
+    pane = tmux("split-window", "-h", "-d", "-P", "-F", "#{pane_id}", "-t", wid, f"sh -c 'printf \"{text}\\n\"; exec cat'")
+    try:
+        tmux("set", "-p", "-t", pane, "@zidev_side", "claude")
+        tmux("select-window", "-t", wid)
+        time.sleep(0.6)
+        left = int(tmux("display", "-p", "-t", pane, "#{pane_left}"))
+        typed = lambda: screen(pane)[len(APPTEST_LINES):]
+        for x, y in ((5, 1), (7, 1), (9, 1), (3, 1), (2, 2), (6, 3), (14, 3)):
+            probe((left + x, y))
+        got = " ".join(typed()).split()
+        check("cmd-click on an item's y / n / ?: 21y 21n 21? into the prompt, not sent", got[:3] == ["21y", "21n", "21?"])
+        check("cmd-click on an item's number: just the number", got[3:5] == ["21", "7"])
+        check("cmd-click on a shorthand in the text: 3y, k 4", got[5:7] == ["3y", "k"] and got[7:8] == ["4"])
+        tmux("send-keys", "-t", pane, "C-u")
+        probe((left + 6, 4))
+        check("cmd-click on a `! command`: typed and run", wait_for(lambda: "!echo apptest-ran" in " ".join(typed()), 3))
+    finally:
+        tmux("select-window", "-t", back)
+        tmux("kill-window", "-t", wid)
+    probe(keys="cmd none cmd none")
+    check("cmd-cmd hides zidev when it is in front", "shown false" in probe())
+    probe(keys="cmd none cmd none")
+    check("cmd-cmd shows it again", "shown true" in probe())
+    probe(keys="cmd none")
+    time.sleep(0.5)
+    probe(keys="cmd none")
+    check("two cmd taps far apart: nothing", "shown true" in probe())
+    probe(keys="cmd key none cmd none")
+    check("cmd-c then cmd: nothing", "shown true" in probe())
+    print(f"\n{len(failed)} failed" if failed else "\nall ok")
+    sys.exit(1 if failed else 0)
+
+
+def wait_for(cond, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def cmd_selftest():
     """End to end on a throwaway server (own socket and home, fake claude): start, new session,
     hook states, side panes, reload, restore after kill. Exit status 1 if anything fails."""
@@ -4571,6 +4658,8 @@ def main():
         cmd_logs(args[1:])
     elif cmd == "selftest":
         cmd_selftest()
+    elif cmd == "apptest":
+        cmd_apptest()
     elif cmd == "run":
         cmd_run(args[1])
     elif cmd == "term":
