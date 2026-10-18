@@ -2454,6 +2454,9 @@ def cmd_bang(pane, x, y, run=""):
     cmd-click (the zidev app, `run`): typed and sent; on a reply shorthand ("k 461") it sends that. Exit 1 when there is none: the double click
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
+    if run:
+        rows = screen(pane)
+        log(f"cmd-click {pane} {x},{y}: {rows[int(y)] if int(y) < len(rows) else '-'!r} -> {hit}")
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(screen(pane), int(y), int(x))
         if short:  # cmd-click on "k 461": sent to Claude as your reply
@@ -2646,8 +2649,10 @@ def install_tmux_hooks():
          f"if-shell \"{me} bang {at}\" '' {{ {word} }}", word)
     # cmd-click: the zidev app sends it as ctrl-alt-click (a terminal can't report cmd); on a
     # `! command` in Claude it runs it, elsewhere it is a plain click
-    tmux("bind", "-n", "C-M-MouseDown1Pane", "select-pane", "-t", "=", "\\;", "if-shell", "-F",
-         "#{==:#{@zidev_side},claude}", f"run-shell -b \"{me} bang {at} run\"", f"run-shell -b \"{me} click {at}\"")
+    # in the sidebar a cmd-click is a click
+    tmux("bind", "-n", "C-M-MouseDown1Pane", "select-pane", "-t", "=", "\\;", "if-shell", "-F", "#{==:#{pane_index},0}",
+         "send-keys -M", f"if-shell -F '#{{==:#{{@zidev_side}},claude}}' "
+         f"{{ run-shell -b \"{me} bang {at} run\" }} {{ run-shell -b \"{me} click {at}\" }}")
     tmux("bind", "-n", "C-M-MouseUp1Pane", "select-pane", "-t", "=")  # its release: not for the app
     tmux("bind", "-n", "MouseUp1Pane", "set", "-gF", "@zidev_link", "#{mouse_hyperlink}", "\\;",
          "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M",
@@ -3755,6 +3760,12 @@ def cmd_selftest():
     with open(f"{proj}/page.html", "w") as f:
         f.write("<h1>served</h1>")
     subprocess.run(["git", "init", "-q", proj], check=True)
+    with open(f"{proj}/.gitignore", "w") as f:
+        f.write("*.log\n")
+    subprocess.run(["git", "-C", proj, "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", proj, "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", "base commit"], check=True)
     browser = f"{root}/browser"
     with open(browser, "w") as f:
         f.write(f"#!/bin/sh\necho \"$1\" > {root}/opened\n")
@@ -3921,6 +3932,13 @@ def cmd_selftest():
         hook({"hook_event_name": "UserPromptSubmit", "prompt": "more", "transcript_path": f"{root}/empty.jsonl"})
         check("no names: the first prompt", shows("fix the login bug"))
         # tabs: one fills the window (never split), the others wait in the park; the sidebar lists them
+        def mouse_click(pane, x, y, button=0):  # a real click through the client, so the tmux bindings run
+            left, top = map(int, t("display", "-p", "-t", pane, "#{pane_left} #{pane_top}").split())
+            top += 1 if t("show", "-gv", "status") == "on" and t("show", "-gv", "status-position") == "top" else 0
+            for end in "Mm":
+                client.stdin.write(f"\x1b[<{button};{left + x + 1};{top + y + 1}{end}".encode())
+                client.stdin.flush()
+                time.sleep(0.1)
         def cursor_to(text):  # the sidebar's cursor to the first row with text
             t("select-pane", "-t", side)  # focused: the cursor shows
             t("send-keys", "-t", side, *["k"] * 30)
@@ -4030,6 +4048,19 @@ def cmd_selftest():
         t("send-keys", "-t", side, "Enter")
         check("⏎ on the shown changes tab unfolds them",
               wait(lambda: all(f in t("capture-pane", "-p", "-t", side) for f in ("? README.md", "? package.json"))))
+        cursor_to("commits")
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on commits: the last commits under it", wait(lambda: "base commit" in t("capture-pane", "-p", "-t", side)))
+        crow = lambda: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "base commit" in l)
+        mouse_click(side, 8, crow())
+        check("a click on a commit: the changes tab shows it",
+              wait(lambda: "*.log" in t("capture-pane", "-p", "-S", "-", "-t", git())))
+        cursor_to("package.json")
+        wait(lambda: "*.log" not in t("capture-pane", "-p", "-S", "-", "-t", git()))
+        cursor_to("base commit")
+        t("send-keys", "-t", side, "Enter")
+        check("⏎ on a commit too", wait(lambda: "*.log" in t("capture-pane", "-p", "-S", "-", "-t", git())))
+        cursor_to("README.md")
         check("one file at a time: scrolling never runs into the next",
               "package.json" not in t("capture-pane", "-p", "-S", "-", "-t", git()))
         cursor_to("package.json")
@@ -4091,13 +4122,6 @@ def cmd_selftest():
         wait(lambda: any(l.startswith("Read(") for l in t("capture-pane", "-p", "-t", term).split("\n")))
         screen = t("capture-pane", "-p", "-t", term).split("\n")
         y = next(i for i, l in enumerate(screen) if l.startswith("Read("))
-        def mouse_click(pane, x, y, button=0):  # a real click through the client, so the tmux bindings run
-            left, top = map(int, t("display", "-p", "-t", pane, "#{pane_left} #{pane_top}").split())
-            top += 1 if t("show", "-gv", "status") == "on" and t("show", "-gv", "status-position") == "top" else 0
-            for end in "Mm":
-                client.stdin.write(f"\x1b[<{button};{left + x + 1};{top + y + 1}{end}".encode())
-                client.stdin.flush()
-                time.sleep(0.1)
         mouse_click(term, 7, y)
         check("click on a path: preview shows that file", wait(lambda: "package.json" in floats()))
         z("click", term, "1", str(y))
