@@ -250,6 +250,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         // the GPU draws the text: CoreGraphics lays out every changed row on the CPU, ~8% of a core for a
         // Claude spinner alone; without Metal it stays on CoreGraphics
         try? term.setUseMetal(true)
+        // every row redrawn each frame: the per-row cache kept rows where they were before tmux moved them (a
+        // line showed 2 rows below where it was, and a cmd-click on it hit the row there)
+        term.metalBufferingMode = .perFrameAggregated
         window.makeFirstResponder(term)
         keyWatch = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             self?.term.zidevKey(e) == true ? nil : e  // before the menu and the terminal see it
