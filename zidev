@@ -2454,9 +2454,6 @@ def cmd_bang(pane, x, y, run=""):
     cmd-click (the zidev app, `run`): typed and sent; on a reply shorthand ("k 461") it sends that. Exit 1 when there is none: the double click
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
-    if run:
-        rows = screen(pane)
-        log(f"cmd-click {pane} {x},{y}: {rows[int(y)] if int(y) < len(rows) else '-'!r} -> {hit}")
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(screen(pane), int(y), int(x))
         if short:  # cmd-click on "k 461": sent to Claude as your reply
