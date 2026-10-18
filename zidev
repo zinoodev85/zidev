@@ -2469,12 +2469,13 @@ def cmd_bang(pane, x, y, run=""):
     """A double click on a `! command` in Claude: typed into its prompt, not sent (⏎ is yours).
     cmd-click (the zidev app, `run`): typed and sent; a reply shorthand ("3y") is added to the prompt, not sent. Exit 1 when there is none: the double click
     selects a word as usual, a cmd-click is a plain click."""
+    rows = screen(pane) if run else []  # before anything focuses it (Claude redraws then)
     hit = clicked_path(pane, x, y)
-    if run:  # TEMP: where cmd-clicks land
-        rows = screen(pane)
-        log(f"cmd-click {pane} {x},{y}: {rows[int(y)][:60] if int(y) < len(rows) else '-'!r} -> {hit}")
+    if run:
+        tmux("select-pane", "-t", pane)
+        log(f"cmd-click {pane} {x},{y}: {rows[int(y)][:60] if int(y) < len(rows) else '-'!r} -> {hit}")  # TEMP
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
-        short = shorthand_at(screen(pane), int(y), int(x))
+        short = shorthand_at(rows, int(y), int(x))
         if short:  # cmd-click on "3y": added to the prompt; click several, ⏎ sends them together
             tmux("send-keys", "-t", pane, "-l", short + " ")
             return
@@ -2663,10 +2664,11 @@ def install_tmux_hooks():
          f"if-shell \"{me} bang {at}\" '' {{ {word} }}", word)
     # cmd-click: the zidev app sends it as ctrl-alt-click (a terminal can't report cmd); on a
     # `! command` in Claude it runs it, elsewhere it is a plain click
-    # in the sidebar a cmd-click is a click
-    tmux("bind", "-n", "C-M-MouseDown1Pane", "select-pane", "-t", "=", "\\;", "if-shell", "-F", "#{==:#{pane_index},0}",
-         "send-keys -M", f"if-shell -F '#{{==:#{{@zidev_side}},claude}}' "
-         f"{{ run-shell -b \"{me} bang {at} run\" }} {{ run-shell -b \"{me} click {at}\" }}")
+    # in the sidebar a cmd-click is a click. In Claude the pane is focused only once its screen is read:
+    # focusing first makes Claude redraw, and the row clicked would hold another line by then
+    tmux("bind", "-n", "C-M-MouseDown1Pane", "if-shell", "-F", "#{==:#{pane_index},0}",
+         "select-pane -t = ; send-keys -M", f"if-shell -F '#{{==:#{{@zidev_side}},claude}}' "
+         f"{{ run-shell -b \"{me} bang {at} run\" }} {{ select-pane -t = ; run-shell -b \"{me} click {at}\" }}")
     tmux("bind", "-n", "C-M-MouseUp1Pane", "select-pane", "-t", "=")  # its release: not for the app
     tmux("bind", "-n", "MouseUp1Pane", "set", "-gF", "@zidev_link", "#{mouse_hyperlink}", "\\;",
          "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M",
