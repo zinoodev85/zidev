@@ -1452,19 +1452,35 @@ def changed_files(cwd, run=True):
     if hit and (hit[0] >= since or now - hit[0] < CHANGES_MIN_S):
         return hit[1]
     path = f"{CHANGES_DIR}/{top.strip('/').replace('/', '%')}.json"
+    stale = lambda d: d.get("at", 0) < since or "commits" not in d
     shared = read_json(path, {})
-    if shared.get("at", 0) < since and run:
+    if stale(shared) and run:
         os.makedirs(CHANGES_DIR, exist_ok=True)
         with open(f"{path}.lock", "w") as lock:  # one sidebar runs it, the others take its list
             fcntl.flock(lock, fcntl.LOCK_EX)
             shared = read_json(path, {})
-            if shared.get("at", 0) < since:
-                shared = {"at": time.time(), "files": git_changes(top)}
+            if stale(shared):
+                shared = {"at": time.time(), "files": git_changes(top), "commits": git_commits(top)}
                 write_json(path, shared)
     if "files" not in shared:
         return hit[1] if hit else []
-    _changed[top] = (shared["at"], [tuple(f) for f in shared["files"]])
+    _changed[top] = (shared["at"], [tuple(f) for f in shared["files"]], [tuple(c) for c in shared.get("commits", [])])
     return _changed[top][1]
+
+
+COMMITS_SHOWN = 5
+
+
+def recent_commits(cwd):
+    """(short hash, subject) of the last commits, read with the changed files (changed_files first)."""
+    hit = _changed.get(repo_top(cwd) or "")
+    return hit[2] if hit else []
+
+
+def git_commits(top):
+    out = subprocess.run(["git", "--no-optional-locks", "-C", top, "log", f"-{COMMITS_SHOWN}", "--format=%h%x09%s"],
+                         capture_output=True, text=True).stdout
+    return [l.split("\t", 1) for l in out.splitlines() if "\t" in l]
 
 
 def git_changes(top):
@@ -1489,6 +1505,9 @@ def cmd_git(where, file=""):
     another file. esc closes the tab. It is redrawn each time it is shown."""
     if subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True).returncode:
         diff, msg = b"", "not a git repository"
+    elif file.startswith("commit:"):  # one of the last commits listed under the changes
+        diff = subprocess.run(["git", "show", "--stat", "-p", file[7:]], capture_output=True).stdout
+        msg = f"no commit {file[7:]}"
     else:
         files = [f for _, f in git_changes(repo_top(os.getcwd()))]  # shown now: fresh, not the watched list
         file = file if file in files else files[0] if files else ""
@@ -2867,6 +2886,7 @@ class Sidebar:
                         self.changes[cwd] = changed_files(cwd, run=self.visible)
                         if cwd in self.data["changes_open"]:
                             self.items += [("change", (t, st, path)) for st, path in self.changes[cwd]]
+                            self.items += [("commit", (t, sha, subject)) for sha, subject in recent_commits(cwd)]
         self.waits = {t["pane"] for t in self.tabs if self.term_waits(t)}
         self.select(key)
 
@@ -2914,7 +2934,8 @@ class Sidebar:
         kind, v = item
         return kind, (v if kind in ("project", "pickfile") else v["id"] if kind == "session" else
                       v["at"] if kind in ("pick", "pickmore") else
-                      (v[0]["pane"], v[2]) if kind == "change" else v["pane"])
+                      (v[0]["pane"], v[2]) if kind == "change" else
+                      (v[0]["pane"], v[1]) if kind == "commit" else v["pane"])
 
     def session_of_item(self, kind, v):
         """The session a row's t / g / c open in: its own; a project or tab row: here()."""
@@ -2923,7 +2944,7 @@ class Sidebar:
     @staticmethod
     def project_of(kind, v):
         return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"],
-                "change": lambda: v[0]["project"]}[kind]()
+                "change": lambda: v[0]["project"], "commit": lambda: v[0]["project"]}[kind]()
 
     def here(self, cwd):
         """Where a project's tab shows: this window when it is the project's, else its window used last."""
@@ -3027,6 +3048,8 @@ class Sidebar:
                 self.draw_tab(y, w, v, base)
             elif kind == "change":
                 self.draw_change(y, w, v, base)
+            elif kind == "commit":
+                self.draw_commit(y, w, v, base)
             elif kind == "pick":
                 self.put(y, 1, f"which {v['name']}?"[: w - 2], base | c(3) | bold)
                 if v["asking"]:
@@ -3136,6 +3159,14 @@ class Sidebar:
         self.put(y, tx, st, base | curses.color_pair(self.CHANGE_COLORS.get(st, 3)))
         self.put(y, tx + 2, name, base | (curses.A_BOLD if shown else curses.A_DIM))
 
+    def draw_commit(self, y, w, commit, base):
+        """One of the last commits, under the changed files; bright while the changes tab shows it."""
+        t, sha, subject = commit
+        tx = 5 if w < 20 else 7
+        shown = t["visible"] and t["file"] == f"commit:{sha}"
+        self.put(y, tx, "◦", base | curses.A_DIM)
+        self.put(y, tx + 2, f"{sha} {subject}"[: max(0, w - tx - 3)], base | (curses.A_BOLD if shown else curses.A_DIM))
+
     # input
 
     def prompt(self, label, text="", complete=False, live=None):
@@ -3180,12 +3211,17 @@ class Sidebar:
         return ch == "y" or ch == again
 
     def follow(self):
-        """The cursor on a changed file while the changes tab shows: that file's diff (focus stays here)."""
+        """The cursor on a changed file or a commit while the changes tab shows: its diff (focus stays here)."""
         kind, v = self.current()
-        if kind == "change" and v[0]["visible"] and v[0]["file"] != v[2]:
+        if kind in ("change", "commit") and v[0]["visible"] and v[0]["file"] != self.diff_of(kind, v):
             s = self.here(v[0]["project"])
             if s and self.windows.get(s["id"]) == v[0]["window"]:
-                show_changes(v[0], v[2], s["id"], focus=False)
+                show_changes(v[0], self.diff_of(kind, v), s["id"], focus=False)
+
+    @staticmethod
+    def diff_of(kind, v):
+        """What the changes tab shows for a changed file row (its path) or a commit row (commit:<hash>)."""
+        return f"commit:{v[1]}" if kind == "commit" else v[2]
 
     def move(self, delta):
         if self.items:
@@ -3215,8 +3251,8 @@ class Sidebar:
                 claude = claude_tab(v["id"])
                 if claude:
                     select_tab(claude["pane"])
-        elif kind in ("tab", "change"):  # in this window when it is the project's
-            t = v[0] if kind == "change" else v
+        elif kind in ("tab", "change", "commit"):  # in this window when it is the project's
+            t = v[0] if kind in ("change", "commit") else v
             s = self.here(t["project"])
             if not s:
                 self.message = "no session: n starts one"
@@ -3224,8 +3260,8 @@ class Sidebar:
                 new_tab(s["id"], "file", file=changed_path(t["project"], v[2]))  # ⏎: the file, as a tab
             elif kind == "tab" and v["kind"] == "git" and v["visible"] and not click:  # shown: ⏎ folds its files
                 self.fold_changes(t["project"])
-            elif kind == "change":  # a click: its diff
-                if show_changes(t, v[2], s["id"]):
+            elif kind in ("change", "commit"):  # a click (a commit: ⏎ too): its diff
+                if show_changes(t, self.diff_of(kind, v), s["id"]):
                     show_window(self.windows[s["id"]])
                     tmux("select-pane", "-t", t["pane"])
             elif select_tab(v["pane"], s["id"]):

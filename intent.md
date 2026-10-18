@@ -55,3 +55,6 @@ Decisions on how zidev should be. Only these.
 - In the app, cmd-click on a `! command` runs it.
 - The app just looks right on every Mac, nothing to set up: Claude's own colors (as outside tmux), zidev's font; a double click on its title bar maximizes it.
 - A folded project shows the spinner while a session in it works, ● while one waits for my answer.
+- Under the changes tab, below its changed files: the last 5 commits; the cursor on one (or a click) shows it in the changes tab.
+- A short tone plays each time a session stops working.
+- zidev is process-light: nothing polls git; the sidebar waits for file and tmux events.
