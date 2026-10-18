@@ -2712,8 +2712,23 @@ def cmd_hook():
             st["since"] = time.time()
             if state in ("waiting", "done", "error"):
                 notify(zid, st, state, detail)
+            if state in ("done", "error") and st.get("state") == "working":
+                chime()
         st["state"], st["detail"] = state, detail or ""
     write_json(path, st)
+
+
+CHIME = "/System/Library/Sounds/Tink.aiff"
+
+
+def chime():
+    """A short tone when a session stops working, on screen or not; config "sound": false mutes it,
+    a path plays that file instead."""
+    sound = read_json(CONFIG, {}).get("sound", CHIME)
+    if not sound or os.environ.get("ZIDEV_NOTIFY") in ("0", "log"):
+        return
+    subprocess.Popen(["afplay", sound if isinstance(sound, str) else CHIME], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def notify(zid, st, state, detail):
