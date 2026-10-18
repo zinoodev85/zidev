@@ -2327,8 +2327,9 @@ def bang_from(rows, y, x, width):
 SHORTHAND = re.compile(r"(?<![\w-])(?:[kyxnd](?: \d+)+|\d+[kyxnd?])(?![\w-])")
 
 
-CHOICES = re.compile(r"\s*(?:[-*•⏺]\s+)?(\d+)\.?((?:\s+[yxndk?])+)\s*:")  # 42 y n ? : what item 42 is
-ITEM = re.compile(r"\s*(?:[-*•⏺]\s+)?(\d+)\b")  # 42. an item's number
+BULLET = r"\s*(?:[-–—*•·⏺]\s+)?"
+CHOICES = re.compile(BULLET + r"(\d+[a-z]?)\.?((?:\s+[yxndk?])+)\s*:")  # 42 y n ? : what item 42 is
+ITEM = re.compile(BULLET + r"(\d+[a-z]?)\b")  # 42. / – 10a: an item's number
 
 
 def shorthand_at(rows, y, x):
