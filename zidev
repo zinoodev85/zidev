@@ -2473,7 +2473,6 @@ def cmd_bang(pane, x, y, run=""):
     hit = clicked_path(pane, x, y)
     if run:
         tmux("select-pane", "-t", pane)
-        log(f"cmd-click {pane} {x},{y}: {rows[int(y)][:60] if int(y) < len(rows) else '-'!r} -> {hit}")  # TEMP
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(rows, int(y), int(x))
         if short:  # cmd-click on "3y": added to the prompt; click several, ⏎ sends them together
