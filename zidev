@@ -55,6 +55,7 @@ STATUS_DIR = f"{HOME}/status"
 SEEN_DIR = f"{HOME}/seen"
 CONFIG = f"{HOME}/config.json"
 VIEW = f"{HOME}/view.json"  # the sidebar's cursor and scroll, the same in every window
+SWITCHED = f"{HOME}/switched"  # touched by tmux hooks when a window, pane or client changes: wakes the sidebars
 HOOK_SETTINGS = f"{HOME}/claude-settings.json"
 LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
@@ -196,8 +197,11 @@ def session_windows(strict=False):
     out = tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{@zidev_id}")
     if out is None and strict:
         return None
+    return parse_windows(out or "")
+
+
+def parse_windows(out):
     wins = {}
-    out = out or ""
     for line in out.splitlines():
         wid, _, zid = line.partition(" ")
         if zid:
@@ -248,12 +252,31 @@ def tmux_all(*cmds):
     return tmux(*args[:-1]) if args else ""
 
 
+TAB_FORMAT = "\t".join(f"#{{{f}}}" for f in TAB_FIELDS.values())
+
+
 def all_tabs(strict=False):
     """Every tab; strict: None when tmux did not answer (not: there are none)."""
-    out = tmux("list-panes", "-a", "-F", "\t".join(f"#{{{f}}}" for f in TAB_FIELDS.values()))
+    out = tmux("list-panes", "-a", "-F", TAB_FORMAT)
     if out is None and strict:
         return None
-    out = out or ""
+    return parse_tabs(out or "")
+
+
+def tmux_snapshot(pane):
+    """What the sidebar reads from tmux, in one tmux call: this pane's flags (window active, session
+    attached, pane active, client theme), the session windows and every tab; None when tmux did not answer."""
+    out = tmux_all(["display", "-p", "-t", pane, "#{window_active} #{session_attached} #{pane_active} #{client_theme}"],
+                   ["list-windows", "-t", SESSION, "-F", "W #{window_id} #{@zidev_id}"],
+                   ["list-panes", "-a", "-F", TAB_FORMAT])
+    if out is None:
+        return None
+    flags, *rest = out.split("\n")
+    wins = "\n".join(l[2:] for l in rest if l.startswith("W "))
+    return flags.split(), parse_windows(wins), parse_tabs("\n".join(l for l in rest if "\t" in l))
+
+
+def parse_tabs(out):
     tabs = []
     for line in out.splitlines():
         t = dict(zip(TAB_FIELDS, line.split("\t")))
@@ -1325,22 +1348,129 @@ def changes(path=None):
     return out
 
 
-_changed = {}
+# ── changed files ──────────────────────────────────────────────────────────
+# git status is not polled: macOS FSEvents (through ctypes, nothing to install) tells when a file in
+# the repository changed, and only then does it run again, at most every CHANGES_MIN_S seconds, in the
+# shown sidebar. Its list is shared through CHANGES_DIR, so sidebars of one repository run it once.
+
+CHANGES_DIR = f"{HOME}/changes"
+CHANGES_MIN_S = 5
+CHANGES_POLL_S = 60  # without FSEvents
+_changed = {}     # repository top -> (when its git status started, its files)
+_changed_at = {}  # repository top -> when a file in it last changed (seen by this process)
+_streams = {}     # repository top -> its FSEvents stream and callback (kept alive), or None
+_tops = {}        # folder -> (when asked, its repository top or None)
+_fsevents = None
+
+
+def repo_top(cwd):
+    hit = _tops.get(cwd)
+    if hit and (hit[1] or time.time() - hit[0] < CHANGES_POLL_S):  # a folder may become a repository
+        return hit[1]
+    top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True).stdout.strip() or None
+    _tops[cwd] = (time.time(), top)
+    return top
 
 
 def changed_path(cwd, path):
     """The full path of a file git status lists (relative to the repository's top)."""
-    top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
-    return os.path.join(top or cwd, path)
+    return os.path.join(repo_top(cwd) or cwd, path)
 
 
-def changed_files(cwd):
-    """(status letter, path) of a project's changed files, listed under its changes tab; cached
-    a moment (the sidebar redraws often)."""
-    hit = _changed.get(cwd)
-    if hit and time.time() - hit[0] < 2:
+def fsevents():
+    """CoreServices' FSEvents through ctypes; False where it cannot load."""
+    global _fsevents
+    if _fsevents is None:
+        try:
+            import ctypes
+            V, P = ctypes.c_void_p, ctypes.POINTER
+            cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            cs = ctypes.CDLL("/System/Library/Frameworks/CoreServices.framework/CoreServices")
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            cf.CFStringCreateWithCString.restype, cf.CFStringCreateWithCString.argtypes = V, [V, ctypes.c_char_p, ctypes.c_uint32]
+            cf.CFArrayCreate.restype, cf.CFArrayCreate.argtypes = V, [V, P(V), ctypes.c_long, V]
+            callback = ctypes.CFUNCTYPE(None, V, V, ctypes.c_size_t, P(ctypes.c_char_p), V, V)
+            cs.FSEventStreamCreate.restype = V
+            cs.FSEventStreamCreate.argtypes = [V, callback, V, V, ctypes.c_uint64, ctypes.c_double, ctypes.c_uint32]
+            cs.FSEventStreamSetDispatchQueue.argtypes = [V, V]
+            cs.FSEventStreamStart.restype, cs.FSEventStreamStart.argtypes = ctypes.c_bool, [V]
+            libc.dispatch_queue_create.restype, libc.dispatch_queue_create.argtypes = V, [ctypes.c_char_p, V]
+            _fsevents = (ctypes, cf, cs, callback, libc.dispatch_queue_create(b"zidev.changes", None))
+        except Exception:
+            log(traceback.format_exc())
+            _fsevents = False
+    return _fsevents
+
+
+def counts(path):
+    """A change git status can show: anything outside .git; inside it only what a commit, an add or a
+    checkout writes, not git's own bookkeeping (fsmonitor cookies, logs, locks)."""
+    _, inside, rest = path.partition("/.git/")
+    return not inside or rest in ("index", "HEAD", "packed-refs") or rest.startswith("refs/")
+
+
+def watch(top):
+    """Watch a repository from now on (once per process); False when it cannot be watched."""
+    if top in _streams:
+        return _streams[top] is not None
+    _changed_at[top] = time.time()  # what changed before is unknown
+    _streams[top] = None
+    fs = fsevents()
+    if not fs:
+        return False
+    ctypes, cf, cs, callback, queue = fs
+
+    def seen(_stream, _info, n, paths, _flags, _ids):
+        if any(counts(paths[i].decode(errors="replace")) for i in range(n)):
+            _changed_at[top] = time.time()
+
+    keep = callback(seen)
+    name = cf.CFStringCreateWithCString(None, top.encode(), 0x08000100)  # UTF-8
+    paths = cf.CFArrayCreate(None, (ctypes.c_void_p * 1)(name), 1,
+                             ctypes.addressof(ctypes.c_void_p.in_dll(cf, "kCFTypeArrayCallBacks")))
+    # since now, 1 s latency (events coalesce), file-level events
+    stream = cs.FSEventStreamCreate(None, keep, None, paths, 0xFFFFFFFFFFFFFFFF, 1.0, 0x10)
+    if not stream:
+        return False
+    cs.FSEventStreamSetDispatchQueue(stream, queue)
+    if not cs.FSEventStreamStart(stream):
+        return False
+    _streams[top] = (stream, keep)
+    return True
+
+
+def changed_files(cwd, run=True):
+    """(status letter, path) of a repository's changed files, listed under its changes tab. git status
+    runs again only after a file in it changed; run=False never runs it (a hidden sidebar)."""
+    top = repo_top(cwd)
+    if not top:
+        return []
+    now = time.time()
+    since = _changed_at[top] if watch(top) else now - CHANGES_POLL_S
+    hit = _changed.get(top)
+    if hit and (hit[0] >= since or now - hit[0] < CHANGES_MIN_S):
         return hit[1]
-    r = subprocess.run(["git", "-C", cwd, "status", "--porcelain=v1", "-z", "-uall"], capture_output=True, text=True)
+    path = f"{CHANGES_DIR}/{top.strip('/').replace('/', '%')}.json"
+    shared = read_json(path, {})
+    if shared.get("at", 0) < since and run:
+        os.makedirs(CHANGES_DIR, exist_ok=True)
+        with open(f"{path}.lock", "w") as lock:  # one sidebar runs it, the others take its list
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            shared = read_json(path, {})
+            if shared.get("at", 0) < since:
+                shared = {"at": time.time(), "files": git_changes(top)}
+                write_json(path, shared)
+    if "files" not in shared:
+        return hit[1] if hit else []
+    _changed[top] = (shared["at"], [tuple(f) for f in shared["files"]])
+    return _changed[top][1]
+
+
+def git_changes(top):
+    # --no-optional-locks: status never writes the index, so it does not wake its own watch
+    r = subprocess.run(["git", "--no-optional-locks", "-C", top, "status", "--porcelain=v1", "-z", "-uall"],
+                       capture_output=True, text=True)
     parts, files = (r.stdout.split("\0") if r.returncode == 0 else []), []
     while parts:
         entry = parts.pop(0)
@@ -1350,7 +1480,6 @@ def changed_files(cwd):
         if xy[0] in "RC":  # the old name follows
             parts = parts[1:]
         files.append(("?" if xy == "??" else xy[1] if xy[1] != " " else xy[0], path))
-    _changed[cwd] = (time.time(), files[:200])
     return files[:200]
 
 
@@ -1361,7 +1490,7 @@ def cmd_git(where, file=""):
     if subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True).returncode:
         diff, msg = b"", "not a git repository"
     else:
-        files = [f for _, f in changed_files(os.getcwd())]
+        files = [f for _, f in git_changes(repo_top(os.getcwd()))]  # shown now: fresh, not the watched list
         file = file if file in files else files[0] if files else ""
         if os.environ.get("TMUX_PANE"):  # the sidebar marks the file shown
             tmux("set", "-p", "-t", os.environ["TMUX_PANE"], "@zidev_file", file)
@@ -2387,6 +2516,9 @@ def install_tmux_hooks():
     me = " ".join(shlex.quote(a) for a in (sys.executable, SELF))
     tmux("set-hook", "-gu", "window-layout-changed")  # older versions
     tmux("set-hook", "-g", "pane-exited", f"run-shell -b \"{me} tabsync\"")
+    for hook in ("session-window-changed", "window-pane-changed", "client-session-changed", "client-attached",
+                 "client-detached", "client-light-theme", "client-dark-theme"):
+        tmux("set-hook", "-g", hook, f"run-shell -b \"touch {shlex.quote(SWITCHED)}\"")
     # -M: clicks work in a menu opened from a key; -O: moving the mouse never closes or picks
     menu = ["display-menu", "-M", "-O", "-T", "#[align=centre] zidev ", "-x", "C", "-y", "C"]
     for item in MENU:
@@ -2682,11 +2814,12 @@ class Sidebar:
 
     # data
 
-    def load(self):
+    def load(self, snap=None):
         self.data = load_state()
         self.status = {s["id"]: read_status(s["id"]) for s in self.data["sessions"]}
         # tmux did not answer: keep what was there, the sessions did not stop
-        wins, tabs = session_windows(strict=True), all_tabs(strict=True)
+        snap = snap or tmux_snapshot(self.pane)
+        wins, tabs = snap[1:] if snap else (None, None)
         self.windows = wins if wins is not None else getattr(self, "windows", {})
         self.tabs = tabs if tabs is not None else getattr(self, "tabs", [])
         gone = set(self.data.get("archived", []))  # archived: not listed (A finds them)
@@ -2716,7 +2849,7 @@ class Sidebar:
                 for t in project_tabs(cwd, self.tabs):  # shared by its sessions
                     self.items.append(("tab", t))
                     if t["kind"] == "git":  # its changed files under it, when unfolded
-                        self.changes[cwd] = changed_files(cwd)
+                        self.changes[cwd] = changed_files(cwd, run=self.visible)
                         if cwd in self.data["changes_open"]:
                             self.items += [("change", (t, st, path)) for st, path in self.changes[cwd]]
         self.waits = {t["pane"] for t in self.tabs if self.term_waits(t)}
@@ -3361,37 +3494,60 @@ class Sidebar:
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(0)
         self.scr.keypad(True)
+        woke, asked, stale = None, 0.0, True
         while True:
-            flags = (tmux("display", "-p", "-t", self.pane,
-                          "#{window_active} #{session_attached} #{pane_active} #{client_theme}") or "0 0 0").split()
-            if len(flags) > 3:  # the terminal's light / dark theme (tmux asks it), as it switches
-                self.paint(flags[3])
-            if flags[0] != "1" or flags[1] == "0":  # not shown: kept drawn, so a switch here shows it as it is
-                self.visible = self.focused = False
-                self.load()
-                self.adopt_view()
+            # a tick looks only at the SWITCHED mark (no process); tmux is asked when it moved, after a
+            # key, or every SHOWN_S / HIDDEN_S seconds
+            mark = mtime(SWITCHED)
+            if stale or mark != woke or time.time() - asked >= (SHOWN_S if self.visible else HIDDEN_S):
+                woke, asked, stale = mark, time.time(), False
+                self.refresh()
+                if not self.visible:
+                    self.draw()  # kept drawn, so a switch here shows it as it is
+            if self.visible:
+                if self.my_id:
+                    mark_seen(self.my_id)
+                self.frame += 1
                 self.draw()
-                self.scr.timeout(500)
-                self.scr.getch()
-                continue
-            self.focused = flags[2] == "1"
-            self.load()
-            if not self.visible:
-                self.visible = True
-                self.fix_width()
-                self.adopt_view()
-                me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
-                if me and not (self.items and self.is_mine(self.current(), me)):
-                    self.select(("session", self.my_id))
-            if self.my_id:
-                mark_seen(self.my_id)
-            self.frame += 1
-            self.draw()
-            self.scr.timeout(250)
+            self.scr.timeout(TICK_MS)
             ch = self.scr.getch()
-            if ch != -1:
+            if ch != -1 and not self.visible:  # a key came before the switch was seen
+                self.refresh()
+            if ch != -1 and self.visible:
                 self.key(ch)
                 self.save_view()
+                stale = True
+
+    def refresh(self):
+        snap = tmux_snapshot(self.pane)
+        flags = snap[0] if snap else ["0", "0", "0"]
+        if len(flags) > 3:  # the terminal's light / dark theme (tmux asks it), as it switches
+            self.paint(flags[3])
+        if flags[0] != "1" or flags[1] == "0":  # not shown
+            self.visible = self.focused = False
+            self.load(snap)
+            self.adopt_view()
+            return
+        self.focused, shown, self.visible = flags[2] == "1", self.visible, True
+        self.load(snap)
+        if not shown:
+            self.fix_width()
+            self.adopt_view()
+            me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
+            if me and not (self.items and self.is_mine(self.current(), me)):
+                self.select(("session", self.my_id))
+
+
+TICK_MS = 250  # keys, mouse and the spinner
+SHOWN_S = 1    # the shown sidebar asks tmux this often (status, tabs, focus)
+HIDDEN_S = 15  # a hidden one this often; a switch to it wakes it at once (SWITCHED)
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
 
 
 SEL_PAIR = 10  # color pairs 10-15: on the selection bar, 20-25: on it while the focus is elsewhere
