@@ -2327,11 +2327,22 @@ def bang_from(rows, y, x, width):
 SHORTHAND = re.compile(r"(?<![\w-])(?:[kyxnd](?: \d+)+|\d+[kyxnd?])(?![\w-])")
 
 
+CHOICES = re.compile(r"\s*(?:[-*•⏺]\s+)?(\d+)\.?((?:\s+[yxndk?])+)\s*:")  # 42 y n ? : what item 42 is
+
+
 def shorthand_at(rows, y, x):
-    """A reply shorthand under (x, y): "k 461", "k 1 2 3", "461k", "3?" (do / drop / explain item n)."""
+    """A reply shorthand under (x, y): "k 461", "k 1 2 3", "461k", "3?" (do / drop / explain item n),
+    or one of an item's choices: the y in "42 y n ? : ..." is 42y."""
     if not 0 <= y < len(rows):
         return None
-    return next((m[0] for m in SHORTHAND.finditer(ANSI.sub("", rows[y])) if m.start() <= x < m.end()), None)
+    plain = ANSI.sub("", rows[y])
+    m = CHOICES.match(plain)
+    if m:
+        letters = m.start(2)
+        for i, c in enumerate(m[2]):
+            if c.strip() and letters + i == x:
+                return m[1] + c
+    return next((m[0] for m in SHORTHAND.finditer(plain) if m.start() <= x < m.end()), None)
 
 
 def screen(pane, ansi=False):

@@ -62,6 +62,6 @@ Decisions on how zidev should be. Only these.
 - A click on a sidebar row opens it and the focus stays in the sidebar: its keys (t, g, …) work next; ⏎ moves the focus to what it opened.
 - A global hotkey shows / hides the zidev app (config "hotkey", default cmd-cmd: cmd pressed twice; or a combo like "alt-space"); Window > Float on Top keeps it above other apps.
 - `t` in the sidebar opens a new terminal tab each time.
-- cmd-click on a reply shorthand in Claude ("3y", "4n", "5?", "k 461") adds it to the prompt; several are sent together with ⏎.
+- cmd-click on a reply shorthand in Claude ("3y", "4n", "5?", "k 461") adds it to the prompt; several are sent together with ⏎. So does a choice of an item line "42 y n ? : ...": its y is 42y.
 - A click on a commit hash (50ca04b) in any tab shows that commit in the floating preview, found in the pane's repo or any project's.
 - Clicks read the rows shown, also when the pane is scrolled back.
