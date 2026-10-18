@@ -1,14 +1,15 @@
 // zidev.app: a window of its own for zidev (a terminal running `zidev`), with its own Dock icon.
 // The cmd / alt keys zidev knows (`zidev keys`) go straight to it; the rest stay the app's (cmd-q, cmd-v).
 // cmd-click on a `! command` Claude suggests runs it.
-// A global hotkey (config "hotkey" in ~/.zidev/config.json, default alt-space) shows and hides the window;
+// A global hotkey (config "hotkey" in ~/.zidev/config.json, default cmd-cmd: cmd pressed twice) shows and
+// hides the window;
 // Window > Float on Top keeps it above other apps.
 import AppKit
 import Carbon.HIToolbox
 import SwiftTerm
 
 let shell = "/bin/zsh"
-let defaultHotkey = "alt-space"
+let defaultHotkey = "cmd-cmd"
 
 /// key codes of the physical keys (US positions: on a German keyboard "z" is the key marked Y)
 let keyCodes: [String: Int] = [
@@ -63,6 +64,70 @@ func registerHotkey(_ s: String, _ action: @escaping () -> Void) {
     }, 1, &spec, nil, nil)
     RegisterEventHotKey(code, mods, EventHotKeyID(signature: OSType(0x7a696476), id: 1),  // 'zidv'
                         GetApplicationEventTarget(), 0, &hotkeyRef)
+}
+
+let tapMods: [String: CGEventFlags] = ["cmd": .maskCommand, "alt": .maskAlternate, "opt": .maskAlternate,
+                                       "ctrl": .maskControl, "shift": .maskShift]
+let anyMod: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+
+/// a double tap of one modifier ("cmd-cmd"): pressed and let go alone, twice within tapGap
+struct DoubleTap {
+    static let tapGap = 0.4, holdMax = 0.3
+    static var mod: CGEventFlags = []
+    static var downAt = 0.0, lastTap = 0.0, clean = false, held = false
+    static var tap: CFMachPort?
+
+    static func flags(_ f: CGEventFlags) {
+        let now = ProcessInfo.processInfo.systemUptime, m = f.intersection(anyMod)
+        if m == mod {
+            downAt = now; clean = true; held = true
+        } else if m.isEmpty && held {
+            held = false
+            guard clean && now - downAt < holdMax else { lastTap = 0; return }
+            if now - lastTap < tapGap {
+                lastTap = 0
+                DispatchQueue.main.async { hotkeyAction?() }
+            } else {
+                lastTap = now
+            }
+        } else {
+            clean = false; held = false; lastTap = 0
+        }
+    }
+
+    static func key() { clean = false; lastTap = 0 }  // cmd-c is no tap
+}
+
+/// "cmd-cmd" etc. through a listen-only event tap (asks once for Input Monitoring in System Settings)
+func registerDoubleTap(_ mod: CGEventFlags, _ action: @escaping () -> Void) {
+    hotkeyAction = action
+    DoubleTap.mod = mod
+    if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
+    let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
+                                      eventsOfInterest: CGEventMask(mask), callback: { _, type, e, _ in
+        switch type {
+        case .flagsChanged: DoubleTap.flags(e.flags)
+        case .keyDown: DoubleTap.key()
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let t = DoubleTap.tap { CGEvent.tapEnable(tap: t, enable: true) }
+        default: break
+        }
+        return Unmanaged.passUnretained(e)
+    }, userInfo: nil) else { return }
+    DoubleTap.tap = tap
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+}
+
+/// a hotkey from the config: "cmd-cmd" (a double tap) or a combo like "ctrl-alt-z"
+func registerAnyHotkey(_ s: String, _ action: @escaping () -> Void) {
+    let parts = s.lowercased().split(separator: "-").map(String.init)
+    if parts.count == 2, parts[0] == parts[1], let mod = tapMods[parts[0]] {
+        registerDoubleTap(mod, action)
+    } else {
+        registerHotkey(s, action)
+    }
 }
 
 /// `zidev keys`: key name (cmd-w, alt-left, cmd-shift-z) -> what to send. Asked through a login shell,
@@ -195,7 +260,7 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
             return self.term.cmdClick(e) ? nil : e
         }
         if let key = configuredHotkey() {
-            registerHotkey(key) { [weak self] in self?.toggleShown() }
+            registerAnyHotkey(key) { [weak self] in self?.toggleShown() }
         }
         setFloating(UserDefaults.standard.bool(forKey: "floatOnTop"))
         NSApp.activate(ignoringOtherApps: true)

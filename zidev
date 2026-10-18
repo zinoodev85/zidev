@@ -3317,12 +3317,12 @@ class Sidebar:
             else:
                 d[key].append(cwd)
 
-    def side(self, s, kind):
-        """Show the project's terminal / commands / git tab in the session's window, a new one if none."""
+    def side(self, s, kind, new=False):
+        """Show the project's terminal / commands / git tab in the session's window, a new one if none (or new)."""
         wid = self.windows.get(s["id"]) or spawn_window(s)
         if wid:
             show_window(wid)
-            show_kind(s["id"], kind)
+            (new_tab if new else show_kind)(s["id"], kind)
 
     def new_in(self, cwd):
         if not cwd:
@@ -3456,7 +3456,7 @@ class Sidebar:
             tmux("display-popup", "-E", "-t", self.pane, "-w", "70%", "-h", "60%", "-T", " archived projects ",
                  self_cmd("archived"))
         elif ch == ord("t") and sess:
-            self.side(sess, "term")
+            self.side(sess, "term", new=True)
         elif ch == ord("g") and sess:
             self.side(sess, "git")
         elif ch in (ord("c"), ord("f")) and sess:
@@ -4265,10 +4265,10 @@ def cmd_selftest():
         t("select-window", "-t", wid2)
         time.sleep(1)
         t("send-keys", "-t", f"{wid2}.0", "t")
-        check("tabs are the project's: the second session shows the same terminal",
-              wait(lambda: main2() == "term" and kinds().count("term") == 1))
-        check("the sidebar lists it once",
-              wait(lambda: t("capture-pane", "-p", "-t", f"{wid2}.0").count("terminal") == 1))
+        check("t in the second session opens another terminal",
+              wait(lambda: main2() == "term" and kinds().count("term") == 2))
+        check("the sidebar lists both",
+              wait(lambda: t("capture-pane", "-p", "-t", f"{wid2}.0").count("terminal") == 2))
         side2 = f"{wid2}.0"
         prow = lambda: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side2).splitlines()) if "proj" in l)
         active = lambda: t("display", "-p", "#{window_id}")
@@ -4302,8 +4302,8 @@ def cmd_selftest():
         t("select-window", "-t", wid)
         time.sleep(1)
         t("send-keys", "-t", side, "t")
-        check("t in the first session moves it there; the second shows its Claude",
-              wait(lambda: main() == "term" and main2() == "claude"))
+        check("t in the first session opens a third; the second keeps its own",
+              wait(lambda: main() == "term" and main2() == "term" and kinds().count("term") == 3))
         z("tab", "claude", f"{wid}.1")
         wait(lambda: main() == "claude")
         cursor_to("fix the login bug")  # the cursor stays where it was (switching windows keeps it)
@@ -4374,6 +4374,9 @@ def cmd_selftest():
               wait(lambda: len(wins()) == n_wins - 2 and "proj3" not in t("capture-pane", "-p", "-t", side)
                    and not any(x["cwd"] == proj3 for x in json.load(open(f"{home}/sessions.json"))["sessions"])))
         n_args = len(args().splitlines())
+        side_tabs = lambda: collections.Counter(l for l in t("list-panes", "-a", "-F", "#{@zidev_side} #{@zidev_project}")
+                                                .splitlines() if l.startswith(("term ", "git ")))
+        tabs_before = side_tabs()
         t("kill-server")
         start = lambda: subprocess.Popen([sys.executable, SELF, "start"], env=env, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL)
@@ -4386,9 +4389,7 @@ def cmd_selftest():
         check("restore after kill: window back", wait(lambda: zid in wins()))
         wid = wins().get(zid, "")
         check("restore: terminal tab back, parked", wait(lambda: pane_of("term") and main() == "claude"))
-        check("two zidevs starting at once restore each tab once", not any(
-            n > 1 for n in collections.Counter(l for l in t("list-panes", "-a", "-F", "#{@zidev_side} #{@zidev_project}")
-                                   .splitlines() if l.startswith(("term ", "git "))).values()))
+        check("two zidevs starting at once restore each tab once", wait(lambda: side_tabs() == tabs_before))
         check("restore restarts claude on its claude id",
               wait(lambda: len(args().splitlines()) == n_args + 1 and status(zid)["claude_id"] in args().splitlines()[-1]))
         proj2 = f"{root}/proj2"

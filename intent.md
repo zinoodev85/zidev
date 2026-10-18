@@ -60,4 +60,5 @@ Decisions on how zidev should be. Only these.
 - A short tone plays each time a session stops working.
 - zidev is process-light: nothing polls git; the sidebar waits for file and tmux events.
 - A click on a sidebar row opens it and the focus stays in the sidebar: its keys (t, g, …) work next; ⏎ moves the focus to what it opened.
-- A global hotkey shows / hides the zidev app (config "hotkey", default alt-space); Window > Float on Top keeps it above other apps.
+- A global hotkey shows / hides the zidev app (config "hotkey", default cmd-cmd: cmd pressed twice; or a combo like "alt-space"); Window > Float on Top keeps it above other apps.
+- `t` in the sidebar opens a new terminal tab each time.
