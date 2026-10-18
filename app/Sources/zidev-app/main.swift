@@ -196,10 +196,13 @@ final class ZidevView: LocalProcessTerminalView {
         guard e.modifierFlags.contains(.command), e.window === window else { return false }
         let p = convert(e.locationInWindow, from: nil)
         guard bounds.contains(p) else { return false }
-        // the cell size as SwiftTerm measures it
-        let w = font.advancement(forGlyph: font.glyph(withName: "W")).width
-        let h = ceil(font.ascender - font.descender + font.leading)
-        let col = Int(p.x / w) + 1, row = Int((bounds.height - p.y) / h) + 1
+        // the cell size as SwiftTerm measures it (computeFontDimensions), snapped to the pixel grid
+        let scale = window?.backingScaleFactor ?? 2
+        let w = (font.advancement(forGlyph: font.glyph(withName: "W")).width * scale).rounded() / scale
+        let h = ceil(ceil((font.ascender - font.descender + font.leading) * lineSpacing) * scale) / scale
+        // the view is flipped: y grows downward from the first row
+        let y = isFlipped ? p.y : bounds.height - p.y
+        let col = Int(p.x / w) + 1, row = Int(y / h) + 1
         send(txt: "\u{1b}[<24;\(col);\(row)" + (e.type == .leftMouseDown ? "M" : "m"))
         return true
     }
