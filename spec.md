@@ -25,6 +25,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | C2 | cmd-click on the number an item line starts with (`42.`, `– 10a:`) adds just the number. | app (number) · hand (10a) |
 | C3 | cmd-click on a shorthand in text (`3y`, `461k`, `k 4`, `k 1 2 3`) adds it, not sent. | app |
 | C4 | cmd-click on a `! command` types it into Claude and runs it. | app |
+| C4b | A `! command` whose last word moved to the next row whole (a long hash) is all of it, clicked on either row. | app |
 | C5 | Clicks hit the row under the mouse, also with blank rows on top or the pane scrolled back. | app (blank top row) |
 | C6 | A click on a commit hash (`50ca04b`) in any tab shows that commit in the floating preview; found in the pane's repo, any project, or a repo next to one. | hand |
 

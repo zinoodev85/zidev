@@ -2313,10 +2313,13 @@ def bang_from(rows, y, x, width):
             return None
     text, end, last = run[2], run[1], y
     for nxt in rows[y + 1:y + 5]:  # wrapped: the same color goes on after the indent
-        if end < len(plain.rstrip()) or (width and end < width - 20):
+        if end < len(plain.rstrip()):
             break
         lead = next((r for r in color_runs(nxt) if r[2].strip()), None)
         if not lead or fg_of(lead[3]) != fg_of(run[3]) or lead[0] > 8 or lead[2].lstrip().startswith("!"):
+            break
+        word = lead[2].split()[0]  # wrapped: its first word did not fit after the row's end (a long hash
+        if width and end + 1 + len(word) <= width:  # moves down whole, leaving the row short)
             break
         full = width and end >= width - 2  # cut mid-word at the edge, not at a space
         text = text.rstrip() + ("" if full else " ") + lead[2].strip()
@@ -3825,6 +3828,12 @@ def cmd_apptest():
         tmux("send-keys", "-t", pane, "C-u")
         probe((left + 6, 4))
         check("cmd-click on a `! command`: typed and run", wait_for(lambda: "!echo apptest-ran" in " ".join(typed()), 3))
+        long = "a" * (int(tmux("display", "-p", "-t", pane, "#{pane_width}")) - 4)  # too long for the first row
+        tmux("respawn-pane", "-k", "-t", pane, f"sh -c 'printf \"\\n  ! echo apptest-wrap\\n  {long}\\n\"; exec cat'")
+        time.sleep(0.5)
+        probe((left + 6, 1))
+        check("cmd-click on a `! command` whose last word wrapped to the next row: all of it",
+              wait_for(lambda: f"!echo apptest-wrap {long}" in "".join(screen(pane)[3:]), 3))
     finally:
         tmux("select-window", "-t", back)
         tmux("kill-window", "-t", wid)
