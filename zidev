@@ -103,6 +103,7 @@ def load_state():
     d.setdefault("sessions", [])
     d.setdefault("collapsed", [])
     d.setdefault("changes_open", [])  # projects whose changed files show under the changes tab
+    d.setdefault("commits_open", [])  # projects whose last commits show under the commits row
     for s in d["sessions"]:  # the files pane became the commands bar
         if "files" in s:
             s["cmds"] = s.pop("files")
@@ -1108,6 +1109,7 @@ def remove_project(cwd):
         for key in ("project_tabs", "names"):
             d.get(key, {}).pop(cwd, None)
         d["changes_open"] = [c for c in d.get("changes_open", []) if c != cwd]
+        d["commits_open"] = [c for c in d.get("commits_open", []) if c != cwd]
     for zid in zids:
         for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
             with contextlib.suppress(OSError):
@@ -1356,6 +1358,7 @@ def changes(path=None):
 CHANGES_DIR = f"{HOME}/changes"
 CHANGES_MIN_S = 5
 CHANGES_POLL_S = 60  # without FSEvents
+CHANGES_SHOWN = 10   # changed files listed under the changes tab, the last changed first (its count is all of them)
 _changed = {}     # repository top -> (when its git status started, its files)
 _changed_at = {}  # repository top -> when a file in it last changed (seen by this process)
 _streams = {}     # repository top -> its FSEvents stream and callback (kept alive), or None
@@ -1460,12 +1463,22 @@ def changed_files(cwd, run=True):
             fcntl.flock(lock, fcntl.LOCK_EX)
             shared = read_json(path, {})
             if stale(shared):
-                shared = {"at": time.time(), "files": git_changes(top), "commits": git_commits(top)}
+                shared = {"at": time.time(), "files": newest_first(top, git_changes(top)), "commits": git_commits(top)}
                 write_json(path, shared)
     if "files" not in shared:
         return hit[1] if hit else []
     _changed[top] = (shared["at"], [tuple(f) for f in shared["files"]], [tuple(c) for c in shared.get("commits", [])])
     return _changed[top][1]
+
+
+def newest_first(top, files):
+    """The last changed first: the sidebar lists CHANGES_SHOWN of them."""
+    def changed_at(f):
+        try:
+            return os.lstat(os.path.join(top, f[1])).st_mtime
+        except OSError:  # deleted
+            return 0
+    return sorted(files, key=changed_at, reverse=True)
 
 
 COMMITS_SHOWN = 5
@@ -2885,7 +2898,9 @@ class Sidebar:
                     if t["kind"] == "git":  # its changed files under it, when unfolded
                         self.changes[cwd] = changed_files(cwd, run=self.visible)
                         if cwd in self.data["changes_open"]:
-                            self.items += [("change", (t, st, path)) for st, path in self.changes[cwd]]
+                            self.items += [("change", (t, st, path)) for st, path in self.changes[cwd][:CHANGES_SHOWN]]
+                        self.items.append(("commits", t))  # its own row under the changes, folds the same way
+                        if cwd in self.data["commits_open"]:
                             self.items += [("commit", (t, sha, subject)) for sha, subject in recent_commits(cwd)]
         self.waits = {t["pane"] for t in self.tabs if self.term_waits(t)}
         self.select(key)
@@ -2943,7 +2958,7 @@ class Sidebar:
 
     @staticmethod
     def project_of(kind, v):
-        return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"],
+        return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"], "commits": lambda: v["project"],
                 "change": lambda: v[0]["project"], "commit": lambda: v[0]["project"]}[kind]()
 
     def here(self, cwd):
@@ -3048,6 +3063,8 @@ class Sidebar:
                 self.draw_tab(y, w, v, base)
             elif kind == "change":
                 self.draw_change(y, w, v, base)
+            elif kind == "commits":
+                self.draw_commits(y, w, v, base)
             elif kind == "commit":
                 self.draw_commit(y, w, v, base)
             elif kind == "pick":
@@ -3159,12 +3176,20 @@ class Sidebar:
         self.put(y, tx, st, base | curses.color_pair(self.CHANGE_COLORS.get(st, 3)))
         self.put(y, tx + 2, name, base | (curses.A_BOLD if shown else curses.A_DIM))
 
+    def draw_commits(self, y, w, t, base):
+        """The commits row under the changes tab: folds open on the last commits."""
+        gx, tx = (1, 3) if w < 20 else (3, 5)
+        shown = t["visible"] and t["file"].startswith("commit:")
+        self.put(y, gx, "◦", base | curses.A_DIM)
+        self.put(y, tx, "commits"[: w - tx - 1], base | (curses.A_BOLD if shown else curses.A_DIM))
+        self.put(y, w - 3, "▾" if t["project"] in self.data["commits_open"] else "▸", base | curses.A_DIM)
+
     def draw_commit(self, y, w, commit, base):
-        """One of the last commits, under the changed files; bright while the changes tab shows it."""
+        """One of the last commits, under the commits row; bright while the changes tab shows it."""
         t, sha, subject = commit
         tx = 5 if w < 20 else 7
         shown = t["visible"] and t["file"] == f"commit:{sha}"
-        self.put(y, tx, "◦", base | curses.A_DIM)
+        self.put(y, tx, "·", base | curses.A_DIM)
         self.put(y, tx + 2, f"{sha} {subject}"[: max(0, w - tx - 3)], base | (curses.A_BOLD if shown else curses.A_DIM))
 
     # input
@@ -3251,6 +3276,8 @@ class Sidebar:
                 claude = claude_tab(v["id"])
                 if claude:
                     select_tab(claude["pane"])
+        elif kind == "commits":  # ⏎ or a click folds it
+            self.fold_changes(v["project"], "commits_open")
         elif kind in ("tab", "change", "commit"):  # in this window when it is the project's
             t = v[0] if kind in ("change", "commit") else v
             s = self.here(t["project"])
@@ -3282,12 +3309,13 @@ class Sidebar:
             elif now and not want:
                 d["collapsed"].remove(cwd)
 
-    def fold_changes(self, cwd):
+    def fold_changes(self, cwd, key="changes_open"):
+        """Fold / unfold a project's changed files (or, key commits_open, its last commits)."""
         with edit_state() as d:
-            if cwd in d["changes_open"]:
-                d["changes_open"].remove(cwd)
+            if cwd in d[key]:
+                d[key].remove(cwd)
             else:
-                d["changes_open"].append(cwd)
+                d[key].append(cwd)
 
     def side(self, s, kind):
         """Show the project's terminal / commands / git tab in the session's window, a new one if none."""
@@ -3380,6 +3408,8 @@ class Sidebar:
             self.fold(v, None if ch == ord(" ") else False)
         elif ch == ord(" ") and kind == "tab" and v["kind"] == "git":
             self.fold_changes(v["project"])
+        elif ch == ord(" ") and kind == "commits":
+            self.fold_changes(v["project"], "commits_open")
         elif ch in (10, 13, curses.KEY_ENTER, ord("l"), curses.KEY_RIGHT, ord(" ")) and kind:
             self.open((kind, v))
         elif ch in (ord("h"), curses.KEY_LEFT) and kind:
