@@ -194,16 +194,13 @@ final class ZidevView: LocalProcessTerminalView {
     /// runs a `! command` there; SwiftTerm would open a link itself
     func cmdClick(_ e: NSEvent) -> Bool {
         guard e.modifierFlags.contains(.command), e.window === window else { return false }
-        let p = convert(e.locationInWindow, from: nil)
-        guard bounds.contains(p) else { return false }
-        // the cell size as SwiftTerm measures it (computeFontDimensions), snapped to the pixel grid
-        let scale = window?.backingScaleFactor ?? 2
-        let w = (font.advancement(forGlyph: font.glyph(withName: "W")).width * scale).rounded() / scale
-        let h = ceil(ceil((font.ascender - font.descender + font.leading) * lineSpacing) * scale) / scale
-        // the view is flipped: y grows downward from the first row
-        let y = isFlipped ? p.y : bounds.height - p.y
-        let col = Int(p.x / w) + 1, row = Int(y / h) + 1
-        send(txt: "\u{1b}[<24;\(col);\(row)" + (e.type == .leftMouseDown ? "M" : "m"))
+        guard bounds.contains(convert(e.locationInWindow, from: nil)) else { return false }
+        // SwiftTerm reports it at the cell it hits, as any click (cells counted here hit a row off)
+        guard let ctrlAlt = NSEvent.mouseEvent(with: e.type, location: e.locationInWindow,
+                                               modifierFlags: [.control, .option], timestamp: e.timestamp,
+                                               windowNumber: e.windowNumber, context: nil, eventNumber: e.eventNumber,
+                                               clickCount: e.clickCount, pressure: e.pressure) else { return false }
+        if e.type == .leftMouseDown { mouseDown(with: ctrlAlt) } else { mouseUp(with: ctrlAlt) }
         return true
     }
 
