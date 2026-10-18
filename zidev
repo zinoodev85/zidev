@@ -2451,15 +2451,13 @@ def copy_text(text):
 
 def cmd_bang(pane, x, y, run=""):
     """A double click on a `! command` in Claude: typed into its prompt, not sent (⏎ is yours).
-    cmd-click (the zidev app, `run`): typed and sent; on a reply shorthand ("k 461") it sends that. Exit 1 when there is none: the double click
+    cmd-click (the zidev app, `run`): typed and sent; a reply shorthand ("3y") is added to the prompt, not sent. Exit 1 when there is none: the double click
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(screen(pane), int(y), int(x))
-        if short:  # cmd-click on "k 461": sent to Claude as your reply
-            tmux("send-keys", "-t", pane, "-l", short)
-            time.sleep(0.1)
-            tmux("send-keys", "-t", pane, "Enter")
+        if short:  # cmd-click on "3y": added to the prompt; click several, ⏎ sends them together
+            tmux("send-keys", "-t", pane, "-l", short + " ")
             return
     if not hit or hit[1] != "bang":
         if run:  # cmd-click on anything else: a plain click (an exit 1 would show tmux's "returned 1")
