@@ -168,6 +168,42 @@ struct Theme {
 
 final class ZidevView: LocalProcessTerminalView {
     var keys: [String: String] = [:]
+    /// the emulator, kept from the first reply it sends (SwiftTerm hands it out nowhere else)
+    nonisolated(unsafe) var emulator: Terminal?
+
+    nonisolated override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        emulator = source
+        super.send(source: source, data: data)
+    }
+
+    /// `notifyutil -p zidev.probe`: the rows as this view has them -> ~/.zidev/probe-screen.txt; with
+    /// ~/.zidev/probe-click ("col row", 0-based) a cmd-click on that cell first, as a hand would make it
+    func probe() {
+        let dir = NSHomeDirectory() + "/.zidev/"
+        if let spec = try? String(contentsOfFile: dir + "probe-click", encoding: .utf8) {
+            try? FileManager.default.removeItem(atPath: dir + "probe-click")
+            let n = spec.split(separator: " ").compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if n.count == 2, let win = window {
+                let scale = win.backingScaleFactor
+                let w = (font.advancement(forGlyph: font.glyph(withName: "W")).width * scale).rounded() / scale
+                let h = ceil(ceil((font.ascender - font.descender + font.leading) * lineSpacing) * scale) / scale
+                let p = convert(NSPoint(x: (CGFloat(n[0]) + 0.5) * w, y: bounds.height - (CGFloat(n[1]) + 0.5) * h), to: nil)
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: .command, timestamp: 0,
+                                                  windowNumber: win.windowNumber, context: nil, eventNumber: 0,
+                                                  clickCount: 1, pressure: 1) {
+                        _ = cmdClick(e)
+                    }
+                }
+            }
+        }
+        guard let t = emulator else { return }
+        var out = "rows \(t.rows) yDisp \(t.buffer.yDisp)\n"
+        for r in 0..<t.rows {
+            out += String(format: "%2d ", r) + (t.getLine(row: r)?.translateToString(trimRight: true) ?? "-") + "\n"
+        }
+        try? out.write(toFile: dir + "probe-screen.txt", atomically: true, encoding: .utf8)
+    }
 
     /// cmd-shift-z, alt-left, cmd-/ : the name `zidev keys` uses for this key press
     func name(_ e: NSEvent) -> String? {
@@ -266,6 +302,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
             registerAnyHotkey(key) { [weak self] in self?.toggleShown() }
         }
         setFloating(UserDefaults.standard.bool(forKey: "floatOnTop"))
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, { _, _, _, _, _ in
+            DispatchQueue.main.async { (NSApp.delegate as? App)?.term.probe() }
+        }, "zidev.probe" as CFString, nil, .deliverImmediately)
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global().async {
             let keys = loadKeys()
