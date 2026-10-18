@@ -2473,6 +2473,8 @@ def cmd_bang(pane, x, y, run=""):
     hit = clicked_path(pane, x, y)
     if run:
         tmux("select-pane", "-t", pane)
+        log(f"cmd-click {pane} {x},{y} -> {hit}\n" + "\n".join(f"   {i}{'>' if i == int(y) else ' '} {rows[i][:70]}"
+                                                       for i in range(max(0, int(y) - 3), min(len(rows), int(y) + 2))))
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(rows, int(y), int(x))
         if short:  # cmd-click on "3y": added to the prompt; click several, ⏎ sends them together
@@ -2668,7 +2670,8 @@ def install_tmux_hooks():
     tmux("bind", "-n", "C-M-MouseDown1Pane", "if-shell", "-F", "#{==:#{pane_index},0}",
          "select-pane -t = ; send-keys -M", f"if-shell -F '#{{==:#{{@zidev_side}},claude}}' "
          f"{{ run-shell -b \"{me} bang {at} run\" }} {{ select-pane -t = ; run-shell -b \"{me} click {at}\" }}")
-    tmux("bind", "-n", "C-M-MouseUp1Pane", "select-pane", "-t", "=")  # its release: not for the app
+    # its release: the sidebar's, else no one's (focusing here would race the screen read)
+    tmux("bind", "-n", "C-M-MouseUp1Pane", "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M")
     tmux("bind", "-n", "MouseUp1Pane", "set", "-gF", "@zidev_link", "#{mouse_hyperlink}", "\\;",
          "if-shell", "-F", "#{==:#{pane_index},0}", "send-keys -M",
          f"if-shell \"{ispath}\" \"run-shell -b \\\"{me} click {at}\\\"\" 'send-keys -M'")
