@@ -2328,14 +2328,18 @@ SHORTHAND = re.compile(r"(?<![\w-])(?:[kyxnd](?: \d+)+|\d+[kyxnd?])(?![\w-])")
 
 
 CHOICES = re.compile(r"\s*(?:[-*•⏺]\s+)?(\d+)\.?((?:\s+[yxndk?])+)\s*:")  # 42 y n ? : what item 42 is
+ITEM = re.compile(r"\s*(?:[-*•⏺]\s+)?(\d+)\b")  # 42. an item's number
 
 
 def shorthand_at(rows, y, x):
     """A reply shorthand under (x, y): "k 461", "k 1 2 3", "461k", "3?" (do / drop / explain item n),
-    or one of an item's choices: the y in "42 y n ? : ..." is 42y."""
+    or one of an item's choices: the y in "42 y n ? : ..." is 42y; the number an item starts with is itself."""
     if not 0 <= y < len(rows):
         return None
     plain = ANSI.sub("", rows[y])
+    item = ITEM.match(plain)
+    if item and item.start(1) <= x < item.end(1):
+        return item[1]
     m = CHOICES.match(plain)
     if m:
         letters = m.start(2)
@@ -2465,6 +2469,9 @@ def cmd_bang(pane, x, y, run=""):
     cmd-click (the zidev app, `run`): typed and sent; a reply shorthand ("3y") is added to the prompt, not sent. Exit 1 when there is none: the double click
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
+    if run:  # TEMP: where cmd-clicks land
+        rows = screen(pane)
+        log(f"cmd-click {pane} {x},{y}: {rows[int(y)][:60] if int(y) < len(rows) else '-'!r} -> {hit}")
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
         short = shorthand_at(screen(pane), int(y), int(x))
         if short:  # cmd-click on "3y": added to the prompt; click several, ⏎ sends them together
