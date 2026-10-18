@@ -63,3 +63,5 @@ Decisions on how zidev should be. Only these.
 - A global hotkey shows / hides the zidev app (config "hotkey", default cmd-cmd: cmd pressed twice; or a combo like "alt-space"); Window > Float on Top keeps it above other apps.
 - `t` in the sidebar opens a new terminal tab each time.
 - cmd-click on a reply shorthand in Claude ("k 461", "461k", "3?") sends it as your reply.
+- A click on a commit hash (50ca04b) in any tab shows that commit in the floating preview, found in the pane's repo or any project's.
+- Clicks read the rows shown, also when the pane is scrolled back.

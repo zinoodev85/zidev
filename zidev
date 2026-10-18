@@ -2334,6 +2334,36 @@ def shorthand_at(rows, y, x):
     return next((m[0] for m in SHORTHAND.finditer(ANSI.sub("", rows[y])) if m.start() <= x < m.end()), None)
 
 
+def screen(pane, ansi=False):
+    """The rows a pane shows now: scrolled back (copy mode), the ones scrolled to."""
+    up, height = (tmux("display", "-p", "-t", pane, "#{scroll_position}x#{pane_height}") or "x0").split("x")
+    up = int(up or 0)
+    at = ["-S", str(-up), "-E", str(int(height) - 1 - up)] if up else []
+    return (tmux("capture-pane", "-p", *(["-e"] if ansi else []), *at, "-t", pane) or "").split("\n")
+
+
+def commit_in(sha, repos):
+    """The repo (of the first that has it) where sha names a commit."""
+    for repo in dict.fromkeys(filter(None, repos)):
+        if os.path.isdir(repo) and not subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+                                                      capture_output=True).returncode:
+            return repo
+    return None
+
+
+def show_commit(zid, repo, sha):
+    """A commit in the window's floating preview: its stat and diff (esc closes it)."""
+    wid = session_windows().get(zid)
+    if not wid:
+        return
+    for p in (tmux("list-panes", "-t", wid, "-F", "#{pane_id} #{@zidev_commit}") or "").split("\n"):
+        if p.endswith(" 1"):  # the last one shown goes
+            tmux("kill-pane", "-t", p.split(" ")[0])
+    pane = float_pane(wid, repo, self_cmd("git", repo, f"commit:{sha}"))
+    if pane:
+        tmux("set", "-p", "-t", pane, "@zidev_commit", "1")
+
+
 def clicked_path(pane, x, y, link=""):
     """What a click at (x, y) hits: (zid, path, line) for a file, (zid, None, word) for a path to a file
     that does not exist, (zid, "url", url) for a web link, None for anything else (plain text, the sidebar)."""
@@ -2346,10 +2376,10 @@ def clicked_path(pane, x, y, link=""):
         return None
     s = session_of(zid) or {}
     if tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":  # `! cmd`: into Claude's prompt
-        cmd = bang_at((tmux("capture-pane", "-p", "-e", "-t", pane) or "").split("\n"), int(y), int(x), int(width))
+        cmd = bang_at(screen(pane, ansi=True), int(y), int(x), int(width))
         if cmd:
             return zid, "bang", cmd
-    words = token_at((tmux("capture-pane", "-p", "-t", pane) or "").split("\n"), int(y), int(x), int(width))
+    words = token_at(screen(pane), int(y), int(x), int(width))
     for w in filter(None, [link if link.startswith(("file://", "/", "~")) else "", *words]):
         for base in (cwd, s.get("cwd", cwd)):
             path, line = resolve_path(w, base)
@@ -2360,6 +2390,14 @@ def clicked_path(pane, x, y, link=""):
             full = os.path.normpath(os.path.join(base, os.path.expanduser(w.removeprefix("file://").rstrip(".:,"))))
             if "/" in w and os.path.isdir(full):
                 return zid, full, None
+    for w in (w.strip("`'\".,;:()[]") for w in words[-1:]):  # a commit hash (50ca04b): that commit
+        if re.fullmatch(r"(?=.*\d)(?=.*[a-f])[0-9a-f]{7,40}", w):
+            cwds = [cwd, s.get("cwd"), *(x["cwd"] for x in load_state()["sessions"])]
+            repo = commit_in(w, cwds) or commit_in(w, [  # else a repo next to one (~/dev/zidev by ~/dev/wp)
+                d.path for c in dict.fromkeys(os.path.dirname(c) for c in cwds if c)
+                for d in os.scandir(c) if os.path.isdir(f"{d.path}/.git")])
+            if repo:
+                return zid, "commit", (repo, w)
     for w in words[-1:]:  # only a name: the file shown earlier or in the project with it; several: pick one
         hits, line = files_named(w, s.get("cwd", cwd), tmux("capture-pane", "-p", "-J", "-S", "-3000", "-t", pane) or "")
         if len(hits) == 1:
@@ -2393,6 +2431,8 @@ def cmd_click(pane, x, y):
     elif path == "bang":  # a click copies it; a double click types it into the prompt (bang_prompt)
         copy_text(line)
         tmux("display-message", "-d", "1500", f"copied: {line}")
+    elif path == "commit":
+        show_commit(zid, *line)
     elif path == "url":
         subprocess.Popen([OPENER, line], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elif path:
@@ -2415,7 +2455,7 @@ def cmd_bang(pane, x, y, run=""):
     selects a word as usual, a cmd-click is a plain click."""
     hit = clicked_path(pane, x, y)
     if run and (not hit or hit[1] != "bang") and tmux("display", "-p", "-t", pane, "#{@zidev_side}") == "claude":
-        short = shorthand_at((tmux("capture-pane", "-p", "-t", pane) or "").split("\n"), int(y), int(x))
+        short = shorthand_at(screen(pane), int(y), int(x))
         if short:  # cmd-click on "k 461": sent to Claude as your reply
             tmux("send-keys", "-t", pane, "-l", short)
             time.sleep(0.1)
