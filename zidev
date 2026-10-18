@@ -3507,6 +3507,8 @@ class Sidebar:
                     self.fold_changes(v["project"])
                 else:
                     self.open((kind, v), click=True)
+                    if kind in ("project", "session", "tab", "change", "commit"):  # keys stay the sidebar's (t, g, …)
+                        tmux("select-pane", "-t", f"{SESSION}:.0")
             else:
                 key = next((k for fy, x0, x1, k in self.footer if fy == y and x0 <= x < x1), None)
                 if key is not None:

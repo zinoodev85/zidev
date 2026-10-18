@@ -59,3 +59,5 @@ Decisions on how zidev should be. Only these.
 - The changes tab lists at most the 10 last changed files (newest first); its count is all of them.
 - A short tone plays each time a session stops working.
 - zidev is process-light: nothing polls git; the sidebar waits for file and tmux events.
+- A click on a sidebar row opens it and the focus stays in the sidebar: its keys (t, g, …) work next; ⏎ moves the focus to what it opened.
+- A global hotkey shows / hides the zidev app (config "hotkey", default alt-space); Window > Float on Top keeps it above other apps.

@@ -1,10 +1,69 @@
 // zidev.app: a window of its own for zidev (a terminal running `zidev`), with its own Dock icon.
 // The cmd / alt keys zidev knows (`zidev keys`) go straight to it; the rest stay the app's (cmd-q, cmd-v).
 // cmd-click on a `! command` Claude suggests runs it.
+// A global hotkey (config "hotkey" in ~/.zidev/config.json, default alt-space) shows and hides the window;
+// Window > Float on Top keeps it above other apps.
 import AppKit
+import Carbon.HIToolbox
 import SwiftTerm
 
 let shell = "/bin/zsh"
+let defaultHotkey = "alt-space"
+
+/// key codes of the physical keys (US positions: on a German keyboard "z" is the key marked Y)
+let keyCodes: [String: Int] = [
+    "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,
+    "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J, "k": kVK_ANSI_K, "l": kVK_ANSI_L,
+    "m": kVK_ANSI_M, "n": kVK_ANSI_N, "o": kVK_ANSI_O, "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R,
+    "s": kVK_ANSI_S, "t": kVK_ANSI_T, "u": kVK_ANSI_U, "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X,
+    "y": kVK_ANSI_Y, "z": kVK_ANSI_Z, "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3,
+    "4": kVK_ANSI_4, "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+    "space": kVK_Space, "return": kVK_Return, "tab": kVK_Tab, "escape": kVK_Escape, "grave": kVK_ANSI_Grave,
+    "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4, "f5": kVK_F5, "f6": kVK_F6, "f7": kVK_F7,
+    "f8": kVK_F8, "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12]
+
+/// "ctrl-alt-z" -> (key code, Carbon modifiers); nil when it names no key
+func parseHotkey(_ s: String) -> (UInt32, UInt32)? {
+    var parts = s.lowercased().split(separator: "-").map(String.init)
+    guard let key = parts.popLast(), let code = keyCodes[key] else { return nil }
+    var mods = 0
+    for m in parts {
+        switch m {
+        case "cmd": mods |= cmdKey
+        case "alt", "opt", "option": mods |= optionKey
+        case "ctrl", "control": mods |= controlKey
+        case "shift": mods |= shiftKey
+        default: return nil
+        }
+    }
+    return (UInt32(code), UInt32(mods))
+}
+
+/// ~/.zidev/config.json "hotkey"; "" or false: none
+func configuredHotkey() -> String? {
+    let path = NSHomeDirectory() + "/.zidev/config.json"
+    guard let data = FileManager.default.contents(atPath: path),
+          let conf = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return defaultHotkey }
+    if let s = conf["hotkey"] as? String { return s.isEmpty ? nil : s }
+    if conf["hotkey"] as? Bool == false { return nil }
+    return defaultHotkey
+}
+
+var hotkeyAction: (() -> Void)?
+var hotkeyRef: EventHotKeyRef?
+
+/// a system-wide hotkey through Carbon (needs no accessibility permission)
+func registerHotkey(_ s: String, _ action: @escaping () -> Void) {
+    guard let (code, mods) = parseHotkey(s) else { return }
+    hotkeyAction = action
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        DispatchQueue.main.async { hotkeyAction?() }
+        return noErr
+    }, 1, &spec, nil, nil)
+    RegisterEventHotKey(code, mods, EventHotKeyID(signature: OSType(0x7a696476), id: 1),  // 'zidv'
+                        GetApplicationEventTarget(), 0, &hotkeyRef)
+}
 
 /// `zidev keys`: key name (cmd-w, alt-left, cmd-shift-z) -> what to send. Asked through a login shell,
 /// so the zidev on your PATH answers (the app starts from Finder without your PATH).
@@ -135,6 +194,10 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
             if self.titleDoubleClick(e) { return nil }
             return self.term.cmdClick(e) ? nil : e
         }
+        if let key = configuredHotkey() {
+            registerHotkey(key) { [weak self] in self?.toggleShown() }
+        }
+        setFloating(UserDefaults.standard.bool(forKey: "floatOnTop"))
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global().async {
             let keys = loadKeys()
@@ -151,6 +214,30 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         term.startProcess(executable: shell, args: ["-lic", run], environment: env.map { "\($0)=\($1)" },
                           execName: "-zsh", currentDirectory: NSHomeDirectory())
     }
+
+    /// the hotkey: zidev in front hides it, else it comes to the front (unminimized)
+    func toggleShown() {
+        if NSApp.isActive && window.isVisible && !window.isMiniaturized {
+            NSApp.hide(nil)
+        } else {
+            NSApp.unhide(nil)
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    var floatItem: NSMenuItem?
+
+    /// Window > Float on Top: above every other app's windows; remembered
+    func setFloating(_ on: Bool) {
+        window.level = on ? .floating : .normal
+        window.collectionBehavior = on ? [.fullScreenAuxiliary, .moveToActiveSpace] : []
+        floatItem?.state = on ? .on : .off
+        UserDefaults.standard.set(on, forKey: "floatOnTop")
+    }
+
+    @objc func toggleFloating(_ sender: Any?) { setFloating(window.level != .floating) }
 
     /// a double click on the title bar fills the screen (and back), whatever System Settings say
     func titleDoubleClick(_ e: NSEvent) -> Bool {
@@ -187,6 +274,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         win.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         let full = win.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         full.keyEquivalentModifierMask = [.command, .control]
+        win.addItem(.separator())
+        floatItem = win.addItem(withTitle: "Float on Top", action: #selector(toggleFloating(_:)), keyEquivalent: "")
+        floatItem?.target = self
         for (title, sub) in [("zidev", app), ("Edit", edit), ("Window", win)] {
             let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.submenu = sub
