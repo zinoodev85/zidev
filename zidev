@@ -3594,9 +3594,15 @@ class Sidebar:
                 elif kind == "tab" and v["kind"] == "git" and x >= w - 3:
                     self.fold_changes(v["project"])
                 else:
+                    shown = lambda: tmux("display", "-p", "-t", f"{SESSION}:.1", "#{window_id} #{pane_id}")
+                    before = shown()
                     self.open((kind, v), click=True)
-                    if kind in ("project", "session", "tab", "change", "commit"):  # keys stay the sidebar's (t, g, …)
+                    # what it opens takes the keys (type into the session at once); a click on what is shown
+                    # already, or on a changed file / commit (its diff beside), leaves them here (t, g, …)
+                    if kind in ("change", "commit") or shown() == before:
                         tmux("select-pane", "-t", f"{SESSION}:.0")
+                    elif kind in ("project", "session", "tab"):
+                        tmux("select-pane", "-t", f"{SESSION}:.1")
             else:
                 key = next((k for fy, x0, x1, k in self.footer if fy == y and x0 <= x < x1), None)
                 if key is not None:
@@ -4481,6 +4487,10 @@ def cmd_selftest():
         mouse_click(side2, 6, prow())
         check("click on a project: its first session, the project stays unfolded",
               wait(lambda: active() == wid) and "▾ proj" in t("capture-pane", "-p", "-t", side))
+        focused = lambda: t("display", "-p", "#{pane_index}")
+        check("a click on a session row: typing goes there", wait(lambda: focused() == "1"))
+        mouse_click(side, 6, next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l))
+        check("a click on it again: the sidebar has the keys", wait(lambda: focused() == "0"))
         t("select-window", "-t", wid2)
         time.sleep(1)
         mouse_click(side2, 1, prow())
