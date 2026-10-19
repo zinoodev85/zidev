@@ -14,7 +14,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | S2 | Under a project's changes tab: a "changes" row with its changed files, at most the 10 newest by mtime. | self: "its changed files are folded" |
 | S3 | A separate "commits" row under it; ⏎ / click folds it open: the last 5 commits (`sha subject`). | self: "⏎ on commits: the last commits under it" |
 | S4 | Click or ⏎ on a commit row: the changes tab shows `git show --stat -p` of it. | self: "a click on a commit", "⏎ on a commit too" |
-| S5 | A click on a session / project / tab row shows it and gives it the keyboard (type at once). A click on what is shown already, or on a changed file / commit, leaves the keyboard in the sidebar (t, g, c work). | self: "a click on a session row: typing goes there", "a click on it again: the sidebar has the keys" |
+| S5 | A click on a session / project / tab row shows it and gives it the keyboard (type at once). A click on what is shown already, or on a changed file / commit, leaves the keyboard in the sidebar (t, g, c work). | self + app: "a click on a session row: typing goes there" (app: real clicks in zidev.app), "a click on it again: the sidebar has the keys" |
 | S6 | cmd-click in the sidebar is a plain click. | hand |
 
 ## Clicks in Claude (zidev.app cmd-click)

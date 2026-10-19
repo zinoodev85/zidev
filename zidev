@@ -3791,10 +3791,10 @@ def cmd_apptest():
         if not good:
             failed.append(name)
 
-    def probe(click=None, keys=None):
+    def probe(click=None, keys=None, plain=False):
         if click:
             with open(f"{HOME}/probe-click", "w") as f:
-                f.write(f"{click[0]} {click[1]}")
+                f.write(f"{click[0]} {click[1]}{' plain' if plain else ''}")
         if keys:
             with open(f"{HOME}/probe-keys", "w") as f:
                 f.write(keys)
@@ -3853,6 +3853,20 @@ def cmd_apptest():
     finally:
         tmux("select-window", "-t", back)
         tmux("kill-window", "-t", wid)
+    at = lambda: tmux("display", "-p", "-c", client, "#{window_id} #{pane_index} #{pane_id}").split(" ")
+    start, wins = at(), session_windows()
+    rows = screen(f"{start[0]}.0")
+    title = lambda z: (session_of(z).get("title") or "")[:20]
+    other = next((z for z, w in wins.items() if w != start[0] and title(z) and any(title(z) in l for l in rows)), None)
+    if other:  # a plain click on another session's row in the sidebar (one that shows), twice
+        row = lambda: next((i for i, l in enumerate(screen(f"{at()[0]}.0")) if title(other) in l), None)
+        probe((8, row()), plain=True)
+        now = at()
+        check("a click on a session row: it shows, typing goes there", now[0] == wins[other] and now[1] == "1")
+        probe((8, row()), plain=True)
+        check("a click on it again: the sidebar has the keys", at()[1] == "0")
+        tmux("select-window", "-t", start[0])
+        tmux("select-pane", "-t", start[2])
     probe(keys="cmd none cmd none")
     check("cmd-cmd hides zidev when it is in front", "shown false" in probe())
     probe(keys="cmd none cmd none")

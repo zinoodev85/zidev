@@ -197,16 +197,17 @@ final class ZidevView: LocalProcessTerminalView {
         if let spec = try? String(contentsOfFile: dir + "probe-click", encoding: .utf8) {
             try? FileManager.default.removeItem(atPath: dir + "probe-click")
             let n = spec.split(separator: " ").compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            let plain = spec.contains("plain")  // "col row plain": a plain click, no cmd
             if n.count == 2, let win = window {
                 let scale = win.backingScaleFactor
                 let w = (font.advancement(forGlyph: font.glyph(withName: "W")).width * scale).rounded() / scale
                 let h = ceil(ceil((font.ascender - font.descender + font.leading) * lineSpacing) * scale) / scale
                 let p = convert(NSPoint(x: (CGFloat(n[0]) + 0.5) * w, y: bounds.height - (CGFloat(n[1]) + 0.5) * h), to: nil)
                 for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-                    if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: .command, timestamp: 0,
-                                                  windowNumber: win.windowNumber, context: nil, eventNumber: 0,
-                                                  clickCount: 1, pressure: 1) {
-                        _ = cmdClick(e)
+                    if let e = NSEvent.mouseEvent(with: type, location: p, modifierFlags: plain ? [] : .command,
+                                                  timestamp: 0, windowNumber: win.windowNumber, context: nil,
+                                                  eventNumber: 0, clickCount: 1, pressure: 1) {
+                        if plain { type == .leftMouseDown ? mouseDown(with: e) : mouseUp(with: e) } else { _ = cmdClick(e) }
                     }
                 }
             }
