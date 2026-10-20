@@ -212,6 +212,18 @@ final class ZidevView: LocalProcessTerminalView {
                 }
             }
         }
+        if let press = try? String(contentsOfFile: dir + "probe-press", encoding: .utf8) {  // "cmd-k": that key pressed
+            try? FileManager.default.removeItem(atPath: dir + "probe-press")
+            let parts = press.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "-").map(String.init)
+            var flags: NSEvent.ModifierFlags = []
+            for m in parts.dropLast() { flags.insert(["cmd": .command, "alt": .option, "shift": .shift][m] ?? []) }
+            if let c = parts.last, let win = window,
+               let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                                        windowNumber: win.windowNumber, context: nil, characters: c,
+                                        charactersIgnoringModifiers: c, isARepeat: false, keyCode: 0) {
+                _ = zidevKey(e, focused: true)  // as the key monitor sees it, in front or not
+            }
+        }
         if let keys = try? String(contentsOfFile: dir + "probe-keys", encoding: .utf8) {  // "cmd none cmd key none"
             try? FileManager.default.removeItem(atPath: dir + "probe-keys")
             for k in keys.split(whereSeparator: \.isWhitespace) {  // as the event tap sees them; key: a key press
@@ -221,7 +233,7 @@ final class ZidevView: LocalProcessTerminalView {
         let shown = NSApp.isActive && !NSApp.isHidden && window?.isVisible == true
         guard let t = emulator else { return }
         var out = "shown \(shown) floating \(window?.level == .floating) rows \(t.rows) yDisp \(t.buffer.yDisp) inputMonitoring \(CGPreflightListenEventAccess()) " +
-            "tap \(DoubleTap.tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false)\n"
+            "tap \(DoubleTap.tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false) keys \(keys.count)\n"
         for r in 0..<t.rows {
             out += String(format: "%2d ", r) + (t.getLine(row: r)?.translateToString(trimRight: true) ?? "-") + "\n"
         }
@@ -264,8 +276,8 @@ final class ZidevView: LocalProcessTerminalView {
     }
 
     /// a key zidev knows: sent to it, not handled by the terminal or the menu
-    func zidevKey(_ e: NSEvent) -> Bool {
-        guard window?.isKeyWindow == true, window?.firstResponder === self,
+    func zidevKey(_ e: NSEvent, focused: Bool = false) -> Bool {
+        guard focused || (window?.isKeyWindow == true && window?.firstResponder === self),
               let n = name(e), let seq = keys[n] else { return false }
         send(txt: seq)
         return true
@@ -326,10 +338,7 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
             DispatchQueue.main.async { (NSApp.delegate as? App)?.term.probe() }
         }, "zidev.probe" as CFString, nil, .deliverImmediately)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.global().async {
-            let keys = loadKeys()
-            DispatchQueue.main.async { self.term.keys = keys }
-        }
+        reloadKeys(tries: 30)
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
@@ -411,6 +420,24 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         }
         NSApp.mainMenu = main
         NSApp.windowsMenu = win
+    }
+
+    /// `zidev keys`, asked again while it answers nothing (it fails while zidev itself is being changed):
+    /// cmd-k and the other keys do not stay dead until the app restarts
+    func reloadKeys(tries: Int) {
+        DispatchQueue.global().async {
+            let keys = loadKeys()
+            DispatchQueue.main.async {
+                self.term.keys = keys
+                if keys.isEmpty && tries > 1 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.reloadKeys(tries: tries - 1) }
+                }
+            }
+        }
+    }
+
+    func applicationDidBecomeActive(_ n: Notification) {
+        if term?.keys.isEmpty == true { reloadKeys(tries: 1) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { true }
