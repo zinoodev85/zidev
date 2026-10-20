@@ -850,7 +850,7 @@ Sidebar:
 
 Everywhere: cmd-b hide / show sidebar · cmd-↑ / cmd-↓ item above / below · cmd-t terminal next to Claude ·
 cmd-shift-t new terminal tab · cmd-w close tab · esc closes preview, viewer, changes, editor (no q) ·
-cmd-k palette: actions, projects, the project's scripts and files (ctrl-q too).
+cmd-k palette, like WebStorm's Search Everywhere: actions, projects, sessions, the project's scripts and files, text in its files, apps, Google; tabs on top, ⇥ switches (ctrl-q too).
 Preview: esc close, ⏎ keep as tab, e edit, l line numbers. Editor (micro): usual mac keys (cmd-x / c / v / f / a / s / z).
 
 ## CLI
@@ -1747,9 +1747,10 @@ def to_sidebar(wid, key, row):
 
 
 def cmd_palette(pane):
-    """The palette (cmd-k). Empty: what was picked last and most, the common actions, the projects.
-    Typing searches everything (all actions, sessions, tabs, archived, the project's scripts and files).
-    ⏎ does it; `>cmd` runs a shell command in a terminal tab, ctrl-g greps the project's files."""
+    """The palette (cmd-k), like WebStorm's Search Everywhere: tabs on top (⇥ switches), ⏎ does what is picked.
+    All, empty: what was picked last and most, the common actions, the projects; typing searches everything
+    (actions, sessions, tabs, archived, apps, the project's scripts and files), the last row searches Google.
+    Text searches inside the project's files. `>cmd` runs a shell command in a terminal tab, `file:line` opens there."""
     if not pane.startswith("%"):  # from a key binding (tmux does not fill in #{pane_id} there): the client's pane
         pane = tmux("display", "-p", "#{pane_id}") or ""
     os.environ["TMUX_PANE"] = pane  # run_in_term: this window's session
@@ -1759,7 +1760,6 @@ def cmd_palette(pane):
     s = session_of(zid)
     cwd = s.get("cwd") or (d["projects"][0] if d["projects"] else os.path.expanduser("~"))
     have = {"session": bool(s), "project": cwd in d["projects"]}
-    dim = lambda t: f"\033[2m{t}\033[0m"
     acts = {}  # rows by key (palette_key)
     for label, hint, what in PALETTE_ACTIONS:
         row = what.split()[-1] if what.startswith("side") else "session" if what.startswith("tab") else "-"
@@ -1776,23 +1776,28 @@ def cmd_palette(pane):
     found.update({f"archived\t{c}": f"archived\t▸ {project_name(c)}  {dim('archived · ⏎ unarchives')}\t{c}\t"
                   for c in archived()})
     rows = {**acts, **projects, **found}
-    top = palette_used(rows, cwd if s else None)
+    apps = {f"app\t{a}": f"app\t◇ {os.path.basename(a)[:-4]}  {dim('app')}\t{a}\t" for a in mac_apps()}
+    top = palette_used({**rows, **apps}, cwd if s else None)
     empty = [r for _, r in top] + [rows[k] for k in common + list(projects) if k not in dict(top)]
     work = tempfile.mkdtemp(prefix="zidev-palette-")
-    full, typed = f"{work}/full", f"{work}/typed"  # typed: there while the full list is shown
+    full = f"{work}/full"
     with open(f"{work}/empty", "w") as f:
         f.write("\n".join(empty) + "\n")
-    # the full list only once something is typed; back to the short one when the query is empty again
-    swap = (f"if [ -n {{q}} ]; then [ -e {typed} ] || {{ touch {typed}; "
-            f"echo 'reload-sync(while [ ! -e {full} ]; do sleep 0.05; done; cat {full})'; }}; "
-            f"elif [ -e {typed} ]; then rm {typed}; echo 'reload-sync(cat {work}/empty)'; fi")
-    fzf = ["fzf", "--ansi", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--border=none", "--tiebreak=index",
-           "--info=inline-right", "--prompt=❯ ", "--print-query", "--expect=ctrl-g", "--with-shell=sh -c",
-           "--header=type: all actions, sessions, scripts, files  >cmd runs it  ^g grep",
-           "--bind=enter:accept-or-print-query", f"--bind=change:transform:{swap}",
+    with open(f"{work}/tab", "w") as f:
+        f.write("All")
+    folder = cwd if s else ""  # the project's files, scripts and text: only from one of its sessions
+    # fzf does not search: palette-rows gives it the rows for the tab and what is typed, on every key
+    fzf = ["fzf", "--ansi", "--disabled", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--border=none",
+           "--info=inline-right", "--prompt=❯ ", "--with-shell=sh -c", "--header-first", f"--header={palette_header('All')}",
+           f"--bind=change:execute-silent(touch {work}/pending)+first+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}",
+           # ⏎ while the rows for what was typed are still coming: picked once they are there, not the old ones
+           f"--bind=enter:transform:[ -e {work}/pending ] && touch {work}/enter || echo accept",
+           f"--bind=load:transform:rm -f {work}/pending; [ -e {work}/enter ] && echo accept",
+           f"--bind=tab:transform:{self_cmd('palette-tab', work, folder, '1')}",
+           f"--bind=btab:transform:{self_cmd('palette-tab', work, folder, '-1')}",
            "--preview", self_cmd("preview") + " {1} {3} {4}",
-           "--preview-window=right,50%,border-left,<110(down,50%,border-top),hidden",  # files and scripts only
-           "--bind=focus:transform:[ {1} = file ] || [ {1} = run ] && echo show-preview || echo hide-preview",
+           "--preview-window=right,50%,border-left,<110(down,50%,border-top),hidden",  # files, scripts, text only
+           "--bind=focus:transform:[ {1} = file ] || [ {1} = run ] || [ {1} = text ] && echo show-preview || echo hide-preview",
            "--bind=ctrl-d:preview-half-page-down", "--bind=ctrl-u:preview-half-page-up"]
     if os.path.isdir(cwd):
         os.chdir(cwd)
@@ -1800,7 +1805,7 @@ def cmd_palette(pane):
     def full_list():  # while fzf shows the short one: the scripts and files take a moment
         more = []
         try:
-            if s and os.path.isdir(cwd):
+            if folder and os.path.isdir(cwd):
                 lister = ["fd", "--type=f", "--hidden", "--follow", *(f"--exclude={x}" for x in SKIP_DIRS)]
                 files = subprocess.run(lister, capture_output=True, text=True).stdout.splitlines()
                 info = project_info(d, cwd)
@@ -1812,7 +1817,7 @@ def cmd_palette(pane):
         finally:  # the rest comes even when the scripts or files could not be read
             shown = {r for _, r in top}
             with contextlib.suppress(OSError), open(f"{full}.part", "w") as f:
-                f.write("\n".join([r for _, r in top] + [r for r in [*rows.values(), *more] if r not in shown]) + "\n")
+                f.write("\n".join([r for _, r in top] + [r for r in [*rows.values(), *more, *apps.values()] if r not in shown]) + "\n")
             with contextlib.suppress(OSError):
                 os.rename(f"{full}.part", full)
             save_titles()
@@ -1823,24 +1828,99 @@ def cmd_palette(pane):
             out = subprocess.run(fzf, stdin=f, stdout=subprocess.PIPE, text=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    if out.returncode not in (0, 1):  # esc / ctrl-c
-        return
-    lines = out.stdout.split("\n")
-    query, key = lines[0].strip(), lines[1] if len(lines) > 1 else ""
-    picked = lines[2].split("\t") if len(lines) > 2 and lines[2] else None
-    if key == "ctrl-g":
-        path, line = grep(query, None)
-        if path and s:
-            add_recent(cwd, path)
-            show_file(zid, pane, os.path.abspath(path), line)
-    elif query.startswith(">") and not (picked and picked[0] == "act"):
-        if query[1:].strip() and s:
-            cmd = query[1:].strip()
-            palette_note(f"run\t\033[32m▶\033[0m {cmd}\t.\t{cmd}", cwd)
-            run_in_term(cwd, cmd, ".")
-    elif picked:
-        palette_note(lines[2], cwd)
+    picked = out.stdout.rstrip("\n").split("\t") if out.returncode == 0 and out.stdout.strip() else None
+    if picked:
+        if picked[0] not in ("google", "text"):  # a search does not come on top next time
+            palette_note(out.stdout.rstrip("\n"), cwd)
         palette_do(picked[0], picked[2], picked[3] if len(picked) > 3 else "", pane, wid, zid, cwd)
+
+
+PALETTE_TABS = ("All", "Files", "Actions", "Text", "Apps")
+PALETTE_TAB_KINDS = {"Files": ("file",), "Actions": ("act", "run"), "Apps": ("app",)}  # the rows a tab lists
+
+
+def dim(text):
+    return f"\033[2m{text}\033[0m"
+
+
+def palette_header(tab):
+    """The tabs on top of the palette; the one shown in bold and underlined."""
+    tabs = "   ".join(f"\033[1;4m{t}\033[0m" if t == tab else dim(t) for t in PALETTE_TABS)
+    return f"{tabs}      {dim('⇥ switches  >cmd runs it  file:line opens there')}"
+
+
+def cmd_palette_tab(work, folder, step):
+    """⇥ / ⇧⇥ in the palette: the next / previous tab; fzf gets its header and its rows for what is typed."""
+    with open(f"{work}/tab") as f:
+        tab = PALETTE_TABS[(PALETTE_TABS.index(f.read()) + int(step)) % len(PALETTE_TABS)]
+    with open(f"{work}/tab", "w") as f:
+        f.write(tab)
+    open(f"{work}/pending", "w").close()  # ⏎ waits for the new rows
+    print(f"change-header({palette_header(tab)})+first+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}")
+
+
+def cmd_palette_rows(work, folder, query):
+    """The palette's rows for its tab and what is typed, best first (fzf shows them as they are).
+    folder: the project's, or "" when the palette is not in one of its sessions."""
+    with open(f"{work}/tab") as f:
+        tab = f.read()
+    if tab == "Text":
+        rows = text_rows(folder, query)
+    elif tab == "All" and not query:
+        rows = open(f"{work}/empty").read().splitlines()
+    elif query.startswith(">"):  # a shell command: runs in a terminal tab
+        cmd = query[1:].strip()
+        rows = [f"run\t\033[32m▶\033[0m {cmd}\t.\t{cmd}"] if cmd and folder else []
+    else:
+        while not os.path.exists(f"{work}/full"):  # the scripts and files are still being listed
+            time.sleep(0.05)
+        rows = open(f"{work}/full").read().splitlines()
+        at = re.fullmatch(r"(.+):(\d+)", query)
+        if at:  # file:line: the files with that name, opened at the line
+            rows = [r + at[2] for r in fuzzy([r for r in rows if r.startswith("file\t")], at[1])]
+        else:
+            rows = fuzzy([r for r in rows if tab == "All" or r.split("\t")[0] in PALETTE_TAB_KINDS[tab]], query)
+    if query and tab == "All":  # always last: search the web for it
+        rows.append(f"google\t\033[34mG\033[0m Google: {query}\t{query}\t")
+    sys.stdout.write("".join(f"{r}\n" for r in rows))
+
+
+def fuzzy(rows, query):
+    """The palette rows whose shown text matches query, best first: fzf's own search (fzf --filter)."""
+    if not query:
+        return rows
+    shown = [ANSI.sub("", r.split("\t")[1]) for r in rows]  # without colours
+    found = subprocess.run(["fzf", f"--filter={query}", "--delimiter=\t", "--with-nth=2", "--tiebreak=index"],
+                           input="".join(f"{i}\t{x}\n" for i, x in enumerate(shown)), capture_output=True, text=True)
+    return [rows[int(x.split("\t")[0])] for x in found.stdout.splitlines()]
+
+
+def text_rows(folder, query):
+    """The Text tab: the lines in the project's files that have query (ripgrep), at most 500."""
+    if not (folder and query):
+        return []
+    rg = subprocess.Popen(["rg", "--line-number", "--no-heading", "--color=always", "--colors=path:none",
+                           "--colors=line:none", "--field-match-separator=\t", "--smart-case", "--hidden",
+                           "-g", "!.git", "--max-columns=300", "--max-columns-preview", "--", query],
+                          cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                          errors="replace")
+    rows = []
+    for line in rg.stdout:  # path, line number and the line, the match in colour
+        path, n, text = line.rstrip("\n").split("\t", 2)
+        path, n, text = ANSI.sub("", path), ANSI.sub("", n), text.strip().replace("\t", "  ")
+        rows.append(f"text\t{text}  {dim(f'{path}:{n}')}\t{path}\t{n}")
+        if len(rows) == 500:
+            break
+    rg.kill()
+    return rows
+
+
+def mac_apps():
+    """The Mac's apps (.app in the usual folders), by name."""
+    folders = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities",
+               os.path.expanduser("~/Applications")]
+    apps = [f"{d}/{x}" for d in folders if os.path.isdir(d) for x in os.listdir(d) if x.endswith(".app")]
+    return sorted(apps, key=lambda a: os.path.basename(a).lower())
 
 
 PALETTE_COMMON = ("side n project", "side p -", "tab term", "tab git", "side r session", "tab close")
@@ -1898,9 +1978,14 @@ def palette_do(kind, target, extra, pane, wid, zid, cwd):
         unarchive_project(target)
     elif kind == "run":
         run_in_term(cwd, extra, target)
-    elif kind == "file":
+    elif kind in ("file", "text"):  # text: a line found in the file; extra: the line, if one was typed or found
         add_recent(cwd, target)
-        show_file(zid, pane, os.path.abspath(target))
+        show_file(zid, pane, os.path.abspath(target), extra or None)
+    elif kind == "app":
+        open_default(target)
+    elif kind == "google":
+        import urllib.parse
+        open_default("https://www.google.com/search?q=" + urllib.parse.quote_plus(target))
 
 
 def package_manager(d):
@@ -2821,22 +2906,6 @@ def install_tmux_hooks():
     tmux("set", "-g", "status", "off")  # no tab bar: tabs are listed in the sidebar
 
 
-def grep(query, env):
-    """Search file contents (ripgrep, live); (path, line) of the picked match, or (None, None)."""
-    rg = ("[ -n {q} ] && rg --line-number --no-heading --color=always --smart-case --hidden "
-          "-g '!.git' -- {q} || true")
-    r = subprocess.run(
-        ["fzf", "--disabled", "--ansi", "--layout=reverse", "--border=none", "--info=inline-right",
-         "--prompt=grep ❯ ", f"--query={query}", "--delimiter=:", "--header=⏎ edit at line  esc back",
-         f"--bind=start:reload:{rg}", f"--bind=change:reload:sleep 0.1; {rg}",
-         "--preview=bat --color=always --style=plain --highlight-line {2} {1}",
-         "--preview-window=down,65%,border-top,+{2}-/2"],
-        stdout=subprocess.PIPE, text=True, env=env)
-    path, _, rest = r.stdout.strip().partition(":")
-    line = rest.partition(":")[0]
-    return (path, line) if r.returncode == 0 and line.isdigit() else (None, None)
-
-
 def session_of(zid):
     return next((s for s in load_state()["sessions"] if s["id"] == zid), {})
 
@@ -2861,12 +2930,17 @@ def add_recent(cwd, path):
     remember(cwd, "recent", path, 10)
 
 
-def cmd_preview(kind, target, cmd=""):
+def cmd_preview(kind, target, extra=""):
+    """The palette's preview. extra: a script's command, or the line of a file (from Text or file:line)."""
     width = os.environ.get("FZF_PREVIEW_COLUMNS", "80")
     if kind == "run":
-        print(f"\033[1m$ {cmd}\033[0m\n\033[2min {os.path.abspath(target)}\033[0m\n\n⏎ runs it in the terminal pane")
+        print(f"\033[1m$ {extra}\033[0m\n\033[2min {os.path.abspath(target)}\033[0m\n\n⏎ runs it in the terminal pane")
     elif not os.path.isfile(target):
         print("\033[2mnew file\033[0m")
+    elif extra:  # at the line: from a little above it, the line marked
+        start = max(1, int(extra) - int(os.environ.get("FZF_PREVIEW_LINES", "30")) // 3)
+        subprocess.call(["bat", "--color=always", "--style=changes", f"--highlight-line={extra}",
+                         f"--line-range={start}:{start + 400}", f"--terminal-width={width}", target])
     elif is_markdown(target):
         subprocess.call(["glow", "-s", THEME["glow"], "-w", width, target])
     else:
@@ -2888,7 +2962,7 @@ def cmd_welcome():
     print("""
   \033[1mzidev\033[0m — Claude Code sessions
 
-  \033[1mcmd-k\033[0m    palette: actions, projects, the project's scripts and files
+  \033[1mcmd-k\033[0m    palette: actions, projects, scripts, files, text, apps, Google
   \033[1m↑ ↓ ⏎\033[0m    move, open
   \033[1m← →\033[0m      fold / unfold
   \033[1mctrl-q\033[0m   palette too (where cmd-k does not reach zidev)
@@ -3311,7 +3385,7 @@ class Sidebar:
             self.put(h - 2, 0, " " * w)
             self.put(h - 2, 1, self.message[: w - 2], curses.color_pair(3))
 
-    HELP = [("cmd-k", "palette: actions, projects, scripts, files"),
+    HELP = [("cmd-k", "palette: actions, files, text, apps, Google; ⇥ tabs"),
             ("↑ / ↓", "move"), ("⏎ / click", "show session (Claude) / tab; a project: its first session"),
             ("→ / ←", "unfold / fold project or changes; ← on a row: up to its project"),
             ("esc", "drop the pick list"), ("right click", "menu: close, rename, …"), ("wheel", "scrolls the list"),
@@ -4253,8 +4327,8 @@ def cmd_selftest():
         check("the empty palette: common actions and projects, no files",
               not any(x in seen()[mark:] for x in ("Restart", "greet")))
         press("-l", "re")
-        check("typing finds scripts and files",
-              wait(lambda: all(x in seen()[mark:] for x in ("Restart", "greet", "README.md"))))
+        check("typing finds scripts and files",  # not "Restart": what is on screen already is not drawn again
+              wait(lambda: all(x in seen()[mark:] for x in ("greet", "README.md"))))
         press("BSpace", "BSpace")  # ctrl-u scrolls the preview here
         terms = kinds().count("term")  # the project's own and the new one
         press("-l", "greet")
@@ -4263,6 +4337,46 @@ def cmd_selftest():
               wait(lambda: main() == "term" and "hi-from-script" in t("capture-pane", "-p", "-t", f"{wid}.1")
                    and "pnpm greet" in t("capture-pane", "-p", "-t", f"{wid}.1"), 20))
         check("the same terminal, not a new one", kinds().count("term") == terms)
+        # the palette's tabs (⇥ / ⇧⇥): Text finds lines in the files, Apps the Mac's apps; Google is the last row
+        floats = lambda: t("list-panes", "-t", wid, "-f", "#{pane_floating_flag}", "-F", "#{pane_id} #{@zidev_label}")
+        floating = lambda: t("capture-pane", "-p", "-t", floats().split()[0]) if floats() else ""
+
+        def opened():  # what was last given to the default app / browser
+            with contextlib.suppress(OSError):
+                return open(f"{root}/opened").read().strip()
+            return ""
+        with open(f"{proj}/notes.txt", "w") as f:
+            f.write("".join(f"line {i}\n" for i in range(1, 80)) + "the needle\n")
+        for keys, typed, find, what in (
+                (["Tab", "Tab", "Tab"], "needle", "notes.txt:80", "⇥ to Text: it finds a line in the files; ⏎ opens it there"),
+                ([], "notes.txt:80", "notes.txt", "file:line: ⏎ opens the file at that line")):
+            mark = len(seen())
+            press("C-q")
+            wait(lambda: "New terminal tab" in seen()[mark:])
+            if keys:
+                press(*keys)
+            press("-l", typed)
+            wait(lambda: find in seen()[mark:])
+            press("Enter")
+            check(what, wait(lambda: "the needle" in floating()))
+            press("Escape")
+            wait(lambda: not floats())
+        os.remove(f"{proj}/notes.txt")
+        mark = len(seen())
+        press("C-q")
+        wait(lambda: "New terminal tab" in seen()[mark:])
+        press("BTab")
+        press("-l", "calcul")
+        check("⇧⇥ to Apps: it finds the Mac's apps", wait(lambda: "Calculator" in seen()[mark:]))
+        press("Enter")
+        check("⏎ opens the app", wait(lambda: opened().endswith("/Calculator.app")))
+        mark = len(seen())
+        press("C-q")
+        wait(lambda: "New terminal tab" in seen()[mark:])
+        press("-l", "what time?")  # the ? matches nothing: Google is the only row
+        check("typing: the last row searches Google", wait(lambda: "Google: what time?" in seen()[mark:]))
+        press("Enter")
+        check("⏎ on it opens the search in the browser", wait(lambda: opened() == "https://www.google.com/search?q=what+time%3F"))
         t("send-keys", "-t", side, "Enter")
         check("⏎ on the session shows Claude", wait(lambda: main() == "claude"))
         t("send-keys", "-t", side, "Down")
@@ -4317,7 +4431,6 @@ def cmd_selftest():
 
         term = pane_of("term")
         z("open", "README.md", extra={"TMUX_PANE": f"{wid}.1"})
-        floats = lambda: t("list-panes", "-t", wid, "-f", "#{pane_floating_flag}", "-F", "#{pane_id} #{@zidev_label}")
         check("zidev open: floating preview", wait(lambda: "README.md" in floats()))
         time.sleep(0.5)
         fl = floats().split()[0]
@@ -4877,6 +4990,10 @@ def main():
         cmd_git(*args[1:3])
     elif cmd == "palette":
         cmd_palette(args[1])
+    elif cmd == "palette-tab":
+        cmd_palette_tab(*args[1:4])
+    elif cmd == "palette-rows":
+        cmd_palette_rows(*args[1:4])
     elif cmd == "view":
         cmd_view(*args[1:3])
     elif cmd == "open":

@@ -24,10 +24,14 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 |---|------|-------|
 | P1 | cmd-k (and ctrl-q, for terminals without zidev's keys) in any zidev pane opens the palette at once (~0.07 s): a popup, type to search, ⏎ picks, esc closes. Session names come from the sidebar's cache (`titles.json`), not from reading whole transcripts; keys start zidev from its kept compiled code (`~/.zidev/pyc`). | self: "ctrl-q opens the palette", "the sidebar keeps Claude's names for the palette" · app: "cmd-k opens the palette", "esc closes it" |
 | P2 | Empty, it shows what was picked in it last (3) and most (3) that fits here, then the common actions (new session, new project, new terminal, changes, rename session, close tab), then the projects; nothing else. | self: "the empty palette: common actions and projects, no files" |
-| P2b | Typing searches everything: all actions (restart Claude, move, close, archive, remove, sidebar, keys), sessions, the project's tabs, archived projects (⏎ unarchives), the project's scripts (⏎ runs in a terminal tab) and files (⏎ previews). | self: "typing finds scripts and files" |
+| P1b | Like WebStorm's Search Everywhere: tabs on top, All · Files · Actions · Text · Apps; ⇥ / ⇧⇥ switches, what is typed stays. No WebStorm shortcuts besides (no ⇧⇧, ⌘⇧O, ⌘⇧A, ⌘⇧F, ⌘E). | self: "⇥ to Text: …", "⇧⇥ to Apps: …" |
+| P2b | Typing in All searches everything: all actions (restart Claude, move, close, archive, remove, sidebar, keys), sessions, the project's tabs, archived projects (⏎ unarchives), the project's scripts (⏎ runs in a terminal tab), its files (⏎ previews) and the Mac's apps (⏎ opens). Files, Actions (with the scripts) and Apps list only theirs, also empty. | self: "typing finds scripts and files", "⇧⇥ to Apps: it finds the Mac's apps", "⏎ opens the app" |
+| P2d | Typing in All: the last row is always "Google: …"; ⏎ on it opens the Google search in the browser. | self: "typing: the last row searches Google", "⏎ on it opens the search in the browser" |
+| P2e | ⏎ right after typing picks from the rows for what was typed (it waits for them), never from the rows shown before. | self: "a script from the palette runs in the terminal tab" |
 | P2c | What was picked comes on top next time (a file or script only in its project). | self: "what was picked is on top next time" |
 | P3 | An action that asks (rename, close, remove) asks in the sidebar, which gets the keys. | self: "palette rename asks in the sidebar" |
-| P4 | `>cmd` + ⏎ runs cmd in a terminal tab; ctrl-g greps the project for the typed text. | self: "palette >cmd runs it" |
+| P4 | `>cmd` + ⏎ runs cmd in a terminal tab. `file:line` + ⏎ opens the file at that line. | self: "palette >cmd runs it", "file:line: ⏎ opens the file at that line" |
+| P4b | The Text tab searches inside the project's files as you type (ripgrep), with a preview at the line; ⏎ opens the file at that line. | self: "⇥ to Text: it finds a line in the files; ⏎ opens it there" |
 | P5 | The right-click menu on a row has that row's actions. | self: "right click on a row: a menu with its actions" |
 
 ## Clicks in Claude (zidev.app cmd-click)
