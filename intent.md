@@ -90,7 +90,7 @@ ZI67 **Real quick.**
 cmd-k opens the palette real quick, no waiting.
 
 ZI68 **Like WebStorm.**
-The palette imitates WebStorm's Search Everywhere: tabs on top (All, Files, Actions, Text, Apps), ⇥ switches. Only cmd-k opens it.
+The palette imitates WebStorm's Search Everywhere: tabs on top (All, Files, Actions, Text, Apps, Clipboard), ⇥ switches. cmd-k opens it in zidev, shift-shift from any app.
 
 ZI69 **Text search inside.**
 The Text tab searches inside the project's files, live, with a preview; ⏎ opens at the line (no ctrl-g).
@@ -103,6 +103,23 @@ The palette searches Google: while typing, the last row is "Google: …".
 
 ZI72 **file:line.**
 Typing file:line opens the file at that line.
+
+ZI73 **Over any app.**
+shift-shift (shift pressed twice) opens only the palette over the app I am in, not the zidev window; that app stays in front. In zidev it opens the cmd-k palette; in WebStorm it stays WebStorm's.
+
+## Clipboard
+
+ZI74 **Clipboard history.**
+zidev keeps my last 50 copies (text, rich text, images, files), readable only by me; what a password manager marks secret is never kept.
+
+ZI75 **Clipboard tab.**
+The palette's Clipboard tab lists them, like WebStorm's Paste from History: searchable, with a preview; ⏎ pastes into the app I was in.
+
+ZI76 **Paste keys.**
+ctrl-cmd-1 … 5 paste the last copies (1 = newest) into any app; ctrl-cmd-0 pastes the clipboard as plain text. Pasting changes neither the clipboard nor the history.
+
+ZI77 **Clipboard on a timer.**
+The clipboard is the only thing zidev checks on a timer, every 0.5 s.
 
 ## Tabs
 
@@ -235,3 +252,6 @@ In the app, cmd-click on a `! command` runs it.
 
 ZI66 **Global hotkey.**
 A global hotkey shows / hides the zidev app (config "hotkey", default cmd-cmd: cmd pressed twice; or a combo like "alt-space"); Window > Float on Top keeps it above other apps.
+
+ZI78 **Starts at login.**
+zidev.app starts at login.

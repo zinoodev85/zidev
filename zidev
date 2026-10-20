@@ -30,6 +30,7 @@ import fcntl
 import glob
 import json
 import os
+import plistlib
 import re
 import resource
 import shlex
@@ -1643,6 +1644,8 @@ def is_binary(path):
 SERVERS = f"{HOME}/servers.json"
 PALETTE_PICK = f"{HOME}/palette-pick.json"  # the row a palette action is for, read by the sidebar
 OPENER = os.environ.get("ZIDEV_OPENER", "open")  # macOS default app / browser; override for tests
+TELL_APP = os.environ.get("ZIDEV_TELL_APP", "notifyutil")  # zidev.app's messages; override for tests
+CLIPS = f"{HOME}/clips"  # zidev.app's clipboard history: index.json (newest first) and one <id>.plist per copy
 
 
 def open_default(target):
@@ -1750,7 +1753,10 @@ def cmd_palette(pane):
     """The palette (cmd-k), like WebStorm's Search Everywhere: tabs on top (⇥ switches), ⏎ does what is picked.
     All, empty: what was picked last and most, the common actions, the projects; typing searches everything
     (actions, sessions, tabs, archived, apps, the project's scripts and files), the last row searches Google.
-    Text searches inside the project's files. `>cmd` runs a shell command in a terminal tab, `file:line` opens there."""
+    Text searches inside the project's files, Clipboard lists the copies zidev.app keeps (⏎ pastes one).
+    `>cmd` runs a shell command in a terminal tab, `file:line` opens there.
+    pane "float": in zidev.app's panel over another app (shift-shift), on zidev's current session."""
+    floating = pane == "float"
     if not pane.startswith("%"):  # from a key binding (tmux does not fill in #{pane_id} there): the client's pane
         pane = tmux("display", "-p", "#{pane_id}") or ""
     os.environ["TMUX_PANE"] = pane  # run_in_term: this window's session
@@ -1797,7 +1803,8 @@ def cmd_palette(pane):
            f"--bind=btab:transform:{self_cmd('palette-tab', work, folder, '-1')}",
            "--preview", self_cmd("preview") + " {1} {3} {4}",
            "--preview-window=right,50%,border-left,<110(down,50%,border-top),hidden",  # files, scripts, text only
-           "--bind=focus:transform:[ {1} = file ] || [ {1} = run ] || [ {1} = text ] && echo show-preview || echo hide-preview",
+           "--bind=focus:transform:[ {1} = file ] || [ {1} = run ] || [ {1} = text ] || [ {1} = clip ] "
+           "&& echo show-preview || echo hide-preview",
            "--bind=ctrl-d:preview-half-page-down", "--bind=ctrl-u:preview-half-page-up"]
     if os.path.isdir(cwd):
         os.chdir(cwd)
@@ -1829,13 +1836,20 @@ def cmd_palette(pane):
     finally:
         shutil.rmtree(work, ignore_errors=True)
     picked = out.stdout.rstrip("\n").split("\t") if out.returncode == 0 and out.stdout.strip() else None
-    if picked:
-        if picked[0] not in ("google", "text"):  # a search does not come on top next time
-            palette_note(out.stdout.rstrip("\n"), cwd)
-        palette_do(picked[0], picked[2], picked[3] if len(picked) > 3 else "", pane, wid, zid, cwd)
+    if not picked:
+        return
+    if picked[0] not in ("google", "text", "clip"):  # a search or a copy does not come on top next time
+        palette_note(out.stdout.rstrip("\n"), cwd)
+    if picked[0] == "clip":  # into the tab beside the sidebar, never into the sidebar
+        here = tmux("display", "-p", "-t", pane, "#{pane_index}")
+        paste_clip(picked[2], None if floating else f"{wid}.1" if here == "0" else pane)
+        return
+    palette_do(picked[0], picked[2], picked[3] if len(picked) > 3 else "", pane, wid, zid, cwd)
+    if floating and picked[0] not in ("app", "google"):  # it is in zidev's window now: that comes to the front
+        tell_app("show")
 
 
-PALETTE_TABS = ("All", "Files", "Actions", "Text", "Apps")
+PALETTE_TABS = ("All", "Files", "Actions", "Text", "Apps", "Clipboard")
 PALETTE_TAB_KINDS = {"Files": ("file",), "Actions": ("act", "run"), "Apps": ("app",)}  # the rows a tab lists
 
 
@@ -1866,6 +1880,8 @@ def cmd_palette_rows(work, folder, query):
         tab = f.read()
     if tab == "Text":
         rows = text_rows(folder, query)
+    elif tab == "Clipboard":
+        rows = fuzzy(clip_rows(), query)
     elif tab == "All" and not query:
         rows = open(f"{work}/empty").read().splitlines()
     elif query.startswith(">"):  # a shell command: runs in a terminal tab
@@ -1913,6 +1929,44 @@ def text_rows(folder, query):
             break
     rg.kill()
     return rows
+
+
+def clip_rows():
+    """The Clipboard tab: the copies zidev.app keeps, newest first, each on one line."""
+    today = time.strftime("%d.%m.")
+    rows = []
+    for c in read_json(f"{CLIPS}/index.json", []):
+        when = time.strftime("%d.%m. %H:%M", time.localtime(c["t"])).removeprefix(today + " ")  # today: the time only
+        line = " ".join(c["text"].split())[:300]
+        rows.append(f"clip\t\033[33m⧉\033[0m {line}  {dim(c['app'] + ' · ' + when)}\t{c['id']}\t")
+    return rows
+
+
+def clip_text(cid):
+    """A copy's plain text; None when it has none (an image)."""
+    with contextlib.suppress(OSError, ValueError, plistlib.InvalidFileException), open(f"{CLIPS}/{cid}.plist", "rb") as f:
+        for kept in plistlib.load(f)[0]:  # its first item: {type, data} for each of its types
+            if kept["type"] == "public.utf8-plain-text":
+                return kept["data"].decode(errors="replace")
+    return None
+
+
+def paste_clip(cid, pane):
+    """⏎ on a copy in the Clipboard tab. In zidev (pane): its text is typed into the pane. Else (an image, or the
+    palette over another app) zidev.app pastes it into the app in front, then puts the clipboard back."""
+    text = clip_text(cid)
+    if pane and text is not None:
+        tmux("set-buffer", "-b", "zidev-clip", "--", text)
+        tmux("paste-buffer", "-p", "-d", "-b", "zidev-clip", "-t", pane)
+        return
+    with open(f"{CLIPS}/paste", "w") as f:
+        f.write(cid)
+    tell_app("paste")
+
+
+def tell_app(what):
+    """A message to zidev.app: "paste" (the copy named in CLIPS/paste), "show" (its window to the front)."""
+    subprocess.call([TELL_APP, "-p", f"zidev.{what}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def mac_apps():
@@ -2933,7 +2987,12 @@ def add_recent(cwd, path):
 def cmd_preview(kind, target, extra=""):
     """The palette's preview. extra: a script's command, or the line of a file (from Text or file:line)."""
     width = os.environ.get("FZF_PREVIEW_COLUMNS", "80")
-    if kind == "run":
+    if kind == "clip":  # a copy: from where and when, then its whole text (an image: its size)
+        c = next((c for c in read_json(f"{CLIPS}/index.json", []) if c["id"] == target), None)
+        if c:
+            print(dim(f"{c['app']} · {time.strftime('%d.%m.%Y %H:%M', time.localtime(c['t']))}") + "\n")
+            print(clip_text(target) or c["text"])
+    elif kind == "run":
         print(f"\033[1m$ {extra}\033[0m\n\033[2min {os.path.abspath(target)}\033[0m\n\n⏎ runs it in the terminal pane")
     elif not os.path.isfile(target):
         print("\033[2mnew file\033[0m")
@@ -3971,6 +4030,31 @@ def edit_state_at(home):
 APPTEST_LINES = ["", "  21 y n ? : an item with choices", "  7. an item without", "  see 3y and k 4 here",
                  "  ! echo apptest-ran", "  8 a b ? : an item with other choices"]
 
+# apptest: a copy marked secret on the clipboard, then the clipboard as it was put back (each item with its types)
+APPTEST_CLIPBOARD = """
+ObjC.import('AppKit')
+const board = $.NSPasteboard.generalPasteboard
+const items = board.pasteboardItems
+const saved = []
+for (let i = 0; i < (items.isNil() ? 0 : items.count); i++) {
+    const item = items.objectAtIndex(i), copy = $.NSPasteboardItem.alloc.init
+    for (let j = 0; j < item.types.count; j++) {
+        const type = item.types.objectAtIndex(j), data = item.dataForType(type)
+        if (!data.isNil()) copy.setDataForType(data, type)
+    }
+    saved.push(copy)
+}
+const secret = $.NSPasteboardItem.alloc.init  // as a password manager copies a password
+secret.setStringForType('zidev-apptest-secret', 'public.utf8-plain-text')
+secret.setStringForType('', 'org.nspasteboard.ConcealedType')
+board.clearContents
+board.writeObjects($([secret]))
+delay(1.2)
+board.clearContents
+if (saved.length) board.writeObjects($(saved))
+delay(1.2)
+"""
+
 
 def cmd_apptest():
     """spec.md, the app rows: drives the running zidev.app through its probe (notifyutil -p zidev.probe) on a
@@ -4080,6 +4164,34 @@ def cmd_apptest():
     check("two cmd taps far apart: nothing", "shown true" in probe())
     probe(keys="cmd key none cmd none")
     check("cmd-c then cmd: nothing", "shown true" in probe())
+    # the clipboard: a copy marked secret is not kept; the clipboard put back is, readable only by me
+    start = time.time()
+    subprocess.run(["osascript", "-l", "JavaScript", "-e", APPTEST_CLIPBOARD], capture_output=True)
+    copies = read_json(f"{CLIPS}/index.json", [])
+    check("a copy a password manager marks secret is not kept", not any("zidev-apptest-secret" in c["text"] for c in copies))
+    if copies and copies[0]["t"] >= start:
+        mode = lambda path: os.stat(path).st_mode & 0o777
+        check("the clipboard put back is kept, on top, readable only by me", mode(CLIPS) == 0o700
+              and mode(f"{CLIPS}/index.json") == 0o600 and mode(f"{CLIPS}/{copies[0]['id']}.plist") == 0o600)
+    else:
+        print("  -   a copy is kept: not checked (the clipboard was empty or secret)")
+    # shift-shift: in zidev the cmd-k palette; over another app only the palette, in a panel, that app stays in front
+    probe(keys="shift none shift none")
+    check("shift-shift in zidev: the cmd-k palette", wait_for(palette, 3))
+    tmux("send-keys", "-K", "-c", client, "Escape")
+    wait_for(lambda: not palette(), 3)
+    subprocess.run(["osascript", "-e", 'tell application "Finder" to activate'])
+    time.sleep(0.5)
+    probe(keys="shift none shift none")
+
+    def over():  # the panel shows the palette, Finder is still in front
+        seen = probe()
+        return "panel true" in seen and "front com.apple.finder" in seen and "Clipboard" in seen
+    check("shift-shift over another app: the palette in a panel, that app stays in front", wait_for(over, 3))
+    with open(f"{HOME}/probe-type", "w") as f:
+        f.write("\x1b")
+    check("esc closes the panel", wait_for(lambda: "panel false" in probe(), 3))
+    subprocess.run(["osascript", "-e", 'tell application "zidev" to activate'])
     print(f"\n{len(failed)} failed" if failed else "\nall ok")
     sys.exit(1 if failed else 0)
 
@@ -4117,6 +4229,17 @@ def cmd_selftest():
     with open(browser, "w") as f:
         f.write(f"#!/bin/sh\necho \"$1\" > {root}/opened\n")
     os.chmod(browser, 0o755)
+    with open(f"{root}/tell", "w") as f:  # stands in for notifyutil: what zidev.app is told
+        f.write(f"#!/bin/sh\necho \"$2\" >> {root}/told\n")
+    os.chmod(f"{root}/tell", 0o755)
+    os.makedirs(f"{home}/clips")  # copies zidev.app kept: a line of text and an image
+    write_json(f"{home}/clips/index.json", [
+        {"id": "1", "t": time.time(), "kind": "text", "text": "clip-alpha line", "app": "Notes", "hash": "a"},
+        {"id": "2", "t": time.time() - 60, "kind": "image", "text": "Image 4 × 3", "app": "Preview", "hash": "b"}])
+    for cid, kept in (("1", {"type": "public.utf8-plain-text", "data": b"clip-alpha line"}),
+                      ("2", {"type": "public.png", "data": b"\x89PNG"})):
+        with open(f"{home}/clips/{cid}.plist", "wb") as f:
+            plistlib.dump([[kept]], f, fmt=plistlib.FMT_BINARY)
     with open(f"{root}/copy", "w") as f:  # stands in for pbcopy
         f.write(f"#!/bin/sh\ncat > {root}/copied\n")
     os.chmod(f"{root}/copy", 0o755)
@@ -4130,7 +4253,7 @@ def cmd_selftest():
     sock = f"zidev-selftest-{os.getpid()}"
     env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
            "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
-           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy"}
+           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell"}
     env.pop("TMUX", None)
     failed = []
 
@@ -4318,6 +4441,10 @@ def cmd_selftest():
             subprocess.Popen(["tmux", "-L", sock, "send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0],
                               *keys], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.4)
+        def shift_tab():  # ⇧⇥ as a terminal sends it: tmux's send-keys BTab never reaches a popup
+            client.stdin.write(b"\x1b[Z")
+            client.stdin.flush()
+            time.sleep(0.4)
         seen = lambda: re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "",  # fzf colours what matched: the words without that
                               open(f"{root}/client.out", "rb").read().decode(errors="replace"))
         mark = len(seen())
@@ -4365,7 +4492,8 @@ def cmd_selftest():
         mark = len(seen())
         press("C-q")
         wait(lambda: "New terminal tab" in seen()[mark:])
-        press("BTab")
+        shift_tab()
+        shift_tab()
         press("-l", "calcul")
         check("⇧⇥ to Apps: it finds the Mac's apps", wait(lambda: "Calculator" in seen()[mark:]))
         press("Enter")
@@ -4377,6 +4505,52 @@ def cmd_selftest():
         check("typing: the last row searches Google", wait(lambda: "Google: what time?" in seen()[mark:]))
         press("Enter")
         check("⏎ on it opens the search in the browser", wait(lambda: opened() == "https://www.google.com/search?q=what+time%3F"))
+        # the Clipboard tab (⇧⇥ from All): the copies zidev.app keeps; ⏎ types a text into the tab, an image the app pastes
+        def told():  # what zidev.app was told
+            with contextlib.suppress(OSError):
+                return open(f"{root}/told").read().split()
+            return []
+        t("select-pane", "-t", side)
+        mark = len(seen())
+        press("C-q")
+        wait(lambda: "New terminal tab" in seen()[mark:])
+        shift_tab()
+        check("⇧⇥ to Clipboard: it lists the copies",  # the image's row: only what differs from the row before is drawn
+              wait(lambda: "clip-alpha line" in seen()[mark:] and "Preview · " in seen()[mark:]))
+        press("-l", "alpha")
+        press("Enter")
+        check("⏎ on a text from the sidebar: typed into the tab beside it",
+              wait(lambda: "clip-alpha line" in t("capture-pane", "-p", "-t", f"{wid}.1")))
+        check("not into the sidebar", "clip-alpha" not in t("capture-pane", "-p", "-t", side))
+        t("send-keys", "-t", f"{wid}.1", "C-u")
+        mark = len(seen())
+        press("C-q")
+        wait(lambda: "New terminal tab" in seen()[mark:])
+        shift_tab()
+        press("-l", "image")
+        wait(lambda: "Preview" in seen()[mark:])
+        press("Enter")
+        check("⏎ on an image: zidev.app pastes it", wait(lambda: "zidev.paste" in told())
+              and open(f"{home}/clips/paste").read() == "2")
+        # the palette over another app (shift-shift): zidev.app runs it outside tmux, on zidev's current session
+        float_pane = t("new-window", "-d", "-P", "-F", "#{pane_id}", f"env -u TMUX {shlex.quote(sys.executable)} "
+                       f"{shlex.quote(SELF)} palette float; sleep 5")
+        on_float = lambda text: text in t("capture-pane", "-p", "-t", float_pane)
+        check("palette float: the palette, on its own", wait(lambda: on_float("New terminal tab")))
+        t("send-keys", "-t", float_pane, "BTab")
+        t("send-keys", "-t", float_pane, "-l", "alpha")
+        wait(lambda: on_float("Notes"))
+        t("send-keys", "-t", float_pane, "Enter")
+        check("float: ⏎ on a text, zidev.app pastes it into the app in front",
+              wait(lambda: told().count("zidev.paste") == 2) and open(f"{home}/clips/paste").read() == "1")
+        t("respawn-pane", "-k", "-t", float_pane, f"env -u TMUX {shlex.quote(sys.executable)} {shlex.quote(SELF)} "
+          "palette float; sleep 5")
+        wait(lambda: on_float("New terminal tab"))
+        t("send-keys", "-t", float_pane, "-l", "fix the login")
+        wait(lambda: on_float("◆ fix the login bug"))
+        t("send-keys", "-t", float_pane, "Enter")
+        check("float: something for zidev's window brings it to the front", wait(lambda: "zidev.show" in told()))
+        t("kill-pane", "-t", float_pane)
         t("send-keys", "-t", side, "Enter")
         check("⏎ on the session shows Claude", wait(lambda: main() == "claude"))
         t("send-keys", "-t", side, "Down")
