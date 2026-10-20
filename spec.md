@@ -22,7 +22,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 
 | # | Spec | Check |
 |---|------|-------|
-| P1 | cmd-k (and ctrl-q, for terminals without zidev's keys) in any zidev pane opens the palette: a popup, type to search, ⏎ picks, esc closes. | self: "ctrl-q opens the palette" · app: "cmd-k opens the palette", "esc closes it" |
+| P1 | cmd-k (and ctrl-q, for terminals without zidev's keys) in any zidev pane opens the palette at once (~0.07 s): a popup, type to search, ⏎ picks, esc closes. Session names come from the sidebar's cache (`titles.json`), not from reading whole transcripts; keys start zidev from its kept compiled code (`~/.zidev/pyc`). | self: "ctrl-q opens the palette", "the sidebar keeps Claude's names for the palette" · app: "cmd-k opens the palette", "esc closes it" |
 | P2 | Empty, it shows what was picked in it last (3) and most (3) that fits here, then the common actions (new session, new project, new terminal, changes, rename session, close tab), then the projects; nothing else. | self: "the empty palette: common actions and projects, no files" |
 | P2b | Typing searches everything: all actions (restart Claude, move, close, archive, remove, sidebar, keys), sessions, the project's tabs, archived projects (⏎ unarchives), the project's scripts (⏎ runs in a terminal tab) and files (⏎ previews). | self: "typing finds scripts and files" |
 | P2c | What was picked comes on top next time (a file or script only in its project). | self: "what was picked is on top next time" |

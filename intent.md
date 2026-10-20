@@ -86,6 +86,24 @@ cmd-k, anywhere in zidev, opens the palette. It replaces the ctrl-q menu, the co
 ZI26 **Short and smart.**
 The palette is short and smart: on top what I used last and most, then a few common simple actions, then the projects. Typing also finds the rest: other actions, sessions, the project's commands and its files.
 
+ZI67 **Real quick.**
+cmd-k opens the palette real quick, no waiting.
+
+ZI68 **Like WebStorm.**
+The palette imitates WebStorm's Search Everywhere: tabs on top (All, Files, Actions, Text, Apps), ⇥ switches. Only cmd-k opens it.
+
+ZI69 **Text search inside.**
+The Text tab searches inside the project's files, live, with a preview; ⏎ opens at the line (no ctrl-g).
+
+ZI70 **Open apps.**
+The palette opens apps.
+
+ZI71 **Search Google.**
+The palette searches Google: while typing, the last row is "Google: …".
+
+ZI72 **file:line.**
+Typing file:line opens the file at that line.
+
 ## Tabs
 
 ZI27 **Tabs belong to the project.**

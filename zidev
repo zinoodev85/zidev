@@ -64,7 +64,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -170,8 +170,7 @@ def old_server_running():
 def setup_dirs():
     for d in (HOME, STATUS_DIR, SEEN_DIR, ANCHOR):
         os.makedirs(d, exist_ok=True)
-    hook = {"type": "command", "command": f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} hook",
-            "timeout": 5}
+    hook = {"type": "command", "command": shlex.join(self_argv("hook")), "timeout": 5}
     write_json(HOOK_SETTINGS, {"hooks": {e: [{"hooks": [hook]}] for e in HOOK_EVENTS}})
 
 
@@ -188,8 +187,19 @@ def tmux(*args):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+# zidev run from its kept compiled code (in HOME/pyc): a script python runs as it is gets compiled on every
+# start (30 ms more on each key); -P: modules are not looked up in the folder it starts in
+FAST = ("import sys, importlib.util as u, importlib.machinery as m; sys.argv = sys.argv[1:]; "
+        "s = u.spec_from_loader(__name__, m.SourceFileLoader(__name__, sys.argv[0])); "
+        "z = sys.modules[__name__] = u.module_from_spec(s); s.loader.exec_module(z)")
+
+
+def self_argv(*args):
+    return [sys.executable, "-P", "-X", f"pycache_prefix={HOME}/pyc", "-c", FAST, SELF, *args]
+
+
 def self_cmd(*args):
-    return "exec " + " ".join(shlex.quote(a) for a in (sys.executable, SELF, *args))
+    return "exec " + shlex.join(self_argv(*args))
 
 
 def server_running():
@@ -1805,6 +1815,7 @@ def cmd_palette(pane):
                 f.write("\n".join([r for _, r in top] + [r for r in [*rows.values(), *more] if r not in shown]) + "\n")
             with contextlib.suppress(OSError):
                 os.rename(f"{full}.part", full)
+            save_titles()
 
     threading.Thread(target=full_list, daemon=True).start()
     try:
@@ -2339,7 +2350,7 @@ def pick_file(zid, pane, name, line, files):
     wid = session_windows().get(zid)
     if wid:
         tmux("select-pane", "-t", f"{wid}.0")
-    subprocess.Popen([sys.executable, SELF, "guess", str(at)], stdin=subprocess.DEVNULL,
+    subprocess.Popen(self_argv("guess", str(at)), stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
@@ -2750,7 +2761,7 @@ ZED_KEYS["bindings"].update({key: ["terminal::SendText", seq] for seq, key, _, _
 
 
 def install_tmux_hooks():
-    me = " ".join(shlex.quote(a) for a in (sys.executable, SELF))
+    me = shlex.join(self_argv())
     tmux("set-hook", "-gu", "window-layout-changed")  # older versions
     tmux("set-hook", "-g", "pane-exited", f"run-shell -b \"{me} tabsync\"")
     for hook in ("session-window-changed", "window-pane-changed", "client-session-changed", "client-attached",
@@ -2977,12 +2988,17 @@ def notify(zid, st, state, detail):
     subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-_titles = {}  # transcript -> (bytes read, /rename name, Claude's own title)
+TITLES = f"{HOME}/titles.json"  # claude_titles' cache for the next process (the palette is a new one each time)
+_titles = None  # transcript -> (bytes read, /rename name, Claude's own title)
+_titles_saved = [0.0, False]  # when, and whether something changed since
 
 
 def claude_titles(path):
     """The session's names in Claude Code, from its transcript: (/rename name, Claude's own title).
-    Reads on from where it stopped last time (the sidebar asks on every draw)."""
+    Reads on from where it stopped last time (the sidebar asks on every draw; TITLES: any process)."""
+    global _titles
+    if _titles is None:
+        _titles = {k: tuple(v) for k, v in read_json(TITLES, {}).items()}
     try:
         size = os.path.getsize(path) if path else 0
     except OSError:
@@ -3002,7 +3018,16 @@ def claude_titles(path):
                     custom = e.get("customTitle") or custom if e.get("type") == "custom-title" else custom
                     ai = e.get("aiTitle") or ai if e.get("type") == "ai-title" else ai
         _titles[path] = (at + end, custom, ai)
+        _titles_saved[1] = True
     return custom, ai
+
+
+def save_titles(every=0):
+    """claude_titles' cache to TITLES when it changed, at most every `every` seconds."""
+    if _titles_saved[1] and time.time() - _titles_saved[0] >= every:
+        _titles_saved[:] = time.time(), False
+        with contextlib.suppress(OSError):
+            write_json(TITLES, {k: v for k, v in _titles.items() if os.path.exists(k)})
 
 
 def title_of(s, st):
@@ -3761,6 +3786,7 @@ class Sidebar:
                     mark_seen(self.my_id)
                 self.frame += 1
                 self.draw()
+            save_titles(10)
             self.scr.timeout(TICK_MS)
             ch = self.scr.getch()
             if ch != -1 and not self.visible:  # a key came before the switch was seen
@@ -3968,6 +3994,8 @@ def cmd_apptest():
         check("a click on it again: the sidebar has the keys", at()[1] == "0")
         tmux("select-window", "-t", start[0])
         tmux("select-pane", "-t", start[2])
+    subprocess.run(["osascript", "-e", 'tell application "zidev" to activate'])  # in front, as when cmd-cmd hides it
+    time.sleep(0.5)
     probe(keys="cmd none cmd none")
     check("cmd-cmd hides zidev when it is in front", "shown false" in probe())
     probe(keys="cmd none cmd none")
@@ -4173,6 +4201,8 @@ def cmd_selftest():
                                                        and "Auth fix" not in cap and "name:" not in cap))
         say({"type": "custom-title", "customTitle": "Later name"})
         check("a later /rename wins again", shows("Later name"))
+        check("the sidebar keeps Claude's names for the palette (it opens at once)",
+              wait(lambda: "Later name" in read_json(f"{home}/titles.json", {}).get(tr, []), 12))
         open(f"{root}/empty.jsonl", "w").close()
         act("r")  # "": no name of its own
         wait(lambda: "name: Later name" in t("capture-pane", "-p", "-t", side))
