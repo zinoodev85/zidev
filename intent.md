@@ -255,3 +255,6 @@ A global hotkey shows / hides the zidev app (config "hotkey", default cmd-cmd: c
 
 ZI78 **Starts at login.**
 zidev.app starts at login.
+
+ZI79 **Keeps running.**
+zidev.app keeps running when its window closes or zidev ends, so the clipboard and the keys keep working.

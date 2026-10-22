@@ -363,6 +363,11 @@ func loadKeys() -> [String: String] {
     (try? JSONSerialization.jsonObject(with: shellOutput(["-lc", "zidev keys"]))) as? [String: String] ?? [:]
 }
 
+/// `zidev palette-argv`: the command that starts the palette panel at once (no login shell first)
+func loadPaletteArgv() -> [String] {
+    (try? JSONSerialization.jsonObject(with: shellOutput(["-lc", "zidev palette-argv"]))) as? [String] ?? []
+}
+
 func color(_ hex: UInt32) -> NSColor {
     NSColor(srgbRed: CGFloat(hex >> 16 & 0xff) / 255, green: CGFloat(hex >> 8 & 0xff) / 255,
             blue: CGFloat(hex & 0xff) / 255, alpha: 1)
@@ -503,6 +508,8 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
     var look: NSKeyValueObservation?
     var keyWatch: Any?
     var clickWatch: Any?
+    var paletteArgv: [String] = []
+    var zidevEnded = false  // ZI79: zidev ended in the window; it starts again when the window shows
 
     func applicationDidFinishLaunching(_ n: Notification) {
         menu()
@@ -553,6 +560,11 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         takeShellPath()  // before the keys and the palette: both ask zidev
         reloadKeys(tries: 30)
         startLoginItem()
+        startZidev()
+    }
+
+    /// zidev in the window's terminal
+    func startZidev() {
         let run = "command -v zidev >/dev/null && exec zidev || " +
             "{ echo 'zidev is not on your PATH: brew install zinoodev85/zidev/zidev'; read -k1; }"
         term.startProcess(executable: shell, args: ["-lic", run], environment: termEnv(),
@@ -604,6 +616,10 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
 
     /// zidev's window in front (unminimized); also `zidev.show`, after something picked in the palette panel
     func show() {
+        if zidevEnded {
+            zidevEnded = false
+            startZidev()
+        }
         NSApp.unhide(nil)
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
@@ -655,8 +671,15 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         paint()
         p.makeKeyAndOrderFront(nil)
         p.makeFirstResponder(t)
-        t.startProcess(executable: shell, args: ["-lc", "exec zidev palette float"], environment: termEnv(),
-                       execName: "-zsh", currentDirectory: NSHomeDirectory())
+        // the command zidev gave (python on its compiled code), while its files are there (a brew upgrade moves
+        // them); else through the login shell, which takes longer
+        if !paletteArgv.isEmpty && paletteArgv.filter({ $0.hasPrefix("/") }).allSatisfy(FileManager.default.fileExists) {
+            t.startProcess(executable: paletteArgv[0], args: Array(paletteArgv.dropFirst()), environment: termEnv(),
+                           currentDirectory: NSHomeDirectory())
+        } else {
+            t.startProcess(executable: shell, args: ["-lc", "exec zidev palette float"], environment: termEnv(),
+                           execName: "-zsh", currentDirectory: NSHomeDirectory())
+        }
     }
 
     func closePalette() {
@@ -691,6 +714,11 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         if let text = try? String(contentsOfFile: typed, encoding: .utf8) {
             try? FileManager.default.removeItem(atPath: typed)
             paletteTerm?.send(txt: text)
+        }
+        let close = NSHomeDirectory() + "/.zidev/probe-close"
+        if FileManager.default.fileExists(atPath: close) {  // a click on the window's close button
+            try? FileManager.default.removeItem(atPath: close)
+            window.performClose(nil)
         }
         var below = ""
         if let p = paletteTerm {  // what the panel shows
@@ -773,13 +801,15 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         NSApp.windowsMenu = win
     }
 
-    /// `zidev keys`, asked again while it answers nothing (it fails while zidev itself is being changed):
-    /// cmd-k and the other keys do not stay dead until the app restarts
+    /// `zidev keys` (and how to start the palette), asked again while it answers nothing (it fails while zidev
+    /// itself is being changed): cmd-k and the other keys do not stay dead until the app restarts
     func reloadKeys(tries: Int) {
         DispatchQueue.global().async {
             let keys = loadKeys()
+            let argv = loadPaletteArgv()
             DispatchQueue.main.async {
                 self.term.keys = keys
+                self.paletteArgv = argv
                 if keys.isEmpty && tries > 1 {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.reloadKeys(tries: tries - 1) }
                 }
@@ -791,13 +821,28 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         if term?.keys.isEmpty == true { reloadKeys(tries: 1) }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { true }
+    // ZI79: the app keeps running without its window, so the clipboard and the keys keep working.
+    // Closing the window hides it; zidev stays in it
+    func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { false }
 
-    // zidev ended (detached, or its server stopped): the sessions keep running; the app goes.
-    // The palette ended (picked, or esc): its panel goes
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender !== window { return true }
+        window.orderOut(nil)
+        return false
+    }
+
+    /// a click on the Dock icon (or opening the app again) shows the window
+    func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        show()
+        return false
+    }
+
+    // zidev ended (detached, or its server stopped): the sessions keep running; the window hides, and zidev
+    // starts again when it shows. The palette ended (picked, or esc): its panel goes
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         if source === term {
-            NSApp.terminate(nil)
+            zidevEnded = true
+            window.orderOut(nil)
         } else if source === paletteTerm {
             closePalette()
         }

@@ -1091,7 +1091,10 @@ def cmd_app():
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.rmtree(dst, ignore_errors=True)
     shutil.copytree(src, dst, symlinks=True)
-    subprocess.run(["open", dst])
+    # the one running (it keeps running, ZI79) quits first, so the new one starts; in a shell of its own, as
+    # this may run inside that app
+    subprocess.Popen(["sh", "-c", "osascript -e 'if application \"zidev\" is running then quit application \"zidev\"'"
+                      f"; sleep 1; open {shlex.quote(dst)}"], start_new_session=True)
     print(f"zidev.app is in {os.path.dirname(dst)} (Spotlight, Launchpad, Dock)")
 
 
@@ -1792,10 +1795,12 @@ def cmd_palette(pane):
     with open(f"{work}/tab", "w") as f:
         f.write("All")
     folder = cwd if s else ""  # the project's files, scripts and text: only from one of its sessions
-    # fzf does not search: palette-rows gives it the rows for the tab and what is typed, on every key
-    fzf = ["fzf", "--ansi", "--disabled", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--border=none",
+    # fzf does not search: palette-rows gives it the rows for the tab and what is typed, on every key;
+    # fzf only marks the letters that match (palette_search)
+    fzf = ["fzf", "--ansi", "--disabled", "--no-sort", "--delimiter=\t", "--with-nth=2", "--layout=reverse", "--border=none",
            "--info=inline-right", "--prompt=❯ ", "--with-shell=sh -c", "--header-first", f"--header={palette_header('All')}",
-           f"--bind=change:execute-silent(touch {work}/pending)+first+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}",
+           f"--bind=change:execute-silent(touch {work}/pending)+first+{palette_search(work)}"
+           f"+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}",
            # ⏎ while the rows for what was typed are still coming: picked once they are there, not the old ones
            f"--bind=enter:transform:[ -e {work}/pending ] && touch {work}/enter || echo accept",
            f"--bind=load:transform:rm -f {work}/pending; [ -e {work}/enter ] && echo accept",
@@ -1870,7 +1875,15 @@ def cmd_palette_tab(work, folder, step):
     with open(f"{work}/tab", "w") as f:
         f.write(tab)
     open(f"{work}/pending", "w").close()  # ⏎ waits for the new rows
-    print(f"change-header({palette_header(tab)})+first+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}")
+    print(f"change-header({palette_header(tab)})+first+{palette_search(work)}"
+          f"+reload-sync:{self_cmd('palette-rows', work, folder)} {{q}}")
+
+
+def palette_search(work):
+    """fzf action: what fzf marks in the palette's rows (they come already found): what is typed, of file:line its
+    file; nothing in the Text tab (ripgrep marks it there) or for >cmd."""
+    return ("transform-search~"
+            f"[ \"$(cat {work}/tab)\" = Text ] || case {{q}} in '>'*) ;; *) printf %s {{q}} | sed -E 's/^(.+):[0-9]+$/\\1/' ;; esac~")
 
 
 def cmd_palette_rows(work, folder, query):
@@ -1896,6 +1909,9 @@ def cmd_palette_rows(work, folder, query):
             rows = [r + at[2] for r in fuzzy([r for r in rows if r.startswith("file\t")], at[1])]
         else:
             rows = fuzzy([r for r in rows if tab == "All" or r.split("\t")[0] in PALETTE_TAB_KINDS[tab]], query)
+            if tab == "All":  # at most the 3 best apps; the rest are in the Apps tab
+                more_apps = set([r for r in rows if r.startswith("app\t")][3:])
+                rows = [r for r in rows if r not in more_apps]
     if query and tab == "All":  # always last: search the web for it
         rows.append(f"google\t\033[34mG\033[0m Google: {query}\t{query}\t")
     sys.stdout.write("".join(f"{r}\n" for r in rows))
@@ -3156,9 +3172,13 @@ def claude_titles(path):
 
 
 def save_titles(every=0):
-    """claude_titles' cache to TITLES when it changed, at most every `every` seconds."""
+    """claude_titles' cache to TITLES when it changed, at most every `every` seconds. Other processes save
+    there too (the sidebar, each palette): per transcript the one read furthest stays."""
     if _titles_saved[1] and time.time() - _titles_saved[0] >= every:
         _titles_saved[:] = time.time(), False
+        for path, saved in read_json(TITLES, {}).items():
+            if saved[0] > _titles.get(path, (0, None, None))[0]:
+                _titles[path] = tuple(saved)
         with contextlib.suppress(OSError):
             write_json(TITLES, {k: v for k, v in _titles.items() if os.path.exists(k)})
 
@@ -4191,6 +4211,12 @@ def cmd_apptest():
     with open(f"{HOME}/probe-type", "w") as f:
         f.write("\x1b")
     check("esc closes the panel", wait_for(lambda: "panel false" in probe(), 3))
+    # ZI79: the close button hides the window; the app keeps running (its probe answers), zidev stays in it
+    open(f"{HOME}/probe-close", "w").close()
+    check("the close button hides the window, the app keeps running", "shown false" in probe())
+    subprocess.run(["notifyutil", "-p", "zidev.show"])
+    check("shown again (Dock, cmd-cmd): zidev still in it", wait_for(
+        lambda: "shown true" in probe() and client in (tmux("list-clients", "-F", "#{client_name}") or "").split(), 3))
     subprocess.run(["osascript", "-e", 'tell application "zidev" to activate'])
     print(f"\n{len(failed)} failed" if failed else "\nall ok")
     sys.exit(1 if failed else 0)
@@ -4498,6 +4524,16 @@ def cmd_selftest():
         check("⇧⇥ to Apps: it finds the Mac's apps", wait(lambda: "Calculator" in seen()[mark:]))
         press("Enter")
         check("⏎ opens the app", wait(lambda: opened().endswith("/Calculator.app")))
+        rows = os.path.join(root, "palette-rows")
+        os.makedirs(rows)
+        with open(f"{rows}/full", "w") as f:
+            f.write("".join(f"app\t◇ Calc{i}\t/Applications/Calc{i}.app\t\n" for i in range(5)))
+        for tab, apps in (("All", 3), ("Apps", 5)):
+            with open(f"{rows}/tab", "w") as f:
+                f.write(tab)
+            found = subprocess.run([sys.executable, SELF, "palette-rows", rows, "", "calc"], capture_output=True, text=True)
+            check(f"typing, {tab} lists {apps} of 5 apps (All: the 3 best)",
+                  [r.split("\t")[0] for r in found.stdout.splitlines()].count("app") == apps)
         mark = len(seen())
         press("C-q")
         wait(lambda: "New terminal tab" in seen()[mark:])
@@ -4548,6 +4584,8 @@ def cmd_selftest():
         wait(lambda: on_float("New terminal tab"))
         t("send-keys", "-t", float_pane, "-l", "fix the login")
         wait(lambda: on_float("◆ fix the login bug"))
+        check("what is typed is marked in the rows", wait(lambda: re.search(  # a colour starts right at "fix"
+            r"◆ (\x1b\[[0-9;]*m)+fix", t("capture-pane", "-p", "-e", "-t", float_pane))))
         t("send-keys", "-t", float_pane, "Enter")
         check("float: something for zidev's window brings it to the front", wait(lambda: "zidev.show" in told()))
         t("kill-pane", "-t", float_pane)
@@ -5183,6 +5221,8 @@ def main():
     elif cmd == "keys":  # for the zidev app: which key sends what (the iTerm profile's map, by name)
         print(json.dumps({**{k: v[1] for k, v in ZED_KEYS["bindings"].items()},
                           **{key: seq for seq, key, _, _ in EDIT_KEYS}}))
+    elif cmd == "palette-argv":  # for the zidev app: how it starts the palette panel at once, without a shell
+        print(json.dumps(self_argv("palette", "float")))
     elif cmd in ("--version", "version"):
         print(f"zidev {VERSION}")
     elif os.path.isdir(os.path.expanduser(cmd)):
