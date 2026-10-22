@@ -107,6 +107,12 @@ Typing file:line opens the file at that line.
 ZI73 **Over any app.**
 shift-shift (shift pressed twice) opens only the palette over the app I am in, not the zidev window; that app stays in front. In zidev it opens the cmd-k palette; in WebStorm it stays WebStorm's.
 
+ZI80 **Matches marked.**
+The palette marks the letters that match what I type.
+
+ZI81 **Few apps in All.**
+All shows at most the 3 best apps; the Apps tab shows all.
+
 ## Clipboard
 
 ZI74 **Clipboard history.**
