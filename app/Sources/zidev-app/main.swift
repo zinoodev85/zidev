@@ -400,7 +400,8 @@ final class ZidevView: LocalProcessTerminalView {
     }
 
     /// `notifyutil -p zidev.probe`: the rows as this view has them -> ~/.zidev/probe-screen.txt; with
-    /// ~/.zidev/probe-click ("col row", 0-based) a cmd-click on that cell first, as a hand would make it.
+    /// ~/.zidev/probe-click ("col row", 0-based) a cmd-click on that cell first, as a hand would make it;
+    /// with ~/.zidev/probe-paste a cmd-v of its text.
     /// more: the app's own line to add on top; below: what to add under the rows
     func probe(more: String, below: String) {
         let dir = NSHomeDirectory() + "/.zidev/"
@@ -439,6 +440,20 @@ final class ZidevView: LocalProcessTerminalView {
             for k in keys.split(whereSeparator: \.isWhitespace) {  // as the event tap sees them; key: a key press
                 if k == "key" { DoubleTap.key() } else { DoubleTap.flags(k == "none" ? [] : tapMods[String(k)] ?? []) }
             }
+        }
+        if let text = try? String(contentsOfFile: dir + "probe-paste", encoding: .utf8) {  // cmd-v of this text
+            try? FileManager.default.removeItem(atPath: dir + "probe-paste")
+            let board = NSPasteboard.general  // the clipboard as it was, all its types, comes back after
+            let kept = (board.pasteboardItems ?? []).map { item in
+                item.types.reduce(into: NSPasteboardItem()) { copy, type in
+                    if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+                }
+            }
+            board.clearContents()
+            board.setString(text, forType: .string)
+            paste(self)
+            board.clearContents()
+            board.writeObjects(kept)
         }
         let shown = NSApp.isActive && !NSApp.isHidden && window?.isVisible == true
         guard let t = emulator else { return }
