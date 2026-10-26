@@ -539,7 +539,8 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         window.setFrameAutosaveName("zidev")
         if !window.setFrameUsingName("zidev") { window.center() }
         paint()
-        look = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in self?.paint() }
+        // paint() belongs to the main thread
+        look = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in DispatchQueue.main.async { self?.paint() } }
         window.makeKeyAndOrderFront(nil)
         // the GPU draws the text: CoreGraphics lays out every changed row on the CPU, ~8% of a core for a
         // Claude spinner alone; without Metal it stays on CoreGraphics
