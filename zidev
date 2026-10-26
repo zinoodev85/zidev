@@ -1103,25 +1103,87 @@ def archived():
 
 
 def archive_project(cwd):
-    """Hide a project from the sidebar: its sessions and tabs stop (saved, back on unarchive)."""
+    """Hide a project from the sidebar. Nothing of it keeps running: its sessions and tabs stop (saved,
+    back on unarchive), and so does what they left running. How many such processes stopped."""
     sync_tabs(cwd)
     with edit_state() as d:
         if cwd not in d.setdefault("archived", []):
             d["archived"].append(cwd)
-    if not server_running():
-        return
-    zids = {s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd}
-    wins = session_windows()
+    return stop_project(cwd, {s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd})
+
+
+def stop_project(cwd, zids):
+    """Stop a project's session windows (zids), its tabs and what they left running."""
+    wins = {w for z, w in session_windows().items() if z in zids}
+    panes = []  # the pids of its panes: tmux stops them
+    for line in (tmux("list-panes", "-a", "-F", "#{pane_pid}\t#{window_id}\t#{@zidev_project}") or "").splitlines():
+        pid, wid, project = line.split("\t")
+        if wid in wins or project == cwd:
+            panes.append(int(pid))
+    leftovers = project_leftovers(cwd, panes)
+    for pid in leftovers:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
     for t in all_tabs():
-        if t["project"] == cwd and not t["visible"]:
+        if t["project"] == cwd:
             tmux("kill-pane", "-t", t["pane"])
     mine = tmux("display", "-p", "#{window_id}") if os.environ.get("TMUX") else None
-    for wid in sorted((w for z, w in wins.items() if z in zids), key=lambda w: w == mine):
+    for wid in sorted(wins, key=lambda w: w == mine):
         tmux("kill-window", "-t", wid)  # the caller's own window last
+    return len(leftovers)
+
+
+def project_leftovers(cwd, panes):
+    """What would keep running when a project's panes stop: all they started, and orphans (their parent
+    gone) working in its folder, e.g. a dev server Claude left running, a preview server. Never this
+    process, the ones it runs in, or a tmux server."""
+    parent, command = {}, {}
+    for line in subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout.splitlines():
+        pid, ppid, cmd = (line.split(None, 2) + [""])[:3]
+        parent[int(pid)], command[int(pid)] = int(ppid), cmd
+    children = {}
+    for pid, ppid in parent.items():
+        children.setdefault(ppid, []).append(pid)
+    # orphans in its folder, not in a project inside it
+    projects = set(load_state()["projects"]) | {cwd}
+    orphans = [pid for pid, ppid in parent.items()
+               if ppid == 1 and os.path.basename(command[pid].split(" ")[0]) != "tmux"]
+    roots = list(panes)
+    for pid, folder in working_folders(orphans).items():
+        owners = [p for p in projects if folder == p or folder.startswith(p + "/")]
+        if owners and max(owners, key=len) == cwd:
+            roots.append(pid)
+    found = set()
+    while roots:  # with their children, and theirs
+        pid = roots.pop()
+        if pid not in found:
+            found.add(pid)
+            roots += children.get(pid, [])
+    pid = os.getpid()  # this process and the ones it runs in (the sidebar's pane, tmux) stop with the panes
+    while pid > 1 and pid in parent:
+        found.discard(pid)
+        pid = parent[pid]
+    return found - set(panes)
+
+
+def working_folders(pids):
+    """{pid: its working folder}, for the ones lsof may read (mine)."""
+    if not pids:
+        return {}
+    out = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))],
+                         capture_output=True, text=True).stdout
+    folders, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            folders[pid] = line[1:]
+    return folders
 
 
 def remove_project(cwd):
-    """A project out of the sidebar with its sessions and tabs: they stop (its folder stays)."""
+    """A project out of the sidebar with its sessions and tabs: they stop, and what they left running
+    (its folder stays)."""
     zids = [s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd]
     with edit_state() as d:
         d["projects"] = [p for p in d["projects"] if p != cwd]
@@ -1134,15 +1196,7 @@ def remove_project(cwd):
         for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
             with contextlib.suppress(OSError):
                 os.remove(path)
-    if not server_running():
-        return
-    wins = session_windows()
-    for t in all_tabs():
-        if t["project"] == cwd:
-            tmux("kill-pane", "-t", t["pane"])
-    mine = tmux("display", "-p", "#{window_id}") if os.environ.get("TMUX") else None
-    for wid in sorted((w for z, w in wins.items() if z in zids), key=lambda w: w == mine):
-        tmux("kill-window", "-t", wid)  # the caller's own window last
+    stop_project(cwd, set(zids))
 
 
 def unarchive_project(cwd):
@@ -1167,8 +1221,12 @@ def cmd_archive(args, on=True):
         sys.exit(f"not a zidev project: {cwd}")
     if not on and cwd not in archived():
         sys.exit(f"not archived: {cwd}")
-    (archive_project if on else unarchive_project)(cwd)
-    print(f"{'archived' if on else 'unarchived'} {project_name(cwd)}")
+    if not on:
+        unarchive_project(cwd)
+        print(f"unarchived {project_name(cwd)}")
+        return
+    stopped = archive_project(cwd)  # again on an archived one: stops what still runs for it
+    print(f"archived {project_name(cwd)}" + (f", {stopped} processes it left running stopped" if stopped else ""))
 
 
 def cmd_new(args):
@@ -1367,6 +1425,7 @@ CHANGES_SHOWN = 10   # changed files listed under the changes tab, the last chan
 _changed = {}     # repository top -> (when its git status started, its files)
 _changed_at = {}  # repository top -> when a file in it last changed (seen by this process)
 _streams = {}     # repository top -> its FSEvents stream and callback (kept alive), or None
+_unwatched = []   # the callbacks of stopped streams: kept alive, one may still be running
 _tops = {}        # folder -> (when asked, its repository top or None)
 _fsevents = None
 
@@ -1403,6 +1462,8 @@ def fsevents():
             cs.FSEventStreamCreate.argtypes = [V, callback, V, V, ctypes.c_uint64, ctypes.c_double, ctypes.c_uint32]
             cs.FSEventStreamSetDispatchQueue.argtypes = [V, V]
             cs.FSEventStreamStart.restype, cs.FSEventStreamStart.argtypes = ctypes.c_bool, [V]
+            for name in ("FSEventStreamStop", "FSEventStreamInvalidate", "FSEventStreamRelease"):
+                getattr(cs, name).argtypes = [V]
             libc.dispatch_queue_create.restype, libc.dispatch_queue_create.argtypes = V, [ctypes.c_char_p, V]
             _fsevents = (ctypes, cf, cs, callback, libc.dispatch_queue_create(b"zidev.changes", None))
         except Exception:
@@ -1446,6 +1507,19 @@ def watch(top):
         return False
     _streams[top] = (stream, keep)
     return True
+
+
+def unwatch(top):
+    """Stop watching a repository the sidebar does not list any more (its project archived, removed or folded)."""
+    stream = _streams.pop(top, None)
+    _changed_at.pop(top, None)
+    _changed.pop(top, None)
+    if stream:
+        cs = fsevents()[2]
+        cs.FSEventStreamStop(stream[0])
+        cs.FSEventStreamInvalidate(stream[0])
+        cs.FSEventStreamRelease(stream[0])
+        _unwatched.append(stream[1])
 
 
 def changed_files(cwd, run=True):
@@ -1686,8 +1760,9 @@ def serve(path):
         with socket.socket() as so:
             so.bind(("127.0.0.1", 0))
             port = so.getsockname()[1]
+        # it works in the folder: archiving its project stops it
         subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
-                          "--directory", folder], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          "--directory", folder], cwd=folder, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
         for _ in range(50):
             if port_open(port):
@@ -3270,6 +3345,9 @@ class Sidebar:
                         self.items.append(("commits", t))  # its own row under the changes, folds the same way
                         if cwd in self.data["commits_open"]:
                             self.items += [("commit", (t, sha, subject)) for sha, subject in recent_commits(cwd)]
+        listed = {repo_top(cwd) for cwd in self.changes}
+        for top in [top for top in _streams if top not in listed]:  # archived, removed or folded: not watched
+            unwatch(top)
         self.waits = {t["pane"] for t in self.tabs if self.term_waits(t)}
         self.select(key)
 
@@ -3800,9 +3878,9 @@ class Sidebar:
                 remove_project(v)
         elif ch == ord("w"):
             self.next_attention()
-        elif ch == ord("a") and kind:
+        elif ch in (ord("a"), ord("A")) and kind:  # A: from the right-click menu, no question
             cwd = self.project_of(kind, v)
-            if self.confirm(f"archive {project_name(cwd)[:16]}?", "a"):
+            if ch == ord("A") or self.confirm(f"archive {project_name(cwd)[:16]}?", "a"):
                 archive_project(cwd)
         elif ch == ord("t") and sess:
             self.side(sess, "term", new=True)
@@ -3864,9 +3942,9 @@ class Sidebar:
             self.cursor = self.rows[y]
             self.context_menu(x, y)
 
-    CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X closes without asking)
+    CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X / A act without asking)
                "session": [("Rename", "r", "r"), ("Restart Claude", "R", "R"), ("Close", "x", "X")],
-               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Archive", "a", "a"),
+               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Archive", "a", "A"),
                            ("Remove", "x", "X")]}
 
     def context_menu(self, x, y):
@@ -4356,10 +4434,11 @@ def cmd_selftest():
         check("list --json", json.loads(z("list", "--json").stdout)[0]["status"]["state"] == "working")
 
         # the sidebar reacts only while a client looks at it
-        client = subprocess.Popen(["script", "-q", "/dev/null", "sh", "-c",  # as big as the window: clicks land
-                                   f"stty cols 200 rows 51; exec tmux -T mouse -L {sock} attach -t zidev:{wid}"],
-                                  stdin=subprocess.PIPE, stdout=open(f"{root}/client.out", "wb"), stderr=subprocess.DEVNULL,
-                                  env=env)
+        attach = lambda wid: subprocess.Popen(["script", "-q", "/dev/null", "sh", "-c",  # as big as the window: clicks land
+                                               f"stty cols 200 rows 51; exec tmux -T mouse -L {sock} attach -t zidev:{wid}"],
+                                              stdin=subprocess.PIPE, stdout=open(f"{root}/client.out", "wb"),
+                                              stderr=subprocess.DEVNULL, env=env)
+        client = attach(wid)
         check("client attaches", wait(lambda: t("list-clients")))
         t("resize-window", "-t", wid, "-x", "200", "-y", "50")
         side = f"{wid}.0"
@@ -5114,17 +5193,37 @@ def cmd_selftest():
         check("two zidevs starting at once restore each tab once", wait(lambda: side_tabs() == tabs_before))
         check("restore restarts claude on its claude id",
               wait(lambda: len(args().splitlines()) == n_args + 1 and status(zid)["claude_id"] in args().splitlines()[-1]))
+        client = attach(wid)  # the old one ended with the server
         proj2 = f"{root}/proj2"
         os.makedirs(proj2)
+        proj2 = os.path.realpath(proj2)  # as zidev keeps it (/var is /private/var)
         z("new", proj2)
         n_wins = len(wins())
-        check("archive: its sessions stop, it leaves the sidebar",
-              "archived" in z("archive", proj2).stdout and wait(lambda: len(wins()) == n_wins - 1
-                  and "proj2" not in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        term2 = lambda: next((p for p, k, c in (l.split("\t") for l in t("list-panes", "-a", "-F",
+            "#{pane_id}\t#{@zidev_side}\t#{@zidev_project}").splitlines()) if k == "term" and c == proj2), "")
+        check("archive: proj2 has a terminal tab", wait(lambda: term2()))
+        # what a project leaves running: a job its terminal started, and orphans working in its folder;
+        # each a sleep only this run uses, so one an older run left never counts
+        job, orphan, other = (os.getpid() * 10 + i for i in (1, 2, 3))
+        t("send-keys", "-t", term2(), f"nohup sleep {job} >/dev/null 2>&1 &", "Enter")
+        for folder, secs in ((proj2, orphan), (proj, other)):  # proj's is not proj2's: it keeps running
+            subprocess.run(["sh", "-c", f"sleep {secs} >/dev/null 2>&1 &"], cwd=folder)
+        running = lambda secs: subprocess.run(["pgrep", "-f", f"^sleep {secs}$"], capture_output=True).returncode == 0
+        check("archive: those run", wait(lambda: running(job) and running(orphan) and running(other)))
+        t("select-window", "-t", wid)  # the right-click menu comes from a sidebar in view
+        wait(lambda: t("list-clients") and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0"))
+        write_json(f"{home}/palette-pick.json", ["project", proj2])
+        t("send-keys", "-t", f"{wid}.0", "F12", "A")  # Archive in the right-click menu
+        check("right-click Archive: no question, its sessions stop, it leaves the sidebar",
+              wait(lambda: len(wins()) == n_wins - 1 and "proj2" not in t("capture-pane", "-p", "-t", f"{wid}.0")))
         check("archive: its tabs stop too", wait(lambda: not any(
             l.endswith("proj2") for l in t("list-panes", "-a", "-F", "#{@zidev_project}").splitlines())))
+        check("archive: what it left running stops (its terminal's job, an orphan in its folder)",
+              wait(lambda: not running(job) and not running(orphan)))
+        check("archive: what runs for another project keeps running", running(other))
+        for secs in (job, orphan, other):
+            subprocess.run(["pkill", "-f", f"^sleep {secs}$"])
         z("unarchive", proj2)
-        os.utime(f"{home}/switched")  # no client now: its sidebar is hidden, a switch to it wakes it
         check("unarchive: session and terminal back",
               wait(lambda: len(wins()) == n_wins and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0")))
         check("doctor runs", "tools" in z("doctor").stdout)

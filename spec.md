@@ -17,6 +17,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | S5 | A click on a session / project / tab row shows it and gives it the keyboard (type at once). A click on what is shown already, or on a changed file / commit, leaves the keyboard in the sidebar. | self + app: "a click on a session row: typing goes there" (app: real clicks in zidev.app), "a click on it again: the sidebar has the keys" |
 | S6 | cmd-click in the sidebar is a plain click. | hand |
 | S7 | Sidebar keys: ↑ ↓ move, ⏎ opens, → unfolds / ← folds (a project, changes, commits; ← on a row under a project: to the project, folded), esc drops a pick list. Any other key does nothing. | self: "letters do nothing in the sidebar", "← folds, → unfolds" |
+| S8 | Close / Archive / Remove from the right-click menu act at once, no question (from cmd-k they ask: P3). | self: "right-click Archive: no question, its sessions stop, it leaves the sidebar" |
 
 ## Palette (cmd-k)
 
@@ -80,3 +81,4 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 |---|------|-------|
 | N1 | A short tone when a session goes from working to done or error; config `"sound": false` mutes, a path plays that file. | hand |
 | N2 | No polling git: FSEvents wake the changes list; tmux hooks wake hidden sidebars. | hand |
+| N3 | An archived project runs nothing: its sessions and tabs stop (saved, back on unarchive), and so does what they left running: all its panes started, and orphans (their parent gone) working in its folder, not in a project inside it. Never a tmux server or zidev itself. Remove stops the same; `zidev archive` on an archived project stops what still runs for it. The sidebar stops its FSEvents watch on a repo it no longer lists (archived, removed, folded). | self: "archive: its tabs stop too", "archive: what it left running stops (…)", "archive: what runs for another project keeps running", "unarchive: session and terminal back" |
