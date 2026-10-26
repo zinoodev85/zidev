@@ -17,7 +17,8 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | S5 | A click on a session / project / tab row shows it and gives it the keyboard (type at once). A click on what is shown already, or on a changed file / commit, leaves the keyboard in the sidebar. | self + app: "a click on a session row: typing goes there" (app: real clicks in zidev.app), "a click on it again: the sidebar has the keys" |
 | S6 | cmd-click in the sidebar is a plain click. | hand |
 | S7 | Sidebar keys: ↑ ↓ move, ⏎ opens, → unfolds / ← folds (a project, changes, commits; ← on a row under a project: to the project, folded), esc drops a pick list. Any other key does nothing. | self: "letters do nothing in the sidebar", "← folds, → unfolds" |
-| S8 | Close / Archive / Remove from the right-click menu act at once, no question (from cmd-k they ask: P3). | self: "right-click Archive: no question, its sessions stop, it leaves the sidebar" |
+| S8 | A paste on the sidebar goes into what its window shows (the session), which then has the keys; never read as sidebar keys. | self + app: "a paste on the sidebar goes into the session" (app: a real cmd-v in zidev.app) |
+| S9 | Close / Archive / Remove from the right-click menu act at once, no question (from cmd-k they ask: P3). | self: "right-click Archive: no question, its sessions stop, it leaves the sidebar" |
 
 ## Palette (cmd-k)
 
@@ -54,7 +55,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | C2 | cmd-click on the number an item line starts with (`42.`, `– 10a:`) adds just the number. | app (number) · hand (10a) |
 | C3 | cmd-click on a shorthand in text (`3y`, `461k`, `k 4`, `k 1 2 3`) adds it, not sent. | app |
 | C4 | cmd-click on a `! command` types it into Claude and runs it. | app |
-| C4b | A `! command` whose last word moved to the next row whole (a long hash) is all of it, clicked on either row. | app |
+| C4b | A `! command` whose last word moved to the next row whole (a long hash) is all of it, clicked on either row. A row that ends with a whole word at the edge (`sed`, then `-e` on the next row) keeps the space; only a word too long for a row of its own is joined without one. | app + self: "a `! command` whose row ends with a whole word at the edge: the space after it stays" |
 | C4c | An inline `` `! command` `` whose `!` ends a prose row and goes on (same color) on the next rows: all of it, clicked on any of its rows. | app |
 | C5 | Clicks hit the row under the mouse, also with blank rows on top or the pane scrolled back. | app (blank top row) |
 | C6 | A click on a commit hash (`50ca04b`) in any tab shows that commit in the floating preview; found in the pane's repo, any project, or a repo next to one. | hand |
