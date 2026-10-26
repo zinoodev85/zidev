@@ -31,6 +31,9 @@ A session can start with its task: zidev new DIR --prompt "…" sends it as Clau
 ZI9 **A skill for agents.**
 An agent skill (~/.claude/skills/zidev) explains zidev to agents; zidev rewrites it on every start so it stays current.
 
+ZI82 **Archived runs nothing.**
+An archived project takes no resources: its sessions, tabs and what they started stop; nothing watches it.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
