@@ -67,7 +67,7 @@ ZI20 **Session names follow Claude.**
 Session names follow Claude (/rename, else Claude's own title, else the first prompt); Rename in zidev wins over it until the next /rename, and never pre-fills the long first prompt.
 
 ZI21 **Right-click acts at once.**
-Close / Remove from the right-click menu acts at once, no question (from cmd-k it asks).
+Close / Archive / Remove from the right-click menu act at once, no question (from cmd-k they ask).
 
 ZI22 **Remove takes all of it.**
 Removing a project removes its sessions and tabs. Every question is one key (y).
