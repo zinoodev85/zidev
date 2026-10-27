@@ -65,7 +65,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -3545,7 +3545,7 @@ class Sidebar:
             self.put(h - 2, 1, self.message[: w - 2], curses.color_pair(3))
 
     HELP = [("cmd-k", "palette: actions, files, text, apps, Google; ⇥ tabs"),
-            ("↑ / ↓", "move"), ("⏎ / click", "show session (Claude) / tab; a project: its first session"),
+            ("↑ / ↓", "move"), ("⏎ / click", "show session (Claude) / tab; a project: its first session (folded: the last used)"),
             ("→ / ←", "unfold / fold project or changes; ← on a row: up to its project"),
             ("esc", "drop the pick list"), ("right click", "menu: close, rename, …"), ("wheel", "scrolls the list"),
             ("cmd-b", "hide / show the sidebar"), ("cmd-↑ / ↓", "item above / below"),
@@ -3692,12 +3692,14 @@ class Sidebar:
                 pick = d.pop("pick", None)
             if pick:
                 show_file(pick["zid"], pick["pane"], v, pick["line"])
-        elif kind == "project":  # its main session: the first; folded or not, it stays so
-            main = next((s for s in self.data["sessions"] if s["cwd"] == v), None)
-            if main:
-                self.open(("session", main))
-            else:
+        elif kind == "project":  # unfolded: its main session, the first; folded: the one used last. It stays so
+            sessions = [s for s in self.data["sessions"] if s["cwd"] == v]
+            if not sessions:
                 self.message = "no session: n starts one"
+            elif v in self.data["collapsed"]:
+                self.open(("session", max(sessions, key=lambda s: seen_at(s["id"]))))
+            else:
+                self.open(("session", sessions[0]))
         elif kind == "session":  # its Claude
             wid = self.windows.get(v["id"])
             if not wid and (wid := spawn_window(v)):  # shown once its sidebar has drawn: no blank flash
@@ -5139,8 +5141,9 @@ def cmd_selftest():
         check("click on its ▾: folds it, nothing opens",
               wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side2)) and active() == wid2)
         mouse_click(side2, 6, prow())
-        check("a folded project opens its first session too, stays folded",
-              wait(lambda: active() == wid) and wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side)))
+        check("a folded project opens the session used last (the second, not the first), stays folded",
+              wait(lambda: active() == wid2 and focused() == "1") and "▸ proj" in t("capture-pane", "-p", "-t", side2))
+        t("select-window", "-t", wid)
         hook({"hook_event_name": "UserPromptSubmit", "prompt": "fix the login bug"})
         spins = lambda: re.search(r"▸ proj.*[\u2800-\u28ff]\s*$", t("capture-pane", "-p", "-t", side), re.M)
         check("a folded project shows a spinner while a session in it works", wait(spins))
@@ -5160,8 +5163,8 @@ def cmd_selftest():
         t("select-window", "-t", wid)
         time.sleep(1)
         act("t")
-        check("new terminal in the first session: a third; the second keeps its own",
-              wait(lambda: main() == "term" and main2() == "term" and kinds().count("term") == 3))
+        check("new terminal in the first session: a third; the second keeps its own",  # the second shows Claude: opened above
+              wait(lambda: main() == "term" and main2() == "claude" and kinds().count("term") == 3))
         z("tab", "claude", f"{wid}.1")
         wait(lambda: main() == "claude")
         cursor_to("fix the login bug")  # the cursor stays where it was (switching windows keeps it)
