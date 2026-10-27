@@ -57,8 +57,8 @@ A click on a session / project / tab row opens it and gives it the keyboard; a s
 ZI16 **Right-click menu.**
 Right click on a sidebar row: a menu with its actions (close, rename, …); a left click opens it.
 
-ZI17 **First session is the main one.**
-A project's first session is its main one: click / ⏎ on the project opens it; folded, the session used last. Folding: click ▸ / ▾, or ← / →.
+ZI17 **A project opens its last session.**
+Click / ⏎ on a project opens its session used last, folded or not. Folding: click ▸ / ▾, or ← / →.
 
 ZI18 **Folded project still shows work.**
 A folded project shows the spinner while a session in it works, ● while one waits for my answer.
