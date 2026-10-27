@@ -2435,18 +2435,20 @@ def render_file(path, line=None, numbers=False):
                           capture_output=True, text=True, errors="replace").stdout.split("\n")
     if code and code[-1] == "":
         code.pop()
-    color = {"added": "\033[32m▎", "changed": "\033[33m▎", "deleted": "\033[31m▁"}
+    # ZI42: a change is only a mark in the left bar, on the line's first row; the code keeps its background
+    plus, minus = "\033[32m+\033[0m ", "\033[31m-\033[0m "
+    mark_of = {"added": plus, "changed": plus, "deleted": minus}
     out, origin = [], []
-    tint, ansi = "\033[48;2;24;48;32m", re.compile(r"\033\[[0-9;]*m")
+    ansi = re.compile(r"\033\[[0-9;]*m")
     for n, text in enumerate(code, 1):
-        if marks.get(n) in ("added", "changed") and str(n) != str(line):  # the clicked line keeps bat's highlight
-            pad = room - len(columns_to_index(ansi.sub("", text)))
-            text = tint + text.replace("\033[0m", "\033[0m" + tint) + " " * max(0, pad) + "\033[0m"
         number = f"\033[2m{n:>{digits - 1}}\033[0m " if numbers else ""
-        mark = color.get(marks.get(n), " ") + "\033[0m "
+        mark = mark_of.get(marks.get(n), "  ")
         lead = len(ansi.sub("", text)) - len(ansi.sub("", text).lstrip(" "))
         for k, part in enumerate(wrap_ansi(text, room, min(lead + 4, room // 2)).split("\n")):
-            out.append(f"{number if k == 0 else ' ' * len(ansi.sub('', number))}{mark}{part}")
+            if k == 0:
+                out.append(f"{number}{mark}{part}")
+            else:
+                out.append(f"{' ' * len(ansi.sub('', number))}  {part}")
             origin.append(n)
     return "\n".join(out) + "\n", origin
 
@@ -2456,7 +2458,7 @@ def view_prompt(path, keys):
     rel = os.path.relpath(path)
     name = rel if not rel.startswith("..") else path.replace(os.path.expanduser("~"), "~", 1)
     base = branch_marks(path)[1] if not is_markdown(path) else None
-    vs = f"  ▎ changed vs {base}" if base and base != "HEAD" else "  ▎ uncommitted" if base else ""
+    vs = f"  + changed vs {base}" if base and base != "HEAD" else "  + uncommitted" if base else ""
     return re.sub(r"([%?:.\\])", r"\\\1", f"{name}{vs}   {keys}")
 
 
@@ -5022,9 +5024,13 @@ def cmd_selftest():
             f.write("12\n")
         check("preview marks the branch's changes (committed and not) against main",
               branch_marks(f"{repo}/a.ts") == ({3: "changed", 6: "deleted", 10: "added", 11: "added"}, "main"))
-        shown = re.sub(r"\033\[[0-9;]*m", "", render_file(f"{repo}/a.ts", "3")[0]).split("\n")
+        raw = render_file(f"{repo}/a.ts", "3")[0].split("\n")
+        shown = [re.sub(r"\033\[[0-9;]*m", "", r) for r in raw]
         check("file line n is screen line n, no line numbers (less +ng lands on it)",
-              shown[2].split() == ["▎", "three"] and "changed vs main" in view_prompt(f"{repo}/a.ts", ""))
+              shown[2].split() == ["+", "three"] and "changed vs main" in view_prompt(f"{repo}/a.ts", ""))
+        check("ZI42: a green + on added and changed lines, a red - where lines were removed, no background",
+              shown[9].split() == ["+", "11"] and shown[5].split() == ["-", "6"] and shown[0].split() == ["1"]
+              and "\033[32m+" in raw[9] and "\033[31m-" in raw[5] and "\033[48" not in raw[9])
         with open(f"{root}/long.py", "w") as f:
             f.write("def f():\n    x = [" + ", ".join(f"item_{i}" for i in range(40)) + "]\n    return x\n")
         shown, origin = render_file(f"{root}/long.py")
