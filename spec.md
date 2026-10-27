@@ -76,6 +76,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | A9 | From the panel, a pick for zidev's window (a session, an action, a file) brings zidev to the front; an app or Google does not. | self: "float: something for zidev's window brings it to the front" |
 | A10 | zidev.app starts at login: registered once, when it runs from Applications (`zidev app`); switched off in System Settings, it stays off. | hand |
 | A11 | zidev.app keeps running without its window (ZI79): the close button hides the window, zidev stays in it. zidev ending (detached, `zidev kill`) hides it; zidev starts again when the window shows (Dock, cmd-cmd). Only Quit ends the app; `zidev app` quits the running one, then opens the new one. | app: "the close button hides the window, the app keeps running", "shown again (Dock, cmd-cmd): zidev still in it" · hand: zidev ending |
+| A12 | ZI83: Input Monitoring not allowed at start: never asked → macOS asks; switched off, or allowed for an older build (Settings shows it on, macOS no longer counts it) → the app says so, Open Settings opens that setting. Allowed later, the tap starts without a restart (A3). | hand |
 
 ## Sessions
 

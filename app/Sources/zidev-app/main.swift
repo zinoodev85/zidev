@@ -9,6 +9,7 @@
 import AppKit
 import Carbon.HIToolbox
 import CryptoKit
+import IOKit.hid
 import ServiceManagement
 import SwiftTerm
 
@@ -117,9 +118,13 @@ func registerDoubleTap(_ mod: CGEventFlags, _ action: @escaping () -> Void) {
     DoubleTap.actions[mod.rawValue] = action
     guard first else { return }  // one tap sees them all
     // without Input Monitoring a tap sees only this app's keys: cmd-cmd hides zidev but never shows it again.
-    // Asked once; the tap comes as soon as it is allowed, no restart
+    // The tap comes as soon as it is allowed, no restart
     if !CGPreflightListenEventAccess() {
-        CGRequestListenEventAccess()
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeUnknown {
+            CGRequestListenEventAccess()  // never asked: macOS asks
+        } else {
+            DispatchQueue.main.async { askForInputMonitoring() }  // after the start, which it would hold up
+        }
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { timer in
             guard CGPreflightListenEventAccess() else { return }
             timer.invalidate()
@@ -128,6 +133,22 @@ func registerDoubleTap(_ mod: CGEventFlags, _ action: @escaping () -> Void) {
         return
     }
     createTap()
+}
+
+/// ZI83: Input Monitoring is off, or allowed for an older build (Settings shows it on, but macOS no longer
+/// counts it, and asks no more): it says so and opens that setting
+func askForInputMonitoring() {
+    let alert = NSAlert()
+    alert.messageText = "shift-shift and cmd-cmd need Input Monitoring"
+    alert.informativeText = "Turn zidev on in System Settings › Privacy & Security › Input Monitoring.\n\n" +
+        "Already on? Select zidev, remove it (−) and add it again (+)."
+    alert.addButton(withTitle: "Open Settings")
+    alert.addButton(withTitle: "Later")
+    NSApp.activate(ignoringOtherApps: true)
+    guard alert.runModal() == .alertFirstButtonReturn,
+          let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+    else { return }
+    NSWorkspace.shared.open(url)
 }
 
 func createTap() {
