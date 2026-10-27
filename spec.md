@@ -70,7 +70,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | A3 | cmd-cmd works from any app: Input Monitoring allowed and the event tap on; allowed later, it starts without a restart. | app (live) |
 | A4 | Config `"hotkey"`: `cmd-cmd` (default), `alt-alt`, `ctrl-ctrl`, or a combo (`ctrl-alt-z`); `""` none. shift-shift is the palette's (A8). | hand |
 | A5 | Window › Float on Top keeps it above other apps; remembered. | hand |
-| A6 | Builds keep their signature ("zidev local", `app/signing.sh` once), so macOS keeps Input Monitoring across builds. | hand |
+| A6 | Builds and releases keep their signature ("zidev local", `app/signing.sh` once), so macOS keeps Input Monitoring across builds and brew upgrades. | hand |
 | A7 | The app has zidev's keys (cmd-k, cmd-b, …): when `zidev keys` answers nothing at start (zidev being changed), it asks again (every 2 s, 1 min; and when it comes to the front). | app: "the app has zidev's keys" |
 | A8 | shift-shift (shift pressed twice): zidev in front → the cmd-k palette. Another app in front → only the palette, in a small panel near the top of the screen under the mouse; that app stays in front; esc, a pick or a click elsewhere closes it. A JetBrains app in front: nothing (⇧⇧ stays its own). The panel starts zidev from its compiled code, no login shell first (`zidev palette-argv`, asked at start; through the shell when its files moved). | app: "shift-shift in zidev: the cmd-k palette", "shift-shift over another app: …", "esc closes the panel" |
 | A9 | From the panel, a pick for zidev's window (a session, an action, a file) brings zidev to the front; an app or Google does not. | self: "float: something for zidev's window brings it to the front" |
