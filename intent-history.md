@@ -14,3 +14,4 @@ Replaced or dropped intents from `intent.md`, one dated line each, with what rep
 - **2026-10-20** — "…So does a choice of an item line "42 y n ? : ...": its y is 42y, its number 42." → ZI59: also "8 a b ? : ...", its a is 8a.
 - **2026-10-20** — "…tabs on top (All, Files, Actions, Text, Apps), ⇥ switches. Only cmd-k opens it." → ZI68: a Clipboard tab; cmd-k in zidev, shift-shift from any app (ZI73).
 - **2026-10-26** — "Close / Remove from the right-click menu acts at once, no question (from cmd-k it asks)." → ZI21: Archive too.
+- **2026-10-27** — "…click / ⏎ on the project opens it, folded or not." → ZI17: folded, the session used last.
