@@ -267,3 +267,6 @@ zidev.app starts at login.
 
 ZI79 **Keeps running.**
 zidev.app keeps running when its window closes or zidev ends, so the clipboard and the keys keep working.
+
+ZI83 **Says when a permission is missing.**
+When macOS does not allow what shift-shift / cmd-cmd need, the app says so and opens that setting.
