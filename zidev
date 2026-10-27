@@ -3545,7 +3545,7 @@ class Sidebar:
             self.put(h - 2, 1, self.message[: w - 2], curses.color_pair(3))
 
     HELP = [("cmd-k", "palette: actions, files, text, apps, Google; ⇥ tabs"),
-            ("↑ / ↓", "move"), ("⏎ / click", "show session (Claude) / tab; a project: its first session (folded: the last used)"),
+            ("↑ / ↓", "move"), ("⏎ / click", "show session (Claude) / tab; a project: its session used last"),
             ("→ / ←", "unfold / fold project or changes; ← on a row: up to its project"),
             ("esc", "drop the pick list"), ("right click", "menu: close, rename, …"), ("wheel", "scrolls the list"),
             ("cmd-b", "hide / show the sidebar"), ("cmd-↑ / ↓", "item above / below"),
@@ -3692,14 +3692,12 @@ class Sidebar:
                 pick = d.pop("pick", None)
             if pick:
                 show_file(pick["zid"], pick["pane"], v, pick["line"])
-        elif kind == "project":  # unfolded: its main session, the first; folded: the one used last. It stays so
+        elif kind == "project":  # its session used last (the first when none was); folded or not, it stays so
             sessions = [s for s in self.data["sessions"] if s["cwd"] == v]
-            if not sessions:
-                self.message = "no session: n starts one"
-            elif v in self.data["collapsed"]:
+            if sessions:
                 self.open(("session", max(sessions, key=lambda s: seen_at(s["id"]))))
             else:
-                self.open(("session", sessions[0]))
+                self.message = "no session: n starts one"
         elif kind == "session":  # its Claude
             wid = self.windows.get(v["id"])
             if not wid and (wid := spawn_window(v)):  # shown once its sidebar has drawn: no blank flash
@@ -5125,10 +5123,11 @@ def cmd_selftest():
         prow = lambda: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side2).splitlines()) if "proj" in l)
         active = lambda: t("display", "-p", "#{window_id}")
         mouse_click(side2, 6, prow())
-        check("click on a project: its first session, the project stays unfolded",
-              wait(lambda: active() == wid) and "▾ proj" in t("capture-pane", "-p", "-t", side))
+        check("click on a project: its session used last (here the one shown), the project stays unfolded",
+              wait(lambda: active() == wid2 and main2() == "claude") and "▾ proj" in t("capture-pane", "-p", "-t", side2))
         focused = lambda: t("display", "-p", "#{pane_index}")
-        check("a click on a session row: typing goes there", wait(lambda: focused() == "1"))
+        mouse_click(side2, 6, prow() + 1)  # the first session, right under its project
+        check("a click on a session row: typing goes there", wait(lambda: active() == wid and focused() == "1"))
         mouse_click(side, 6, next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l))
         check("a click on it again: the sidebar has the keys", wait(lambda: focused() == "0"))
         t("set-buffer", "-b", "test-paste", "pasted xq")
@@ -5141,8 +5140,8 @@ def cmd_selftest():
         check("click on its ▾: folds it, nothing opens",
               wait(lambda: "▸ proj" in t("capture-pane", "-p", "-t", side2)) and active() == wid2)
         mouse_click(side2, 6, prow())
-        check("a folded project opens the session used last (the second, not the first), stays folded",
-              wait(lambda: active() == wid2 and focused() == "1") and "▸ proj" in t("capture-pane", "-p", "-t", side2))
+        check("a folded project opens its session used last too, stays folded",
+              wait(lambda: active() == wid2) and "▸ proj" in t("capture-pane", "-p", "-t", side2))
         t("select-window", "-t", wid)
         hook({"hook_event_name": "UserPromptSubmit", "prompt": "fix the login bug"})
         spins = lambda: re.search(r"▸ proj.*[\u2800-\u28ff]\s*$", t("capture-pane", "-p", "-t", side), re.M)
@@ -5224,6 +5223,19 @@ def cmd_selftest():
         z(proj3, extra=inside)
         check("zidev DIR on a project: its first session shown, no new one",
               wait(lambda: len(sessions3()) == 2 and active() == wins().get(sessions3()[0])))
+        # from another project's window: a click on proj3 shows its session used last, the second
+        seen = lambda z: os.path.getmtime(f"{home}/seen/{z}") if os.path.exists(f"{home}/seen/{z}") else 0
+        last3 = sessions3()[1]
+        t("select-window", "-t", wins()[last3])
+        wait(lambda: seen(last3) > seen(sessions3()[0]))
+        t("select-window", "-t", wid)
+        wait(lambda: "proj3" in t("capture-pane", "-p", "-t", side))
+        row3 = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj3" in l)
+        mouse_click(side, 6, row3)
+        opened = wait(lambda: active() == wins()[last3])
+        time.sleep(1)  # nothing switches away after it
+        check("a click on a project from another window: its session used last, it stays and has the keys",
+              opened and active() == wins()[last3] and focused() == "1")
         t("select-window", "-t", wid)
         wait(lambda: "proj3" in t("capture-pane", "-p", "-t", side))
         n_wins = len(wins())

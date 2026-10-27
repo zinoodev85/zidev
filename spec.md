@@ -19,7 +19,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | S7 | Sidebar keys: ↑ ↓ move, ⏎ opens, → unfolds / ← folds (a project, changes, commits; ← on a row under a project: to the project, folded), esc drops a pick list. Any other key does nothing. | self: "letters do nothing in the sidebar", "← folds, → unfolds" |
 | S8 | A paste on the sidebar goes into what its window shows (the session), which then has the keys; never read as sidebar keys. | self + app: "a paste on the sidebar goes into the session" (app: a real cmd-v in zidev.app) |
 | S9 | Close / Archive / Remove from the right-click menu act at once, no question (from cmd-k they ask: P3). | self: "right-click Archive: no question, its sessions stop, it leaves the sidebar" |
-| S10 | ZI17: a click or ⏎ on a project: unfolded, its first session; folded, the session used last (whose window was shown last). The project stays folded or unfolded. | self: "click on a project: its first session, the project stays unfolded", "a folded project opens the session used last (…), stays folded" |
+| S10 | ZI17: a click or ⏎ on a project opens its session used last (whose window was shown last), folded or not, also from another project's window; nothing switches away after. The project stays folded or unfolded. | self: "click on a project: its session used last (…)", "a folded project opens its session used last too, stays folded", "a click on a project from another window: …" |
 
 ## Palette (cmd-k)
 
