@@ -181,8 +181,8 @@ HTML file: ask "open in browser or preview here?"; browser serves it from a simp
 ZI41 **Binary files in their app.**
 Images and binary files (movies…): open in their default app.
 
-ZI42 **Branch changes highlighted.**
-File preview highlights what changed on this branch (vs main, incl. uncommitted).
+ZI42 **Changes as + and −.**
+The file preview marks what changed on this branch (vs main, incl. uncommitted) only in the left bar: a green + on each added or changed line, a red − where lines were removed. No green background: it looks like the black editor.
 
 ZI43 **Wrap under the indent.**
 Long lines in the preview wrap under their own indentation, never into the gutter.

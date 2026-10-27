@@ -16,3 +16,4 @@ Replaced or dropped intents from `intent.md`, one dated line each, with what rep
 - **2026-10-26** — "Close / Remove from the right-click menu acts at once, no question (from cmd-k it asks)." → ZI21: Archive too.
 - **2026-10-27** — "…click / ⏎ on the project opens it, folded or not." → ZI17: folded, the session used last.
 - **2026-10-27** — "First session is the main one. A project's first session is its main one: click / ⏎ on the project opens it; folded, the session used last." → ZI17: its session used last, folded or not.
+- **2026-10-27** — "Branch changes highlighted. File preview highlights what changed on this branch (vs main, incl. uncommitted)." → ZI42: only a green + / red − in the left bar, no green background.
