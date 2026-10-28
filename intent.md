@@ -147,8 +147,8 @@ New terminal (cmd-shift-t) opens a new terminal tab each time.
 ZI31 **A file open once.**
 A file is open at most once in the sidebar; opening it again shows its tab.
 
-ZI32 **cmd-b.**
-cmd-b hides / shows the sidebar.
+ZI32 **Only cmd-b.**
+cmd-b hides / shows the sidebar; nothing else does. Only while it asks something I started (rename, close, which file) it shows, then hides again.
 
 ZI33 **cmd-↑ / cmd-↓.**
 cmd-↑ / cmd-↓ move between a project's items in the sidebar: Claude, terminals, files (not the changes tab).
