@@ -4370,6 +4370,11 @@ def cmd_apptest():
     check("cmd-cmd hides zidev when it is in front", "shown false" in probe())
     probe(keys="cmd none cmd none")
     check("cmd-cmd shows it again", "shown true" in probe())
+    subprocess.run(["osascript", "-e", 'tell application "Finder" to activate'])  # another app in front
+    time.sleep(0.5)
+    probe(keys="cmd none cmd none")
+    time.sleep(0.5)
+    check("cmd-cmd over another app: zidev comes to the front", "shown true" in probe())
     probe(keys="cmd none")
     time.sleep(0.5)
     probe(keys="cmd none")

@@ -651,8 +651,9 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         }
     }
 
-    /// zidev's window in front (unminimized); also `zidev.show`, after something picked in the palette panel
-    func show() {
+    /// zidev's window in front (unminimized); also `zidev.show`, after something picked in the palette panel.
+    /// again: false when it was opened again already (the Dock, Launch Services)
+    func show(again: Bool = true) {
         if zidevEnded {
             zidevEnded = false
             startZidev()
@@ -661,6 +662,14 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        guard again else { return }
+        // macOS may say no while another app is in front (cmd-cmd seen by the event tap is no click on zidev):
+        // opened again through Launch Services, it comes to the front
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            if !NSApp.isActive {
+                NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: NSWorkspace.OpenConfiguration())
+            }
+        }
     }
 
     /// ZI73, shift-shift: zidev in front opens its cmd-k palette; over another app the palette panel;
@@ -870,7 +879,7 @@ final class App: NSObject, NSApplicationDelegate, LocalProcessTerminalViewDelega
 
     /// a click on the Dock icon (or opening the app again) shows the window
     func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        show()
+        show(again: false)
         return false
     }
 

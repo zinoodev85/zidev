@@ -69,7 +69,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 |---|------|-------|
 | A1 | cmd pressed twice (each alone, < 0.3 s held, < 0.4 s apart): zidev in front → hidden; else → shown in front. | app |
 | A2 | Not a double tap: two taps far apart; cmd used with a key (cmd-c) in between. | app |
-| A3 | cmd-cmd works from any app: Input Monitoring allowed and the event tap on; allowed later, it starts without a restart. | app (live) |
+| A3 | cmd-cmd works from any app: Input Monitoring allowed and the event tap on; allowed later, it starts without a restart. When macOS will not bring zidev to the front, it asks again through Launch Services. | app (live), "cmd-cmd over another app: zidev comes to the front" |
 | A4 | Config `"hotkey"`: `cmd-cmd` (default), `alt-alt`, `ctrl-ctrl`, or a combo (`ctrl-alt-z`); `""` none. shift-shift is the palette's (A8). | hand |
 | A5 | Window › Float on Top keeps it above other apps; remembered. | hand |
 | A6 | Builds and releases keep their signature ("zidev local", `app/signing.sh` once), so macOS keeps Input Monitoring across builds and brew upgrades. | hand |
