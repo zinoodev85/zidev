@@ -18,3 +18,5 @@ Replaced or dropped intents from `intent.md`, one dated line each, with what rep
 - **2026-10-27** — "First session is the main one. A project's first session is its main one: click / ⏎ on the project opens it; folded, the session used last." → ZI17: its session used last, folded or not.
 - **2026-10-27** — "Branch changes highlighted. File preview highlights what changed on this branch (vs main, incl. uncommitted)." → ZI42: only a green + / red − in the left bar, no green background.
 - **2026-10-28** — "cmd-b. cmd-b hides / shows the sidebar." → ZI32: only cmd-b; it shows only while it asks something I started.
+- **2026-10-29** — "Stripe shows active projects. Hidden, the sidebar is a thin stripe: the projects active in the last 10 minutes, …" (ZI84) → dropped: too ugly; ZI32: hidden, nothing of it shows.
+- **2026-10-29** — "Only cmd-b. cmd-b hides / shows the sidebar; nothing else does. Only while it asks …" → ZI32: hidden, nothing of it shows: clean, no stripe.

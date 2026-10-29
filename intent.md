@@ -148,10 +148,7 @@ ZI31 **A file open once.**
 A file is open at most once in the sidebar; opening it again shows its tab.
 
 ZI32 **Only cmd-b.**
-cmd-b hides / shows the sidebar; nothing else does. Only while it asks something I started (rename, close, which file) it shows, then hides again.
-
-ZI84 **Stripe shows active projects.**
-Hidden, the sidebar is a thin stripe: the projects active in the last 10 minutes, each name written top to bottom (at most 10 letters) under one sign for its state (working, needs me, done …), as in the sidebar. A click on one opens its session used last.
+cmd-b hides / shows the sidebar; nothing else does. Hidden, nothing of it shows: clean, no stripe. Only while it asks something I started (rename, close, which file) it shows, then hides again.
 
 ZI33 **cmd-↑ / cmd-↓.**
 cmd-↑ / cmd-↓ move between a project's items in the sidebar: Claude, terminals, files (not the changes tab).
