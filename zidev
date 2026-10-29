@@ -3440,8 +3440,10 @@ class Sidebar:
     def draw(self):
         self.scr.erase()
         h, w = self.scr.getmaxyx()
-        if w == 1:  # ZI32: hidden (cmd-b), an empty sliver; a click on it opens nothing
+        if w == 1:  # ZI32: hidden (cmd-b), a stripe
             self.rows, self.footer = {}, []
+            self.draw_stripe(h)
+            self.scr.refresh()
             return
         if self.help:
             return self.draw_help(h, w)
@@ -3525,6 +3527,41 @@ class Sidebar:
         self.draw_footer(h, w)
         self.scr.refresh()
 
+    STRIPE_S = 600  # ZI84: the stripe shows the projects active in the last 10 minutes
+    URGENCY = ("waiting", "error", "working", "done", "exited", "stopped", "idle")  # the most urgent first
+
+    def active(self, s):
+        """ZI84: the session works or waits now, or its state changed in the last 10 minutes."""
+        state = self.state_of(s)[0]
+        since = self.status.get(s["id"], {}).get("since", 0)
+        return state in ("working", "waiting") or time.time() - since < self.STRIPE_S
+
+    def urgency(self, s):
+        """Lower is more urgent: needs me, error, working, done (unseen first), the rest."""
+        state, attention = self.state_of(s)
+        rank = self.URGENCY.index(state) if state in self.URGENCY else len(self.URGENCY)
+        return rank, not attention
+
+    def draw_stripe(self, h):
+        """ZI84: the hidden sidebar, 1 column: each active project as a sign, then its name top to bottom."""
+        y = 1
+        for i, (kind, cwd) in enumerate(self.items):
+            if kind != "project":
+                continue
+            active = [s for s in self.data["sessions"] if s["cwd"] == cwd and self.active(s)]
+            if not active:
+                continue
+            name = project_name(cwd)[:10]
+            if y + len(name) >= h:  # what does not fit is left out
+                break
+            sign, color, _ = self.sign_of(min(active, key=self.urgency))  # several sessions: the most urgent
+            self.put(y, 0, sign, color)
+            self.rows[y] = i  # a click on the sign or a letter opens the project
+            for n, letter in enumerate(name, 1):
+                self.put(y + n, 0, letter)
+                self.rows[y + n] = i
+            y += len(name) + 2  # a blank row between projects
+
     FOOTER = ([], [("⌘k all actions", "palette"), ("? keys", "?")])
 
     def draw_footer(self, h, w):
@@ -3554,11 +3591,12 @@ class Sidebar:
             self.put(y, 13, text[: w - 14], curses.A_DIM if not k else 0)
         self.scr.refresh()
 
-    def draw_session(self, y, w, s, base):
+    def sign_of(self, s):
+        """A session's state as (sign, its color, a short label): the same in the sidebar and the stripe."""
         state, attention = self.state_of(s)
         st = self.status.get(s["id"], {})
         c = curses.color_pair
-        glyph, color, label = {
+        return {
             "working": (SPIN[self.frame % len(SPIN)], c(4), age(st.get("since"))),
             "waiting": ("●", c(3) | curses.A_BOLD, "needs you"),
             "done": ("●" if attention else "○", c(2) if attention else curses.A_DIM,
@@ -3567,6 +3605,12 @@ class Sidebar:
             "exited": ("■", curses.A_DIM, "exited"),
             "stopped": ("–", curses.A_DIM, "stopped"),
         }.get(state, ("○", curses.A_DIM, ""))
+
+    def draw_session(self, y, w, s, base):
+        state, attention = self.state_of(s)
+        st = self.status.get(s["id"], {})
+        c = curses.color_pair
+        glyph, color, label = self.sign_of(s)
         gx, tx = (1, 3) if w < 20 else (3, 5)  # a narrow sidebar: less indent
         if s["id"] == self.my_id:
             self.put(y, 0, "▌", base | c(5))
@@ -3938,7 +3982,7 @@ class Sidebar:
                 kind, v = self.items[self.cursor]
                 w = self.scr.getmaxyx()[1]
                 self.save_view()  # before open: the window it switches to shows the list just like this
-                if kind == "project" and x <= 2:  # its ▸ / ▾
+                if kind == "project" and x <= 2 and w > 1:  # its ▸ / ▾ (the stripe has none)
                     self.fold(v)
                 elif kind == "tab" and v["kind"] == "git" and x >= w - 3:
                     self.fold_changes(v["project"])
@@ -4761,6 +4805,12 @@ def cmd_selftest():
         width = side_w()
         z("tab", "sidebar", pane_of("term"))
         check("cmd-b hides the sidebar: a sliver", wait(lambda: side_w() == "1") and not keys_in())
+        stripe = lambda: "".join(l[:1] or " " for l in t("capture-pane", "-p", "-t", side).splitlines())
+        check("ZI84: the stripe shows the working project, its name top to bottom under a spinner",
+              wait(lambda: re.match(f"[{SPIN}]proj( |$)", stripe())))  # t() strips the blank top row
+        mouse_click(side, 0, 3)
+        check("ZI84: a click on its name opens its session used last, the stripe stays",
+              wait(lambda: main() == "claude") and side_w() == "1")
         z("tab", "select", pane_of("claude"))
         check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(lambda: side_w() == "1"))
         t("resize-window", "-t", wid, "-x", "180", "-y", "50")
