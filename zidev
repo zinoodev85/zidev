@@ -496,8 +496,7 @@ def split_of(zid):
 
 def settle(wid=None):
     """After the shown tab changed: Claude's side terminal is next to it only while Claude shows
-    (parked otherwise); a hidden sidebar (cmd-b) stays hidden. tmux unzooms on every swap or join,
-    so this runs after each. Not while a preview floats (it would be zoomed away)."""
+    (parked otherwise); a hidden sidebar (cmd-b) stays a sliver, a shown one keeps its width."""
     wins = session_windows()
     for zid, w in [(window_zid(wid, wins), wid)] if wid else wins.items():
         if not zid:
@@ -514,20 +513,12 @@ def settle(wid=None):
             tmux("break-pane", "-d", "-s", pane, "-t", f"{PARK}:")
         elif pane and at != w and want:
             tmux("join-pane", "-d", "-h", "-l", "40%", "-s", pane, "-t", shown["pane"])
-        zoomed = tmux("display", "-p", "-t", w, "#{window_zoomed_flag}") == "1"
         side = int(tmux("display", "-p", "-t", f"{w}.0", "#{pane_width}") or 0)
-        if sidebar_hidden() and not floating_in(w):
-            if want:  # zoom would hide the terminal too: the sidebar shrinks to a sliver instead
-                if zoomed:
-                    tmux("resize-pane", "-Z", "-t", f"{w}.1")
+        if sidebar_hidden():  # ZI32: a sliver of 1 column (the sidebar widens itself while it asks)
+            if side > 1:
                 tmux("resize-pane", "-t", f"{w}.0", "-x", "1")
-            elif not zoomed:
-                tmux_all(["select-pane", "-t", f"{w}.1"], ["resize-pane", "-Z", "-t", f"{w}.1"])
-        else:
-            if zoomed:
-                tmux("resize-pane", "-Z", "-t", f"{w}.1")
-            if side < SIDEBAR_MIN:
-                tmux("resize-pane", "-t", f"{w}.0", "-x", str(sidebar_width()))
+        elif side < SIDEBAR_MIN:
+            tmux("resize-pane", "-t", f"{w}.0", "-x", str(sidebar_width()))
         if want:  # 40 % of what is right of the sidebar, however the sidebar changed
             room = tmux("display", "-p", "-t", f"{w}.0", "#{window_width} #{pane_width}")
             if room:
@@ -1821,8 +1812,6 @@ def to_sidebar(wid, key, row):
     """A sidebar action on row ([kind, id] or None): F12 then its key; the row waits in PALETTE_PICK."""
     write_json(PALETTE_PICK, row)
     if key in ASKS:
-        if sidebar_hidden():
-            toggle_sidebar()
         tmux("select-pane", "-t", f"{wid}.0")
     tmux("send-keys", "-t", f"{wid}.0", "F12", "Enter" if key == "\n" else key)
 
@@ -2109,7 +2098,6 @@ def palette_do(kind, target, extra, pane, wid, zid, cwd):
     if kind == "act" and target.startswith("tab "):
         cmd_tab([target[4:], pane])
     elif kind == "act" and target == "focus":  # sidebar ⇄ the tab beside it
-        tmux("set", "-g", "@zidev_hidden", "0")
         here = tmux("display", "-p", "-t", pane, "#{pane_index}")
         tmux("select-pane", "-t", f"{wid}.1" if here == "0" else f"{wid}.0")
     elif kind == "act":
@@ -3305,6 +3293,8 @@ class Sidebar:
         self.frame = 0
         self.message = message
         self.help = False
+        self.asking = False  # a question waits for my answer at the bottom
+        self.asked = False   # it asked something at the last width check (ZI32)
         self.footer = []   # (y, x from, x to, key) of the clickable footer hints
         self.term_seen = {}  # pane -> (its last rows, since when): a script that stopped on a question
         self.waits = set()   # panes of terminal tabs that wait for you
@@ -3450,6 +3440,9 @@ class Sidebar:
     def draw(self):
         self.scr.erase()
         h, w = self.scr.getmaxyx()
+        if w == 1:  # ZI32: hidden (cmd-b), an empty sliver; a click on it opens nothing
+            self.rows, self.footer = {}, []
+            return
         if self.help:
             return self.draw_help(h, w)
         dim, bold = curses.A_DIM, curses.A_BOLD
@@ -3631,7 +3624,23 @@ class Sidebar:
 
     # input
 
+    def asks(self):
+        """It asks something I started: a question, the keys, which file (the pick list)."""
+        return self.asking or self.help or any(kind == "pick" for kind, _ in self.items)
+
+    def ask(self, on):
+        """ZI32: a hidden sidebar shows while it asks a question, then it is a sliver again."""
+        self.asking = on
+        if not sidebar_hidden():
+            return
+        self.fix_width()
+        if on:  # curses learns the new width now, not at the next key
+            size = tmux("display", "-p", "-t", self.pane, "#{pane_height} #{pane_width}")
+            if size:
+                curses.resizeterm(*map(int, size.split()))
+
     def prompt(self, label, text="", complete=False):
+        self.ask(True)
         h, w = self.scr.getmaxyx()
         curses.curs_set(1)
         self.scr.timeout(-1)
@@ -3658,9 +3667,11 @@ class Sidebar:
                     text += ch
         finally:
             curses.curs_set(0)
+            self.ask(False)
 
     def confirm(self, question, again=None):
         """One key: y (or the key that asked again: x x, a a, R R) is yes, any other no."""
+        self.ask(True)
         h, w = self.scr.getmaxyx()
         self.put(h - 2, 0, " " * w)
         self.put(h - 1, 0, " " * w)
@@ -3668,6 +3679,9 @@ class Sidebar:
         self.put(h - 1, 1, f"{again + ' / ' if again else ''}y yes  any key no"[:w - 2], curses.A_DIM)
         self.scr.timeout(-1)
         ch = self.scr.get_wch()
+        while ch == curses.KEY_RESIZE:  # the sidebar widened to ask: not an answer
+            ch = self.scr.get_wch()
+        self.ask(False)
         return ch == "y" or ch == again
 
     def follow(self):
@@ -3779,7 +3793,7 @@ class Sidebar:
 
     def new_project(self):
         kind, v = self.current()
-        cwd = v if kind == "project" else v and v["cwd"]
+        cwd = self.project_of(kind, v) if kind else None
         default = (os.path.dirname(cwd) if cwd else os.path.expanduser("~/projects")) + "/"
         path = self.prompt("folder: ", default.replace(os.path.expanduser("~"), "~", 1), complete=True)
         if path:
@@ -3964,23 +3978,24 @@ class Sidebar:
         subprocess.Popen(["tmux", "-L", SOCKET, *menu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def fix_width(self, drag=False):
-        """Keep the sidebar at its saved width. A resize while the window keeps its width is a drag
-        of the border: that width is saved (for every session) instead."""
+        """Keep the sidebar at its saved width; hidden (cmd-b), a sliver of 1 column, except while it
+        asks (ZI32). A resize while the window keeps its width is a drag of the border: that width is
+        saved (for every session) instead."""
         size = tmux("display", "-p", "-t", self.pane, "#{pane_width} #{window_width}")
         if not size:
             return
         pane_w, win_w = map(int, size.split())
-        if sidebar_hidden():  # zoomed away or a sliver next to Claude's terminal; resize-pane would unzoom
-            self.win_w = win_w
-            return
-        want = sidebar_width()
-        if drag and win_w == self.win_w and pane_w != want:
+        hidden, asked = sidebar_hidden(), self.asks()
+        want = 1 if hidden and not asked else sidebar_width()
+        if drag and not hidden and win_w == self.win_w and pane_w != want:
             conf = read_json(CONFIG, {})
             conf["sidebar_w"] = want = max(SIDEBAR_MIN, min(pane_w, win_w - 20))
             write_json(CONFIG, conf)
         if pane_w != want and win_w > want + 20:
             tmux("resize-pane", "-t", self.pane, "-x", str(want))
-        self.win_w = win_w
+        if hidden and asked and not self.asked:  # shown to ask: the keyboard comes here
+            tmux("select-pane", "-t", self.pane)
+        self.win_w, self.asked = win_w, asked
 
     def paint(self, theme):
         """Colors for the terminal's light or dark theme: text keeps the theme's own colors; the
@@ -4085,8 +4100,11 @@ class Sidebar:
             return
         self.focused, shown, self.visible = flags[2] == "1", self.visible, True
         self.load(snap)
-        if not shown:
+        if not shown or self.asks() != self.asked:  # ZI32: shown for a question, a sliver again after it
             self.fix_width()
+        if self.focused and not self.asks() and self.scr.getmaxyx()[1] == 1:  # a sliver takes no keys
+            tmux("select-pane", "-R", "-t", self.pane)
+        if not shown:
             self.adopt_view()
             me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
             if me and not (self.items and self.is_mine(self.current(), me)):
@@ -4738,20 +4756,30 @@ def cmd_selftest():
         z("tab", "down", pane_of("term"))
         time.sleep(0.5)
         check("cmd-↓ skips the changes tab", main() == "term")
-        zoomed = lambda: t("display", "-p", "-t", wid, "#{window_zoomed_flag}") == "1"
+        side_w = lambda: t("display", "-p", "-t", side, "#{pane_width}")
+        keys_in = lambda: t("display", "-p", "-t", wid, "#{pane_id}") == t("display", "-p", "-t", side, "#{pane_id}")
+        width = side_w()
         z("tab", "sidebar", pane_of("term"))
-        check("cmd-b hides the sidebar", wait(zoomed))
+        check("cmd-b hides the sidebar: a sliver", wait(lambda: side_w() == "1") and not keys_in())
         z("tab", "select", pane_of("claude"))
-        check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(zoomed))
+        check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(lambda: side_w() == "1"))
         t("resize-window", "-t", wid, "-x", "180", "-y", "50")
         time.sleep(1)
         t("resize-window", "-t", wid, "-x", "200", "-y", "50")
-        time.sleep(1)
-        check("it stays hidden when the window resizes", zoomed())
+        check("it stays hidden when the window resizes", wait(lambda: side_w() == "1"))
+        z("open", "README.md", extra={"TMUX_PANE": f"{wid}.1"})
+        check("a preview floats over it, it stays hidden", wait(lambda: "README.md" in floats()) and side_w() == "1")
+        t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
+        wait(lambda: not floats())
+        act("p")
+        check("ZI32: a question shows it, with the keys",
+              wait(lambda: side_w() == width and "esc cancel" in t("capture-pane", "-p", "-t", side)) and keys_in())
+        t("send-keys", "-t", side, "Escape")
+        check("after the question a sliver again, the keys back in the tab",
+              wait(lambda: side_w() == "1") and wait(lambda: not keys_in()))
         z("tab", "sidebar", pane_of("claude"))
-        check("cmd-b shows it again", wait(lambda: not zoomed()))
+        check("cmd-b shows it again", wait(lambda: side_w() == width))
         sides = lambda: t("list-panes", "-t", wid, "-F", "#{@zidev_side}").split()
-        width = t("display", "-p", "-t", f"{wid}.0", "#{pane_width}")
         z("tab", "split", pane_of("claude"))
         check("cmd-t: a terminal next to Claude", wait(lambda: sides()[-2:] == ["claude", "split"]))
         z("tab", "down", pane_of("claude"))
