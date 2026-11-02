@@ -141,8 +141,8 @@ The clipboard is the only thing zidev checks on a timer, every 0.5 s.
 ZI27 **Tabs belong to the project.**
 Tabs (terminal, git, files) belong to the project, shared by all its sessions, listed under the project.
 
-ZI28 **Always a terminal and changes.**
-Every project always has a terminal and a changes tab.
+ZI28 **Always a terminal.**
+Every project always has a terminal. Changes (its tab with the commits row) are off by default; "Toggle changes" in the palette (shift-shift / cmd-k) or the right-click menu turns them on / off per project, and that stays.
 
 ZI29 **Full screen, never split.**
 Tabs are always full screen, never split — except Claude: cmd-t puts a terminal next to it (cmd-t again: away). cmd-shift-t: a new terminal tab under the project.
@@ -171,7 +171,7 @@ ZI36 **Last 10 changed files.**
 The changes tab lists at most the 10 last changed files (newest first); its count is all of them.
 
 ZI37 **Commits row.**
-Every project has a commits row under its changes tab: it folds open on the last 5 commits; the cursor on one (or a click) shows it in the changes tab.
+A changes tab has a commits row under it: it folds open on the last 5 commits; the cursor on one (or a click) shows it in the changes tab.
 
 ZI38 **Click a commit hash.**
 A click on a commit hash (50ca04b) in any tab shows that commit in the floating preview, found in the pane's repo or any project's.
