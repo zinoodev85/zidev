@@ -37,7 +37,7 @@ runs without an Apple developer account. Closing it leaves the sessions running.
 |---|---|
 | `⏎` / click | show session (Claude) / tab; a project: its first session (folded or not) |
 | `space` / click `▸` | fold / unfold a project or the changed files (folded: ● while a session in it needs you, a spinner while one works) |
-| right click | menu of the row: close tab · rename / restart / close session · rename / new session / archive / remove project |
+| right click | menu of the row: close tab · rename / restart / close session · rename / new session / toggle changes / archive / remove project |
 | `j` / `k`, arrows | move; the wheel scrolls the list, the cursor stays |
 | `n` / `p` | new session in project / new project (folder) |
 | `r` / `x` | rename / close session, tab or project (a project with its sessions); `x x` confirms |
@@ -95,6 +95,8 @@ Tabs are full screen; only Claude can have a terminal next to it (`cmd-t`).
 - `zidev open FILE[:LINE] [--tab]` from any zidev pane.
 
 ## Changes tab
+
+Off at first: "Toggle changes" (cmd-k, or the project's right-click menu) turns it on / off per project.
 
 The diff of one changed file at a time (delta); scrolling never runs into another file.
 Its changed files fold under it in the sidebar (folded at first, with their number): `⏎` on the shown

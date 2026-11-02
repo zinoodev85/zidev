@@ -66,7 +66,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -597,12 +597,12 @@ def cycle_tab(pane, delta, items=False):
 
 def close_tab(pane):
     """Close a tab (never a Claude); its window shows the tab used before it. A project's own
-    terminal and changes tab stay: they restart, parked."""
+    terminal and (changes on) changes tab stay: they restart, parked."""
     tabs, wins = all_tabs(), session_windows()
     t = find_tab(pane, tabs)
     if not t or t["kind"] == "claude":
         return
-    keep = t["kind"] in ALWAYS and [x["pane"] for x in project_tabs(t["project"], tabs) if x["kind"] == t["kind"]] == [pane]
+    keep = t["kind"] in always(t["project"]) and [x["pane"] for x in project_tabs(t["project"], tabs) if x["kind"] == t["kind"]] == [pane]
     if t["visible"] and not t["float"]:
         zid = window_zid(t["window"], wins)
         rest = [x for x in window_choices(zid, tabs) if x["pane"] != pane and not x["visible"]]
@@ -622,7 +622,22 @@ def close_tab(pane):
     sync_tabs(t["project"])
 
 
-ALWAYS = ("term", "git")  # every project has a terminal and (in a git repo) a changes tab
+def always(cwd, d=None):
+    """The tabs a project always has: a terminal; a changes tab (in a git repo) while its changes are on (ZI28)."""
+    return ("term", "git") if cwd in (d or load_state()).get("changes", []) else ("term",)
+
+
+def toggle_changes(cwd):
+    """Changes on / off for a project (ZI28): its changes tab with the commits row is made (parked) or
+    closes. True when they are on now."""
+    with edit_state() as d:
+        on = cwd not in d.setdefault("changes", [])
+        if on:
+            d["changes"].append(cwd)
+        else:
+            d["changes"].remove(cwd)
+    ensure_project_tabs()
+    return on
 
 
 @contextlib.contextmanager
@@ -634,7 +649,8 @@ def tabs_lock():
 
 
 def ensure_project_tabs():
-    """Give each project its terminal and changes tab, parked, when it has none."""
+    """Give each project its terminal and (changes on) changes tab, parked, when it has none; changes off: its
+    changes tab closes."""
     with tabs_lock():
         _ensure_project_tabs()
 
@@ -647,14 +663,18 @@ def _ensure_project_tabs():
     for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
         if not os.path.isdir(cwd) or cwd in d.get("archived", []):
             continue
+        kinds = always(cwd, d)
+        for t in project_tabs(cwd, tabs):
+            if t["kind"] == "git" and "git" not in kinds:  # changes off
+                close_tab(t["pane"])
         have = {t["kind"] for t in project_tabs(cwd, tabs)}
         repo = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-dir"], capture_output=True).returncode == 0
-        for kind in ALWAYS:
+        for kind in kinds:
             if kind not in have and (kind != "git" or repo):
                 pane = spawn_parked(cwd, kind)
                 if pane:
                     mark_tab(pane, cwd, kind)
-        if not have.issuperset(ALWAYS):
+        if not have.issuperset(kinds):
             sync_tabs(cwd)
 
 
@@ -806,6 +826,8 @@ def _restore_tabs():
             if any(t is e for e in extra):
                 continue
             if t["kind"] not in TAB_KINDS[1:] or (t["kind"] == "file" and not os.path.isfile(t.get("file") or "")):
+                continue
+            if t["kind"] == "git" and "git" not in always(cwd, d):  # changes off
                 continue
             pane = spawn_parked(cwd, t["kind"], t.get("file"))
             if not pane:
@@ -1223,8 +1245,8 @@ def remove_project(cwd):
         d["sessions"] = [s for s in d["sessions"] if s["cwd"] != cwd]
         for key in ("project_tabs", "names"):
             d.get(key, {}).pop(cwd, None)
-        d["changes_open"] = [c for c in d.get("changes_open", []) if c != cwd]
-        d["commits_open"] = [c for c in d.get("commits_open", []) if c != cwd]
+        for key in ("changes", "changes_open", "commits_open"):
+            d[key] = [c for c in d.get(key, []) if c != cwd]
     for zid in zids:
         for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
             with contextlib.suppress(OSError):
@@ -1933,7 +1955,7 @@ def cmd_html(zid, path, line, choice):
 
 PALETTE_ACTIONS = [  # (label, key hint, what: "tab ACTION", "side KEY ROW" (F12 KEY to the sidebar) or "focus")
     ("New session", "", "side n project"), ("New project…", "", "side p -"),
-    ("New terminal tab", "⌘⇧T", "tab term"), ("Changes (diff)", "", "tab git"),
+    ("New terminal tab", "⌘⇧T", "tab term"), ("Toggle changes", "", "side c project"),
     ("Terminal next to Claude", "⌘T", "tab split"), ("Hide / show sidebar", "⌘B", "tab sidebar"),
     ("Sidebar ⇄ tab", "", "focus"), ("Next session that needs you", "", "side w -"),
     ("Rename session", "", "side r session"), ("Rename project", "", "side r project"),
@@ -2206,7 +2228,7 @@ def mac_apps():
     return sorted(apps, key=lambda a: os.path.basename(a).lower())
 
 
-PALETTE_COMMON = ("side n project", "side p -", "tab term", "tab git", "side r session", "tab close")
+PALETTE_COMMON = ("side n project", "side p -", "tab term", "side r session", "tab close")
 PALETTE_USED = f"{HOME}/palette-used.json"  # what the palette picked: {key: {n, t, row}}
 
 
@@ -3546,7 +3568,7 @@ class Sidebar:
                       (v[0]["pane"], v[1]) if kind == "commit" else v["pane"])
 
     def session_of_item(self, kind, v):
-        """The session a row's t / g / c open in: its own; a project or tab row: here()."""
+        """The session a row's t / c open in: its own; a project or tab row: here()."""
         return v if kind == "session" else self.here(self.project_of(kind, v)) if kind and "pick" not in kind else None
 
     @staticmethod
@@ -4056,8 +4078,9 @@ class Sidebar:
                 archive_project(cwd)
         elif ch == ord("t") and sess:
             self.side(sess, "term", new=True)
-        elif ch == ord("g") and sess:
-            self.side(sess, "git")
+        elif ch == ord("c") and kind:  # Toggle changes (palette, right-click menu); on: they show
+            if toggle_changes(self.project_of(kind, v)) and sess:
+                self.side(sess, "git")
         elif ch in (ord("J"), ord("K")) and kind in ("project", "session"):
             self.reorder(kind, v, 1 if ch == ord("J") else -1)
         elif ch == ord("R") and kind == "session":
@@ -4084,6 +4107,11 @@ class Sidebar:
             if time.time() - getattr(self, "pressed", 0) < 1:
                 return  # the end of a press already handled: a fold must not fold back
             bstate |= curses.BUTTON1_CLICKED  # its press went elsewhere (focus moving here): the release is the click
+        if bstate & curses.BUTTON3_PRESSED:
+            self.right_pressed = time.time()
+        elif bstate & curses.BUTTON3_RELEASED and time.time() - getattr(self, "right_pressed", 0) >= 1:
+            # the menu took the release of the last right click, so curses lost this press: the release is the click
+            bstate |= curses.BUTTON3_CLICKED
         if bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
             if self.help:
                 self.help = False
@@ -4116,8 +4144,8 @@ class Sidebar:
 
     CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X / A act without asking)
                "session": [("Rename", "r", "r"), ("Restart Claude", "R", "R"), ("Close", "x", "X")],
-               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Archive", "a", "A"),
-                           ("Remove", "x", "X")]}
+               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Toggle changes", "c", "c"),
+                           ("Archive", "a", "A"), ("Remove", "x", "X")]}
 
     def context_menu(self, x, y):
         """Right click on a row: its actions as a menu; each one is the row's key, sent to the sidebar."""
@@ -4771,6 +4799,18 @@ def cmd_selftest():
         main = lambda: t("display", "-p", "-t", f"{wid}.1", "#{@zidev_side}")
         docked = lambda: len(t("list-panes", "-t", wid, "-f", "#{!=:#{pane_floating_flag},1}", "-F", "x").split())
         check("claude is the first tab", main() == "claude")
+        check("changes off by default: a terminal, no changes tab", wait(lambda: kinds() == ["term"]))
+        row = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l)
+        mouse_click(side, 3, row, button=2)  # the second right click: the first menu took its release, none gets lost
+        check("right click on a project: Toggle changes in its menu",
+              wait(lambda: b"Toggle changes" in open(f"{root}/client.out", "rb").read()))
+        client.stdin.write(b"c")
+        client.stdin.flush()
+        check("Toggle changes: on, the changes tab shows, its commits row under it",
+              wait(lambda: main() == "git" and "git" in kinds() and "commits" in t("capture-pane", "-p", "-t", side)))
+        z("tab", "claude", f"{wid}.1")
+        wait(lambda: main() == "claude")
+        cursor_to("fix the login bug")  # the right click put it on the project
         act("t")
         check("new terminal: a terminal tab, full size", wait(lambda: main() == "term" and docked() == 2 and "term" in kinds()))
         check("the sidebar lists it under the project", wait(lambda: "terminal" in t("capture-pane", "-p", "-t", side)))
@@ -5302,6 +5342,16 @@ def cmd_selftest():
         press("-l", ">echo pal-$((6*7))")
         press("Enter")
         check("palette >cmd runs it", wait(lambda: main() == "term" and "pal-42" in t("capture-pane", "-p", "-t", f"{wid}.1")))
+        mark = len(seen())
+        press("C-q")
+        wait(lambda: "Rename session" in seen()[mark:])
+        press("-l", "toggle changes")
+        press("Enter")
+        check("palette Toggle changes: off, the changes tab and its commits row go",
+              wait(lambda: "git" not in kinds() and not pane_of("git") and "commits" not in t("capture-pane", "-p", "-t", side)))
+        act("c")
+        check("Toggle changes again: on (it stays: restored after a restart, below)",
+              wait(lambda: main() == "git" and "git" in kinds()))
 
         z("tab", "select", pane_of("term"))
         wait(lambda: main() == "term")
@@ -5316,6 +5366,7 @@ def cmd_selftest():
                    and not any("prompt" in x for x in read_json(f"{home}/sessions.json", {})["sessions"])))
         t("select-window", "-t", wid)  # `new` switched to the new session
         time.sleep(1.2)
+        cursor_to("fix the login bug")  # Toggle changes left it on the project
         act("J")
         check("J moves a session down", wait(lambda: ids()[1] == zid))
         act("K")
@@ -5473,6 +5524,7 @@ def cmd_selftest():
         wid = wins().get(zid, "")
         check("restore: terminal tab back, parked", wait(lambda: pane_of("term") and main() == "claude"))
         check("two zidevs starting at once restore each tab once", wait(lambda: side_tabs() == tabs_before))
+        check("changes on stays after a restart: its changes tab is back", "git" in kinds() and bool(pane_of("git")))
         check("restore restarts claude on its claude id",
               wait(lambda: len(args().splitlines()) == n_args + 1 and status(zid)["claude_id"] in args().splitlines()[-1]))
         client = attach(wid)  # the old one ended with the server
