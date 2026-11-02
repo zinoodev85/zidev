@@ -20,3 +20,4 @@ Replaced or dropped intents from `intent.md`, one dated line each, with what rep
 - **2026-10-28** — "cmd-b. cmd-b hides / shows the sidebar." → ZI32: only cmd-b; it shows only while it asks something I started.
 - **2026-10-29** — "Stripe shows active projects. Hidden, the sidebar is a thin stripe: the projects active in the last 10 minutes, …" (ZI84) → dropped: too ugly; ZI32: hidden, nothing of it shows.
 - **2026-10-29** — "Only cmd-b. cmd-b hides / shows the sidebar; nothing else does. Only while it asks …" → ZI32: hidden, nothing of it shows: clean, no stripe.
+- **2026-11-02** — "Done only when merged. `/zidev done` checks that the task is really done: its MR is merged. If not yet, it checks again once an hour until it is." → ZI86: no MR, or closed without merge: it asks.

@@ -38,7 +38,7 @@ ZI85 **`/zidev done`.**
 `/zidev done` in a session ends its task: its todo is marked done, its folder is deleted, its project is removed (Remove). With uncommitted or unpushed work it asks first.
 
 ZI86 **Done only when merged.**
-`/zidev done` checks that the task is really done: its MR is merged. If not yet, it checks again once an hour until it is.
+`/zidev done` checks that the task is really done: its MR is merged. If not yet, it checks again once an hour until it is. No MR, or closed without merge: it asks.
 
 ## Sidebar
 
