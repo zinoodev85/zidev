@@ -429,10 +429,16 @@ def show_changes(t, file, zid, focus=True):
 
 
 def fill_window(t, wid):
-    """An empty session window (its shown tab died): tab t fills it."""
+    """An empty session window (its shown tab died): tab t fills it. A hidden sidebar is back in the
+    window for that moment: tmux joins a tab only next to a pane of the layout, not a floating one."""
+    hidden = tmux("display", "-p", "-t", f"{wid}.0", "#{pane_floating_flag}") == "1"
+    if hidden:
+        tmux("join-pane", "-d", "-s", f"{wid}.0", "-t", f"{wid}.0")
     width = int(tmux("display", "-p", "-t", wid, "#{window_width}") or 200)
     tmux("join-pane", "-d", "-h", "-l", str(max(20, width - sidebar_width() - 1)), "-s", t["pane"],
          "-t", f"{wid}.0")
+    if hidden:
+        place_sidebar(f"{wid}.0", hide=True)
 
 
 def vacate(t, wins, tabs):
@@ -487,6 +493,24 @@ def sidebar_hidden():
     return tmux("show", "-gv", "@zidev_hidden") == "1"
 
 
+def place_sidebar(pane, hide):
+    """ZI32: hidden, nothing of the sidebar shows. tmux cannot hide a pane, so it floats just past the
+    window's bottom right corner: 1 empty cell, no border (window-resized keeps it there). Shown, it is
+    back on the left at its width."""
+    geo = tmux("display", "-p", "-t", pane,
+               "#{pane_floating_flag} #{pane_active} #{window_width} #{window_height} #{window_id}")
+    if not geo:
+        return
+    floating, active, win_w, win_h, wid = geo.split()
+    if hide and floating == "0":
+        tmux_all(["set", "-p", "-t", pane, "pane-border-lines", "none"],
+                 ["break-pane", "-W", "-d", "-s", pane, "-X", win_w, "-Y", win_h, "-x", "3", "-y", "3"])
+        if active == "1":  # the keyboard goes to the tab
+            tmux("select-pane", "-t", f"{wid}.1")
+    elif not hide and floating == "1":
+        tmux("join-pane", "-d", "-f", "-h", "-b", "-l", str(sidebar_width()), "-s", pane, "-t", f"{wid}.1")
+
+
 def split_of(zid):
     """The terminal next to session zid's Claude (cmd-t), shown or parked: (pane, window) or (None, None)."""
     out = tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@zidev_side}\t#{@zidev_owner}\t#{window_id}") or ""
@@ -496,7 +520,7 @@ def split_of(zid):
 
 def settle(wid=None):
     """After the shown tab changed: Claude's side terminal is next to it only while Claude shows
-    (parked otherwise); a hidden sidebar (cmd-b) stays a sliver, a shown one keeps its width."""
+    (parked otherwise); a hidden sidebar (cmd-b) stays out of sight, a shown one keeps its width."""
     wins = session_windows()
     for zid, w in [(window_zid(wid, wins), wid)] if wid else wins.items():
         if not zid:
@@ -513,17 +537,16 @@ def settle(wid=None):
             tmux("break-pane", "-d", "-s", pane, "-t", f"{PARK}:")
         elif pane and at != w and want:
             tmux("join-pane", "-d", "-h", "-l", "40%", "-s", pane, "-t", shown["pane"])
+        place_sidebar(f"{w}.0", hide=sidebar_hidden())  # ZI32 (the sidebar shows itself while it asks)
         side = int(tmux("display", "-p", "-t", f"{w}.0", "#{pane_width}") or 0)
-        if sidebar_hidden():  # ZI32: a sliver of 1 column (the sidebar widens itself while it asks)
-            if side > 1:
-                tmux("resize-pane", "-t", f"{w}.0", "-x", "1")
-        elif side < SIDEBAR_MIN:
+        if not sidebar_hidden() and side < SIDEBAR_MIN:
             tmux("resize-pane", "-t", f"{w}.0", "-x", str(sidebar_width()))
         if want:  # 40 % of what is right of the sidebar, however the sidebar changed
-            room = tmux("display", "-p", "-t", f"{w}.0", "#{window_width} #{pane_width}")
+            room = tmux("display", "-p", "-t", f"{w}.0", "#{window_width} #{pane_width} #{pane_floating_flag}")
             if room:
-                win, bar = map(int, room.split())
-                tmux("resize-pane", "-t", split_of(zid)[0], "-x", str(max(10, (win - bar - 2) * 2 // 5)))
+                win, bar, floating = map(int, room.split())
+                right = win if floating else win - bar - 1  # right of the sidebar and its border
+                tmux("resize-pane", "-t", split_of(zid)[0], "-x", str(max(10, (right - 1) * 2 // 5)))
 
 
 def toggle_split(pane):
@@ -2986,6 +3009,10 @@ def install_tmux_hooks():
     me = shlex.join(self_argv())
     tmux("set-hook", "-gu", "window-layout-changed")  # older versions
     tmux("set-hook", "-g", "pane-exited", f"run-shell -b \"{me} tabsync\"")
+    # ZI32: a hidden sidebar floats just past its window's corner; a resized window would show it: away again
+    tmux("set-hook", "-g", "window-resized",
+         "run-shell -C \"if-shell -F -t #{window_id}.0 '##{pane_floating_flag}' "
+         "'move-pane -t #{window_id}.0 -X #{window_width} -Y #{window_height}'\"")
     for hook in ("session-window-changed", "window-pane-changed", "client-session-changed", "client-attached",
                  "client-detached", "client-light-theme", "client-dark-theme"):
         tmux("set-hook", "-g", hook, f"run-shell -b \"touch {shlex.quote(SWITCHED)}\"")
@@ -3440,9 +3467,8 @@ class Sidebar:
     def draw(self):
         self.scr.erase()
         h, w = self.scr.getmaxyx()
-        if w == 1:  # ZI32: hidden (cmd-b), a stripe
+        if w == 1:  # ZI32: hidden (cmd-b), out of sight: 1 empty cell
             self.rows, self.footer = {}, []
-            self.draw_stripe(h)
             self.scr.refresh()
             return
         if self.help:
@@ -3527,41 +3553,6 @@ class Sidebar:
         self.draw_footer(h, w)
         self.scr.refresh()
 
-    STRIPE_S = 600  # ZI84: the stripe shows the projects active in the last 10 minutes
-    URGENCY = ("waiting", "error", "working", "done", "exited", "stopped", "idle")  # the most urgent first
-
-    def active(self, s):
-        """ZI84: the session works or waits now, or its state changed in the last 10 minutes."""
-        state = self.state_of(s)[0]
-        since = self.status.get(s["id"], {}).get("since", 0)
-        return state in ("working", "waiting") or time.time() - since < self.STRIPE_S
-
-    def urgency(self, s):
-        """Lower is more urgent: needs me, error, working, done (unseen first), the rest."""
-        state, attention = self.state_of(s)
-        rank = self.URGENCY.index(state) if state in self.URGENCY else len(self.URGENCY)
-        return rank, not attention
-
-    def draw_stripe(self, h):
-        """ZI84: the hidden sidebar, 1 column: each active project as a sign, then its name top to bottom."""
-        y = 1
-        for i, (kind, cwd) in enumerate(self.items):
-            if kind != "project":
-                continue
-            active = [s for s in self.data["sessions"] if s["cwd"] == cwd and self.active(s)]
-            if not active:
-                continue
-            name = project_name(cwd)[:10]
-            if y + len(name) >= h:  # what does not fit is left out
-                break
-            sign, color, _ = self.sign_of(min(active, key=self.urgency))  # several sessions: the most urgent
-            self.put(y, 0, sign, color)
-            self.rows[y] = i  # a click on the sign or a letter opens the project
-            for n, letter in enumerate(name, 1):
-                self.put(y + n, 0, letter)
-                self.rows[y + n] = i
-            y += len(name) + 2  # a blank row between projects
-
     FOOTER = ([], [("⌘k all actions", "palette"), ("? keys", "?")])
 
     def draw_footer(self, h, w):
@@ -3591,12 +3582,11 @@ class Sidebar:
             self.put(y, 13, text[: w - 14], curses.A_DIM if not k else 0)
         self.scr.refresh()
 
-    def sign_of(self, s):
-        """A session's state as (sign, its color, a short label): the same in the sidebar and the stripe."""
+    def draw_session(self, y, w, s, base):
         state, attention = self.state_of(s)
         st = self.status.get(s["id"], {})
         c = curses.color_pair
-        return {
+        glyph, color, label = {
             "working": (SPIN[self.frame % len(SPIN)], c(4), age(st.get("since"))),
             "waiting": ("●", c(3) | curses.A_BOLD, "needs you"),
             "done": ("●" if attention else "○", c(2) if attention else curses.A_DIM,
@@ -3605,12 +3595,6 @@ class Sidebar:
             "exited": ("■", curses.A_DIM, "exited"),
             "stopped": ("–", curses.A_DIM, "stopped"),
         }.get(state, ("○", curses.A_DIM, ""))
-
-    def draw_session(self, y, w, s, base):
-        state, attention = self.state_of(s)
-        st = self.status.get(s["id"], {})
-        c = curses.color_pair
-        glyph, color, label = self.sign_of(s)
         gx, tx = (1, 3) if w < 20 else (3, 5)  # a narrow sidebar: less indent
         if s["id"] == self.my_id:
             self.put(y, 0, "▌", base | c(5))
@@ -3673,7 +3657,7 @@ class Sidebar:
         return self.asking or self.help or any(kind == "pick" for kind, _ in self.items)
 
     def ask(self, on):
-        """ZI32: a hidden sidebar shows while it asks a question, then it is a sliver again."""
+        """ZI32: a hidden sidebar shows while it asks a question, then it is out of sight again."""
         self.asking = on
         if not sidebar_hidden():
             return
@@ -3982,7 +3966,7 @@ class Sidebar:
                 kind, v = self.items[self.cursor]
                 w = self.scr.getmaxyx()[1]
                 self.save_view()  # before open: the window it switches to shows the list just like this
-                if kind == "project" and x <= 2 and w > 1:  # its ▸ / ▾ (the stripe has none)
+                if kind == "project" and x <= 2:  # its ▸ / ▾
                     self.fold(v)
                 elif kind == "tab" and v["kind"] == "git" and x >= w - 3:
                     self.fold_changes(v["project"])
@@ -4022,20 +4006,21 @@ class Sidebar:
         subprocess.Popen(["tmux", "-L", SOCKET, *menu], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def fix_width(self, drag=False):
-        """Keep the sidebar at its saved width; hidden (cmd-b), a sliver of 1 column, except while it
-        asks (ZI32). A resize while the window keeps its width is a drag of the border: that width is
+        """Keep the sidebar at its saved width; hidden (cmd-b), out of sight, except while it asks
+        (ZI32). A resize while the window keeps its width is a drag of the border: that width is
         saved (for every session) instead."""
-        size = tmux("display", "-p", "-t", self.pane, "#{pane_width} #{window_width}")
+        hidden, asked = sidebar_hidden(), self.asks()
+        place_sidebar(self.pane, hide=hidden and not asked)
+        size = tmux("display", "-p", "-t", self.pane, "#{pane_width} #{window_width} #{pane_floating_flag}")
         if not size:
             return
-        pane_w, win_w = map(int, size.split())
-        hidden, asked = sidebar_hidden(), self.asks()
-        want = 1 if hidden and not asked else sidebar_width()
+        pane_w, win_w, floating = map(int, size.split())
+        want = sidebar_width()
         if drag and not hidden and win_w == self.win_w and pane_w != want:
             conf = read_json(CONFIG, {})
             conf["sidebar_w"] = want = max(SIDEBAR_MIN, min(pane_w, win_w - 20))
             write_json(CONFIG, conf)
-        if pane_w != want and win_w > want + 20:
+        if not floating and pane_w != want and win_w > want + 20:
             tmux("resize-pane", "-t", self.pane, "-x", str(want))
         if hidden and asked and not self.asked:  # shown to ask: the keyboard comes here
             tmux("select-pane", "-t", self.pane)
@@ -4144,10 +4129,10 @@ class Sidebar:
             return
         self.focused, shown, self.visible = flags[2] == "1", self.visible, True
         self.load(snap)
-        if not shown or self.asks() != self.asked:  # ZI32: shown for a question, a sliver again after it
+        if not shown or self.asks() != self.asked:  # ZI32: shown for a question, hidden again after it
             self.fix_width()
-        if self.focused and not self.asks() and self.scr.getmaxyx()[1] == 1:  # a sliver takes no keys
-            tmux("select-pane", "-R", "-t", self.pane)
+        if self.focused and not self.asks() and self.scr.getmaxyx()[1] == 1:  # hidden, it takes no keys
+            tmux("select-pane", "-t", f"{tmux('display', '-p', '-t', self.pane, '#{window_id}')}.1")
         if not shown:
             self.adopt_view()
             me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
@@ -4689,7 +4674,8 @@ def cmd_selftest():
                    and "pnpm greet" in t("capture-pane", "-p", "-t", f"{wid}.1"), 20))
         check("the same terminal, not a new one", kinds().count("term") == terms)
         # the palette's tabs (⇥ / ⇧⇥): Text finds lines in the files, Apps the Mac's apps; Google is the last row
-        floats = lambda: t("list-panes", "-t", wid, "-f", "#{pane_floating_flag}", "-F", "#{pane_id} #{@zidev_label}")
+        floats = lambda: t("list-panes", "-t", wid, "-f", "#{&&:#{pane_floating_flag},#{pane_index}}",  # not a hidden sidebar
+                           "-F", "#{pane_id} #{@zidev_label}")
         floating = lambda: t("capture-pane", "-p", "-t", floats().split()[0]) if floats() else ""
 
         def opened():  # what was last given to the default app / browser
@@ -4807,31 +4793,37 @@ def cmd_selftest():
         check("cmd-↓ skips the changes tab", main() == "term")
         side_w = lambda: t("display", "-p", "-t", side, "#{pane_width}")
         keys_in = lambda: t("display", "-p", "-t", wid, "#{pane_id}") == t("display", "-p", "-t", side, "#{pane_id}")
+        def hidden():  # ZI32: nothing of it shows: it floats past the window's corner, the tab has all the width
+            geo = t("display", "-p", "-t", side, "#{pane_floating_flag} #{pane_left} #{pane_top} #{window_width} #{window_height}")
+            if not geo:
+                return False
+            floating, left, top, win_w, win_h = map(int, geo.split())
+            return (floating == 1 and left >= win_w and top >= win_h
+                    and t("display", "-p", "-t", f"{wid}.1", "#{pane_left}") == "0")
         width = side_w()
         z("tab", "sidebar", pane_of("term"))
-        check("cmd-b hides the sidebar: a sliver", wait(lambda: side_w() == "1") and not keys_in())
-        stripe = lambda: "".join(l[:1] or " " for l in t("capture-pane", "-p", "-t", side).splitlines())
-        check("ZI84: the stripe shows the working project, its name top to bottom under a spinner",
-              wait(lambda: re.match(f"[{SPIN}]proj( |$)", stripe())))  # t() strips the blank top row
-        mouse_click(side, 0, 3)
-        check("ZI84: a click on its name opens its session used last, the stripe stays",
-              wait(lambda: main() == "claude") and side_w() == "1")
+        check("cmd-b hides the sidebar: nothing of it shows", wait(hidden) and not keys_in())
         z("tab", "select", pane_of("claude"))
-        check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(lambda: side_w() == "1"))
+        check("it stays hidden on another tab", wait(lambda: main() == "claude") and wait(hidden))
+        z("tab", "term", pane_of("claude"))
+        wait(lambda: main() == "term")
+        t("send-keys", "-t", t("display", "-p", "-t", f"{wid}.1", "#{pane_id}"), "exit", "Enter")
+        check("its shell ends while hidden: the tab before fills the window, still hidden",
+              wait(lambda: main() == "claude") and wait(hidden))
         t("resize-window", "-t", wid, "-x", "180", "-y", "50")
         time.sleep(1)
         t("resize-window", "-t", wid, "-x", "200", "-y", "50")
-        check("it stays hidden when the window resizes", wait(lambda: side_w() == "1"))
+        check("it stays hidden when the window resizes", wait(hidden))
         z("open", "README.md", extra={"TMUX_PANE": f"{wid}.1"})
-        check("a preview floats over it, it stays hidden", wait(lambda: "README.md" in floats()) and side_w() == "1")
+        check("a preview floats over it, it stays hidden", wait(lambda: "README.md" in floats()) and hidden())
         t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
         wait(lambda: not floats())
         act("p")
         check("ZI32: a question shows it, with the keys",
               wait(lambda: side_w() == width and "esc cancel" in t("capture-pane", "-p", "-t", side)) and keys_in())
         t("send-keys", "-t", side, "Escape")
-        check("after the question a sliver again, the keys back in the tab",
-              wait(lambda: side_w() == "1") and wait(lambda: not keys_in()))
+        check("after the question hidden again, the keys back in the tab",
+              wait(hidden) and wait(lambda: not keys_in()))
         z("tab", "sidebar", pane_of("claude"))
         check("cmd-b shows it again", wait(lambda: side_w() == width))
         sides = lambda: t("list-panes", "-t", wid, "-F", "#{@zidev_side}").split()
@@ -4843,7 +4835,7 @@ def cmd_selftest():
         check("Claude again: its terminal is back", wait(lambda: main() == "claude" and "split" in sides()))
         z("tab", "sidebar", pane_of("claude"))
         check("hidden sidebar keeps the terminal",
-              wait(lambda: t("display", "-p", "-t", f"{wid}.0", "#{pane_width}") == "1") and "split" in sides())
+              wait(hidden) and "split" in sides())
         z("tab", "sidebar", pane_of("claude"))
         check("shown again, its width as before", wait(lambda: t("display", "-p", "-t", f"{wid}.0", "#{pane_width}") == width))
         z("tab", "split", pane_of("claude"))
