@@ -34,6 +34,9 @@ An agent skill (~/.claude/skills/zidev) explains zidev to agents; zidev rewrites
 ZI82 **Archived runs nothing.**
 An archived project takes no resources: its sessions, tabs and what they started stop; nothing watches it.
 
+ZI85 **`/zidev done`.**
+`/zidev done` in a session ends its task: its todo is marked done, its folder is deleted, its project is removed (Remove). With uncommitted or unpushed work it asks first.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
