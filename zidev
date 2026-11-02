@@ -11,7 +11,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
   zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
-  zidev done [DIR] [--check | --force]   task finished: remove the project, delete its folder (not while that loses work)
+  zidev done [DIR] [--check | --force]   task finished: remove the project, delete its folder (not while its MR is open or that loses work)
   zidev list [--json]  print sessions and their status
   zidev kill         stop the tmux server (sessions stay saved, restored on next start)
   zidev reload       load new zidev code into a running server (Claude sessions keep running)
@@ -66,7 +66,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -857,8 +857,12 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
 ## `/zidev done`: the task is finished (the skill called with `done`)
 
 Do these steps in order, nothing after them:
-1. `zidev done --check`: what deleting this project's folder would lose (uncommitted changes, unpushed commits,
-   stashes). If it lists anything, show it to the user and ask; without their yes stop here.
+1. `zidev done --check`: is the task really done (its MR is merged), and what would deleting this project's
+   folder lose (uncommitted changes, unpushed commits, stashes).
+   - It says `not merged yet: <MR>`: tell the user, check again once an hour (the loop skill with
+     `1h /zidev done`, started once: not when that loop runs already) and stop here.
+   - It lists anything else (no MR, MR closed, work that would be lost): show it to the user and ask; without
+     their yes stop here.
 2. If a todo works on this folder (the todo skill; `zidev: <this folder>` in its todo.md), mark it done with
    that skill (Done).
 3. `zidev done --force`: removes the project (its sessions and tabs stop, this one too) and deletes its folder.
@@ -1258,9 +1262,42 @@ def cmd_archive(args, on=True):
     print(f"archived {project_name(cwd)}" + (f", {stopped} processes it left running stopped" if stopped else ""))
 
 
-def done_risks(cwd):
+def branch_mr(cwd):
+    """ZI86: the newest MR (GitLab) or pull request (GitHub) of the folder's branch: its state (merged, open,
+    closed, none, unknown), a line that says it, the branch, when it was merged."""
+    import urllib.parse
+    branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
+    mr = {"state": "none", "text": f"no MR for the branch {branch}", "branch": branch, "merged_at": None}
+    if not branch:
+        return {**mr, "text": "not on a branch: no MR"}
+    remote = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True).stdout
+    if "github.com" in remote:
+        ask = ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "state,url,mergedAt"]
+    else:
+        ask = ["glab", "api", "projects/:fullpath/merge_requests?per_page=1&source_branch="
+               + urllib.parse.quote(branch, safe="")]
+    if not shutil.which(ask[0]):
+        return {**mr, "state": "unknown", "text": f"its MR unknown: {ask[0]} is not installed"}
+    r = subprocess.run(ask, cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        why = (r.stderr.strip().splitlines() or ["no answer"])[-1]
+        return {**mr, "state": "unknown", "text": f"its MR unknown: {ask[0]}: {why}"}
+    found = json.loads(r.stdout or "[]")
+    if not found:
+        return mr
+    url = found[0].get("web_url") or found[0].get("url")
+    state = found[0]["state"].lower()  # GitLab: opened / merged / closed / locked, GitHub: OPEN / MERGED / CLOSED
+    if state == "merged":
+        return {**mr, "state": "merged", "text": f"its MR is merged: {url}",
+                "merged_at": found[0].get("merged_at") or found[0].get("mergedAt")}
+    if state == "closed":
+        return {**mr, "state": "closed", "text": f"its MR is closed, not merged: {url}"}
+    return {**mr, "state": "open", "text": f"not merged yet: {url}"}
+
+
+def done_risks(cwd, mr):
     """ZI85: what deleting a project's folder would lose: uncommitted changes, unpushed commits, stashes.
-    A folder not in git, or only a part of a repo: all of it."""
+    A folder not in git, or only a part of a repo: all of it. ZI86: its MR not merged (none, closed) too."""
     if not os.path.isdir(cwd):
         return []
     git = lambda *a: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True).stdout.splitlines()
@@ -1269,14 +1306,17 @@ def done_risks(cwd):
         return ["not in git: all of it"]
     if os.path.realpath(top[0]) != cwd:
         return [f"a part of the repo {top[0]}: deleting it changes that repo"]
-    risks = [f"uncommitted: {line}" for line in git("status", "--porcelain")]
+    risks = [] if mr["state"] == "merged" else [mr["text"]]
+    risks += [f"uncommitted: {line}" for line in git("status", "--porcelain")]
     if os.path.isfile(f"{cwd}/.git"):  # a linked work tree: its commits stay in its main repo
         return risks
     main = git("rev-parse", "--abbrev-ref", "origin/HEAD")  # the remote's main branch, e.g. origin/master
     for branch in git("for-each-ref", "--format=%(refname:short)", "refs/heads"):
         # merged already: the same change is in the main branch (git cherry marks it -), e.g. a rebased merge
         merged = {line[2:] for line in git("cherry", main[0], branch) if line.startswith("- ")} if main else set()
-        for line in git("log", "--format=%H %h %s", branch, "--not", "--remotes"):
+        # ZI86: the branch of a merged MR: its commits up to the merge are in it (a squash merge too)
+        since = [f"--since={mr['merged_at']}"] if branch == mr["branch"] and mr["state"] == "merged" else []
+        for line in git("log", "--format=%H %h %s", *since, branch, "--not", "--remotes"):
             commit, shown = line.split(" ", 1)
             if commit not in merged:
                 risks.append(f"unpushed on {branch}: {shown}")
@@ -1299,8 +1339,8 @@ def finish_project(cwd):
 
 def cmd_done(args):
     """zidev done [DIR] [--check | --force]: ZI85, the task is finished: the project is removed and its folder
-    deleted. DIR: this session's project by default. Nothing happens while deleting would lose work, it says
-    what (--check: only say it; --force: delete anyway)."""
+    deleted. DIR: this session's project by default. Nothing happens while its MR is not merged (ZI86) or
+    deleting would lose work, it says what (--check: only say it; --force: delete anyway)."""
     check, force = "--check" in args, "--force" in args
     rest = [a for a in args if a not in ("--check", "--force", "--now")]
     cwd = os.path.realpath(os.path.expanduser(rest[0]) if rest else this_project())
@@ -1312,12 +1352,15 @@ def cmd_done(args):
         except Exception:
             log(f"done: {traceback.format_exc()}")
         return
-    risks = [] if force else done_risks(cwd)
+    mr = None if force else branch_mr(cwd)
+    if mr and mr["state"] == "open":
+        sys.exit(mr["text"])  # ZI86: the skill checks again in an hour
+    risks = [] if force else done_risks(cwd, mr)
     if risks:
         more = f"\n  … {len(risks) - 20} more" if len(risks) > 20 else ""
-        sys.exit(f"deleting {cwd} would lose:\n  " + "\n  ".join(risks[:20]) + more)
+        sys.exit(f"ask before deleting {cwd}:\n  " + "\n  ".join(risks[:20]) + more)
     if check:
-        print(f"nothing is lost by deleting {cwd}")
+        print(f"nothing is lost by deleting {cwd}; {mr['text']}")
         return
     # on its own: removing the project stops the session that called this (Claude's /zidev done)
     subprocess.Popen(self_argv("done", cwd, "--now"), cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
@@ -5471,32 +5514,59 @@ def cmd_selftest():
         subprocess.run(["git", "clone", "-q", origin, proj4], check=True, capture_output=True)
         git4 = lambda *a: subprocess.run(["git", "-C", proj4, "-c", "commit.gpgsign=false", "-c", "user.name=t",
                                           "-c", "user.email=t@t", *a], capture_output=True)
+        # ZI86: GitLab's answer about the branch's MR, from a stand-in glab
+        os.makedirs(f"{root}/bin")
+        with open(f"{root}/bin/glab", "w") as f:
+            f.write(f"#!/bin/sh\ncat {root}/mr.json\n")
+        os.chmod(f"{root}/bin/glab", 0o755)
+
+        def mr(state, merged_at=None):
+            with open(f"{root}/mr.json", "w") as f:
+                json.dump([{"state": state, "web_url": "https://gitlab.test/mr/1", "merged_at": merged_at}]
+                          if state else [], f)
+
+        with_glab = {"PATH": f"{root}/bin:{env['PATH']}"}
+        done = lambda *a: z("done", proj4, *a, extra=with_glab)
         with open(f"{proj4}/a.txt", "w") as f:
             f.write("a\n")
         z("new", proj4)
         zid4 = next(x["id"] for x in json.load(open(f"{home}/sessions.json"))["sessions"] if x["cwd"] == proj4)
         wait(lambda: zid4 in wins())
-        r = z("done", proj4)
-        check("zidev done with uncommitted work: nothing happens, it says what",
-              r.returncode == 1 and "uncommitted: ?? a.txt" in r.stderr and os.path.isdir(proj4) and zid4 in wins())
+        mr(None)
+        r = done()
+        check("zidev done with uncommitted work and no MR: nothing happens, it says what",
+              r.returncode == 1 and "uncommitted: ?? a.txt" in r.stderr and "no MR for the branch" in r.stderr
+              and os.path.isdir(proj4) and zid4 in wins())
         git4("add", "a.txt")
         git4("commit", "-qm", "a")
         git4("push", "-q", "origin", "HEAD")
         git4("remote", "set-head", "origin", "-a")
-        check("zidev done --check: pushed, nothing is lost", z("done", proj4, "--check").returncode == 0)
+        mr("merged", "2000-01-01T00:00:00.000Z")
+        check("zidev done --check: its MR merged, pushed, nothing is lost", done("--check").returncode == 0)
         git4("switch", "-qc", "feat")
         with open(f"{proj4}/b.txt", "w") as f:
             f.write("b\n")
         git4("add", "b.txt")
         git4("commit", "-qm", "b")
-        r = z("done", proj4, "--check")
-        check("zidev done --check: a commit not pushed", r.returncode == 1 and "unpushed on feat: " in r.stderr)
+        mr("opened")
+        r = done()
+        check("zidev done: its MR not merged yet: nothing happens, it says so",
+              r.returncode == 1 and "not merged yet: https://gitlab.test/mr/1" in r.stderr and os.path.isdir(proj4))
+        mr("closed")
+        check("zidev done --check: its MR closed, not merged: it says so",
+              "its MR is closed, not merged" in done("--check").stderr)
+        mr("merged", "2000-01-01T00:00:00.000Z")
+        r = done("--check")
+        check("zidev done --check: a commit after its MR's merge, not pushed", r.returncode == 1 and "unpushed on feat: " in r.stderr)
+        mr("merged", "2099-01-01T00:00:00.000Z")
+        check("zidev done --check: its commits before the merge are in its MR (a squash merge), nothing is lost",
+              done("--check").returncode == 0)
         git4("switch", "-q", "-")
         git4("cherry-pick", "feat")  # as a rebased merge: the same change, another commit
         git4("push", "-q", "origin", "HEAD")
-        check("zidev done --check: its change is in the main branch, nothing is lost",
-              z("done", proj4, "--check").returncode == 0)
-        z("done", extra={"ZIDEV_ID": zid4})  # from its own session, as /zidev done does
+        mr("merged", "2000-01-01T00:00:00.000Z")
+        check("zidev done --check: its change is in the main branch, nothing is lost", done("--check").returncode == 0)
+        z("done", extra={**with_glab, "ZIDEV_ID": zid4})  # from its own session, as /zidev done does
         check("zidev done: its project is removed, its folder deleted",
               wait(lambda: not os.path.exists(proj4) and zid4 not in wins()
                    and proj4 not in json.load(open(f"{home}/sessions.json"))["projects"]))
