@@ -11,6 +11,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
   zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
+  zidev done [DIR] [--check | --force]   task finished: remove the project, delete its folder (not while that loses work)
   zidev list [--json]  print sessions and their status
   zidev kill         stop the tmux server (sessions stay saved, restored on next start)
   zidev reload       load new zidev code into a running server (Claude sessions keep running)
@@ -831,7 +832,7 @@ def show_window(wid):
 SKILL_DIR = os.environ.get("ZIDEV_SKILL_DIR") or os.path.expanduser("~/.claude/skills/zidev")
 SKILL = """---
 name: zidev
-description: What zidev is and how to work inside it. Use when running in a zidev session (env ZIDEV_ID is set), when the user mentions zidev, its sidebar, tabs, preview or changes tab, or asks to rename the project, show them a file, or open a new session.
+description: What zidev is and how to work inside it. Use when running in a zidev session (env ZIDEV_ID is set), when the user mentions zidev, its sidebar, tabs, preview or changes tab, asks to rename the project, show them a file, or open a new session, or says /zidev done (the task is finished).
 ---
 
 # zidev
@@ -852,6 +853,15 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
 - A new session in another folder: `zidev new DIR`. Give it its task right away: `zidev new DIR --prompt "…"`
   (Claude's first message, sent when the session starts).
 - Sessions and their status: `zidev list --json`.
+
+## `/zidev done`: the task is finished (the skill called with `done`)
+
+Do these steps in order, nothing after them:
+1. `zidev done --check`: what deleting this project's folder would lose (uncommitted changes, unpushed commits,
+   stashes). If it lists anything, show it to the user and ask; without their yes stop here.
+2. If a todo works on this folder (the todo skill; `zidev: <this folder>` in its todo.md), mark it done with
+   that skill (Done).
+3. `zidev done --force`: removes the project (its sessions and tabs stop, this one too) and deletes its folder.
 
 ## Do not
 
@@ -997,14 +1007,19 @@ def rename_project(cwd, name):
             names.pop(cwd, None)
 
 
+def this_project():
+    """The project of the session this runs in, else the current folder."""
+    own = next((s["cwd"] for s in load_state()["sessions"] if s["id"] == os.environ.get("ZIDEV_ID")), None)
+    return own or os.getcwd()
+
+
 def cmd_rename_project(args):
     """zidev rename-project [PATH] NAME: PATH defaults to this session's project (else the current folder)."""
     if not args:
         sys.exit("usage: zidev rename-project [PATH] NAME   (NAME \"\" gives back the folder's name)")
     d = load_state()
     if len(args) == 1:
-        own = next((s["cwd"] for s in d["sessions"] if s["id"] == os.environ.get("ZIDEV_ID")), None)
-        path, name = own or os.getcwd(), args[0]
+        path, name = this_project(), args[0]
     else:
         path, name = args[0], " ".join(args[1:])
     cwd = os.path.realpath(path)
@@ -1243,6 +1258,73 @@ def cmd_archive(args, on=True):
     print(f"archived {project_name(cwd)}" + (f", {stopped} processes it left running stopped" if stopped else ""))
 
 
+def done_risks(cwd):
+    """ZI85: what deleting a project's folder would lose: uncommitted changes, unpushed commits, stashes.
+    A folder not in git, or only a part of a repo: all of it."""
+    if not os.path.isdir(cwd):
+        return []
+    git = lambda *a: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True).stdout.splitlines()
+    top = git("rev-parse", "--show-toplevel")
+    if not top:
+        return ["not in git: all of it"]
+    if os.path.realpath(top[0]) != cwd:
+        return [f"a part of the repo {top[0]}: deleting it changes that repo"]
+    risks = [f"uncommitted: {line}" for line in git("status", "--porcelain")]
+    if os.path.isfile(f"{cwd}/.git"):  # a linked work tree: its commits stay in its main repo
+        return risks
+    main = git("rev-parse", "--abbrev-ref", "origin/HEAD")  # the remote's main branch, e.g. origin/master
+    for branch in git("for-each-ref", "--format=%(refname:short)", "refs/heads"):
+        # merged already: the same change is in the main branch (git cherry marks it -), e.g. a rebased merge
+        merged = {line[2:] for line in git("cherry", main[0], branch) if line.startswith("- ")} if main else set()
+        for line in git("log", "--format=%H %h %s", branch, "--not", "--remotes"):
+            commit, shown = line.split(" ", 1)
+            if commit not in merged:
+                risks.append(f"unpushed on {branch}: {shown}")
+    risks += [f"stash: {line}" for line in git("stash", "list")]
+    return risks
+
+
+def finish_project(cwd):
+    """ZI85: the project out of zidev (its sessions and tabs stop), then its folder deleted. A linked git
+    work tree is also taken out of its main repo."""
+    common = None
+    if os.path.isfile(f"{cwd}/.git"):
+        common = subprocess.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True).stdout.strip()
+    remove_project(cwd)
+    shutil.rmtree(cwd, ignore_errors=True)
+    if common:
+        subprocess.run(["git", "--git-dir", common, "worktree", "prune"], capture_output=True)
+
+
+def cmd_done(args):
+    """zidev done [DIR] [--check | --force]: ZI85, the task is finished: the project is removed and its folder
+    deleted. DIR: this session's project by default. Nothing happens while deleting would lose work, it says
+    what (--check: only say it; --force: delete anyway)."""
+    check, force = "--check" in args, "--force" in args
+    rest = [a for a in args if a not in ("--check", "--force", "--now")]
+    cwd = os.path.realpath(os.path.expanduser(rest[0]) if rest else this_project())
+    if cwd not in load_state()["projects"]:
+        sys.exit(f"not a zidev project: {cwd}")
+    if "--now" in args:  # the detached part, below
+        try:
+            finish_project(cwd)
+        except Exception:
+            log(f"done: {traceback.format_exc()}")
+        return
+    risks = [] if force else done_risks(cwd)
+    if risks:
+        more = f"\n  … {len(risks) - 20} more" if len(risks) > 20 else ""
+        sys.exit(f"deleting {cwd} would lose:\n  " + "\n  ".join(risks[:20]) + more)
+    if check:
+        print(f"nothing is lost by deleting {cwd}")
+        return
+    # on its own: removing the project stops the session that called this (Claude's /zidev done)
+    subprocess.Popen(self_argv("done", cwd, "--now"), cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print(f"done: {project_name(cwd)} is removed, {cwd} deleted")
+
+
 def cmd_new(args):
     prompt = None
     if "--prompt" in args:
@@ -1278,6 +1360,7 @@ def cmd_reload():
     Claude and terminal panes keep running (R in the sidebar restarts a Claude)."""
     if not server_running():
         sys.exit("zidev is not running")
+    install_skill()  # its text is new code too
     tmux("source-file", TMUX_CONF)
     install_tmux_hooks()
     out = tmux("list-panes", "-s", "-t", SESSION, "-F",
@@ -5379,6 +5462,41 @@ def cmd_selftest():
         z("unarchive", proj2)
         check("unarchive: session and terminal back",
               wait(lambda: len(wins()) == n_wins and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        # ZI85: zidev done: not while it would lose work; then the project is removed and its folder deleted
+        origin, proj4 = f"{root}/origin.git", os.path.realpath(root) + "/proj4"
+        subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+        subprocess.run(["git", "clone", "-q", origin, proj4], check=True, capture_output=True)
+        git4 = lambda *a: subprocess.run(["git", "-C", proj4, "-c", "commit.gpgsign=false", "-c", "user.name=t",
+                                          "-c", "user.email=t@t", *a], capture_output=True)
+        with open(f"{proj4}/a.txt", "w") as f:
+            f.write("a\n")
+        z("new", proj4)
+        zid4 = next(x["id"] for x in json.load(open(f"{home}/sessions.json"))["sessions"] if x["cwd"] == proj4)
+        wait(lambda: zid4 in wins())
+        r = z("done", proj4)
+        check("zidev done with uncommitted work: nothing happens, it says what",
+              r.returncode == 1 and "uncommitted: ?? a.txt" in r.stderr and os.path.isdir(proj4) and zid4 in wins())
+        git4("add", "a.txt")
+        git4("commit", "-qm", "a")
+        git4("push", "-q", "origin", "HEAD")
+        git4("remote", "set-head", "origin", "-a")
+        check("zidev done --check: pushed, nothing is lost", z("done", proj4, "--check").returncode == 0)
+        git4("switch", "-qc", "feat")
+        with open(f"{proj4}/b.txt", "w") as f:
+            f.write("b\n")
+        git4("add", "b.txt")
+        git4("commit", "-qm", "b")
+        r = z("done", proj4, "--check")
+        check("zidev done --check: a commit not pushed", r.returncode == 1 and "unpushed on feat: " in r.stderr)
+        git4("switch", "-q", "-")
+        git4("cherry-pick", "feat")  # as a rebased merge: the same change, another commit
+        git4("push", "-q", "origin", "HEAD")
+        check("zidev done --check: its change is in the main branch, nothing is lost",
+              z("done", proj4, "--check").returncode == 0)
+        z("done", extra={"ZIDEV_ID": zid4})  # from its own session, as /zidev done does
+        check("zidev done: its project is removed, its folder deleted",
+              wait(lambda: not os.path.exists(proj4) and zid4 not in wins()
+                   and proj4 not in json.load(open(f"{home}/sessions.json"))["projects"]))
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
@@ -5428,6 +5546,8 @@ def main():
         cmd_rename_project(args[1:])
     elif cmd in ("archive", "unarchive"):
         cmd_archive(args[1:], cmd == "archive")
+    elif cmd == "done":
+        cmd_done(args[1:])
     elif cmd == "list":
         cmd_list(args[1:])
     elif cmd == "status":
