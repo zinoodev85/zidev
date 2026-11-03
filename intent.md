@@ -141,8 +141,8 @@ The clipboard is the only thing zidev checks on a timer, every 0.5 s.
 ZI27 **Tabs belong to the project.**
 Tabs (terminal, git, files) belong to the project, shared by all its sessions, listed under the project.
 
-ZI28 **Always a terminal.**
-Every project always has a terminal. Changes (its tab with the commits row) are off by default; "Toggle changes" in the palette (shift-shift / cmd-k) or the right-click menu turns them on / off per project, and that stays.
+ZI28 **Starts with one Claude session.**
+A new project starts with one Claude session, nothing else; a terminal comes with cmd-shift-t and closes like any tab. Changes (its tab with the commits row) are off by default; "Toggle changes" in the palette (shift-shift / cmd-k) or the right-click menu turns them on / off per project, and that stays.
 
 ZI29 **Full screen, never split.**
 Tabs are always full screen, never split — except Claude: cmd-t puts a terminal next to it (cmd-t again: away). cmd-shift-t: a new terminal tab under the project.

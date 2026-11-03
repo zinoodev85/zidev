@@ -596,13 +596,15 @@ def cycle_tab(pane, delta, items=False):
 
 
 def close_tab(pane):
-    """Close a tab (never a Claude); its window shows the tab used before it. A project's own
-    terminal and (changes on) changes tab stay: they restart, parked."""
+    """Close a tab (never a Claude); its window shows the tab used before it. The changes tab: its
+    project's changes go off (ZI28)."""
     tabs, wins = all_tabs(), session_windows()
     t = find_tab(pane, tabs)
     if not t or t["kind"] == "claude":
         return
-    keep = t["kind"] in always(t["project"]) and [x["pane"] for x in project_tabs(t["project"], tabs) if x["kind"] == t["kind"]] == [pane]
+    if t["kind"] == "git":  # changes off: no new one is made for it
+        with edit_state() as d:
+            d["changes"] = [c for c in d.get("changes", []) if c != t["project"]]
     if t["visible"] and not t["float"]:
         zid = window_zid(t["window"], wins)
         rest = [x for x in window_choices(zid, tabs) if x["pane"] != pane and not x["visible"]]
@@ -612,19 +614,15 @@ def close_tab(pane):
             tmux("set", "-p", "-t", nxt["pane"], "@zidev_used", str(next_seq()))
             if tmux("display", "-p", "-t", pane, "#{pane_active}") == "1":
                 tmux("select-pane", "-t", nxt["pane"])
-    if keep:
-        sync_tabs(t["project"])
-        tmux_all(["set", "-p", "-t", pane, "@zidev_file", ""],  # last: may be this very process
-                 ["respawn-pane", "-k", "-t", pane, "-c", t["project"], tab_cmd(t["kind"], t["project"])])
-        return
     tmux("kill-pane", "-t", pane)
     settle(t["window"])
     sync_tabs(t["project"])
 
 
 def always(cwd, d=None):
-    """The tabs a project always has: a terminal; a changes tab (in a git repo) while its changes are on (ZI28)."""
-    return ("term", "git") if cwd in (d or load_state()).get("changes", []) else ("term",)
+    """The tabs a project always has: a changes tab (in a git repo) while its changes are on (ZI28); a new
+    project has only its Claude session."""
+    return ("git",) if cwd in (d or load_state()).get("changes", []) else ()
 
 
 def toggle_changes(cwd):
@@ -649,8 +647,8 @@ def tabs_lock():
 
 
 def ensure_project_tabs():
-    """Give each project its terminal and (changes on) changes tab, parked, when it has none; changes off: its
-    changes tab closes."""
+    """Give each project with changes on its changes tab, parked, when it has none; changes off: its changes
+    tab closes."""
     with tabs_lock():
         _ensure_project_tabs()
 
@@ -2398,6 +2396,7 @@ def leave_tab():
     """End of a tab's process: the tab used before it takes its place."""
     pane = os.environ.get("TMUX_PANE")
     if pane and find_tab(pane):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)  # its pane goes: close_tab still saves the tabs after
         close_tab(pane)
 
 
@@ -3066,7 +3065,10 @@ def cmd_tab(args):
         t = find_tab(pane) or (floating_in(session_windows().get(zid)) if zid else None)
         if t:
             close_tab(t["pane"])
-    elif action == "git" and zid:
+    elif action == "git" and zid:  # changes off: they go on (ZI28)
+        cwd = session_of(zid).get("cwd")
+        if "git" not in always(cwd):
+            toggle_changes(cwd)
         show_kind(zid, "git")
     elif action in ("esc", "enter"):  # in the floating preview, a file or changes tab
         tty = tmux("display", "-p", "-t", pane, "#{pane_tty}") or ""
@@ -4799,7 +4801,10 @@ def cmd_selftest():
         main = lambda: t("display", "-p", "-t", f"{wid}.1", "#{@zidev_side}")
         docked = lambda: len(t("list-panes", "-t", wid, "-f", "#{!=:#{pane_floating_flag},1}", "-F", "x").split())
         check("claude is the first tab", main() == "claude")
-        check("changes off by default: a terminal, no changes tab", wait(lambda: kinds() == ["term"]))
+        check("a new project: only its Claude session, no terminal, no changes tab", wait(lambda: kinds() == []))
+        act("t")
+        check("new terminal: a terminal tab, full size", wait(lambda: main() == "term" and docked() == 2 and "term" in kinds()))
+        check("the sidebar lists it under the project", wait(lambda: "terminal" in t("capture-pane", "-p", "-t", side)))
         row = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side).splitlines()) if "proj" in l)
         mouse_click(side, 3, row, button=2)  # the second right click: the first menu took its release, none gets lost
         check("right click on a project: Toggle changes in its menu",
@@ -4808,12 +4813,9 @@ def cmd_selftest():
         client.stdin.flush()
         check("Toggle changes: on, the changes tab shows, its commits row under it",
               wait(lambda: main() == "git" and "git" in kinds() and "commits" in t("capture-pane", "-p", "-t", side)))
-        z("tab", "claude", f"{wid}.1")
-        wait(lambda: main() == "claude")
+        z("tab", "select", pane_of("term"))
+        wait(lambda: main() == "term")
         cursor_to("fix the login bug")  # the right click put it on the project
-        act("t")
-        check("new terminal: a terminal tab, full size", wait(lambda: main() == "term" and docked() == 2 and "term" in kinds()))
-        check("the sidebar lists it under the project", wait(lambda: "terminal" in t("capture-pane", "-p", "-t", side)))
         # the palette (cmd-k; here ctrl-q): a popup, short until something is typed
         def press(*keys):  # keys from the client; not waited for: the palette's popup holds the key's command
             subprocess.Popen(["tmux", "-L", sock, "send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0],
@@ -4835,7 +4837,7 @@ def cmd_selftest():
         check("typing finds scripts and files",  # not "Restart": what is on screen already is not drawn again
               wait(lambda: all(x in seen()[mark:] for x in ("greet", "README.md"))))
         press("BSpace", "BSpace")  # ctrl-u scrolls the preview here
-        terms = kinds().count("term")  # the project's own and the new one
+        terms = kinds().count("term")  # the one made above
         press("-l", "greet")
         press("Enter")
         check("a script from the palette runs in the terminal tab",
@@ -5079,12 +5081,11 @@ def cmd_selftest():
         time.sleep(0.5)
         t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Escape")
         time.sleep(0.5)
-        check("esc closes it; it stays, parked", wait(lambda: not git() and kinds().count("git") == 1))
+        check("esc closes it: changes off", wait(lambda: not git() and "git" not in kinds()))
         z("tab", "git", term)
-        check("g again: the same tab, no second one", wait(lambda: bool(git())) and kinds().count("git") == 1)
+        check("g again: changes on, one changes tab", wait(lambda: bool(git())) and kinds().count("git") == 1)
         z("tab", "close", git())
-        check("closing it shows the terminal again; it stays, parked",
-              wait(lambda: main() == "term" and kinds().count("git") == 1))
+        check("closing it: changes off, the terminal shows again", wait(lambda: main() == "term" and "git" not in kinds()))
         z("open", f"{proj}/README.md", extra={"TMUX_PANE": f"{wid}.1"})
         wait(lambda: "hello" in t("capture-pane", "-p", "-t", (floats() or "x").split()[0]))
         t("send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0], "Enter")
@@ -5317,8 +5318,8 @@ def cmd_selftest():
 
         cursor_to("terminal")
         act("x")
-        check("x on the terminal: the tab before comes back, the terminal stays (fresh, parked)",
-              wait(lambda: main() == "git" and kinds().count("term") == 1))
+        check("x on the last terminal: it closes, the tab before comes back",
+              wait(lambda: main() == "claude" and "term" not in kinds()))
         z("tab", "claude", f"{wid}.1")
         cursor_to("fix the login bug")
         t("send-keys", "-t", side, "Left")
@@ -5347,11 +5348,12 @@ def cmd_selftest():
         wait(lambda: "Rename session" in seen()[mark:])
         press("-l", "toggle changes")
         press("Enter")
-        check("palette Toggle changes: off, the changes tab and its commits row go",
+        check("palette Toggle changes: on, the changes tab shows", wait(lambda: main() == "git" and "git" in kinds()))
+        act("c")
+        check("Toggle changes again: off, the changes tab and its commits row go",
               wait(lambda: "git" not in kinds() and not pane_of("git") and "commits" not in t("capture-pane", "-p", "-t", side)))
         act("c")
-        check("Toggle changes again: on (it stays: restored after a restart, below)",
-              wait(lambda: main() == "git" and "git" in kinds()))
+        check("and on again (it stays: restored after a restart, below)", wait(lambda: main() == "git" and "git" in kinds()))
 
         z("tab", "select", pane_of("term"))
         wait(lambda: main() == "term")
@@ -5533,6 +5535,9 @@ def cmd_selftest():
         proj2 = os.path.realpath(proj2)  # as zidev keeps it (/var is /private/var)
         z("new", proj2)
         n_wins = len(wins())
+        zid2 = lambda: next((x["id"] for x in read_json(f"{home}/sessions.json", {})["sessions"] if x["cwd"] == proj2), "")
+        wait(lambda: zid2() in wins())
+        z("tab", "term", f"{wins()[zid2()]}.1")  # a new project has no terminal: one for the job below
         term2 = lambda: next((p for p, k, c in (l.split("\t") for l in t("list-panes", "-a", "-F",
             "#{pane_id}\t#{@zidev_side}\t#{@zidev_project}").splitlines()) if k == "term" and c == proj2), "")
         check("archive: proj2 has a terminal tab", wait(lambda: term2()))
