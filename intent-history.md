@@ -24,3 +24,4 @@ Replaced or dropped intents from `intent.md`, one dated line each, with what rep
 - **2026-11-02** — "Always a terminal and changes. Every project always has a terminal and a changes tab." → ZI28: always a terminal; changes off by default, "Toggle changes" turns them on / off.
 - **2026-11-02** — "Commits row. Every project has a commits row under its changes tab: …" → ZI37: a changes tab has a commits row under it.
 - **2026-11-03** — "Always a terminal. Every project always has a terminal. Changes …" → ZI28: a new project starts with one Claude session, nothing else; a terminal closes like any tab.
+- **2026-11-03** — "…"Toggle changes" … turns them on / off per project, and that stays." → ZI28: Close on its tab: off.

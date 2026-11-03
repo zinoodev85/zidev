@@ -104,6 +104,12 @@ The palette imitates WebStorm's Search Everywhere: tabs on top (All, Files, Acti
 ZI69 **Text search inside.**
 The Text tab searches inside the project's files, live, with a preview; ⏎ opens at the line (no ctrl-g).
 
+ZI88 **All finds text too.**
+All searches file names and the text inside the files, like WebStorm.
+
+ZI89 **Search term marked in the preview.**
+The preview highlights the search term, not only its line.
+
 ZI70 **Open apps.**
 The palette opens apps.
 
@@ -142,7 +148,7 @@ ZI27 **Tabs belong to the project.**
 Tabs (terminal, git, files) belong to the project, shared by all its sessions, listed under the project.
 
 ZI28 **Starts with one Claude session.**
-A new project starts with one Claude session, nothing else; a terminal comes with cmd-shift-t and closes like any tab. Changes (its tab with the commits row) are off by default; "Toggle changes" in the palette (shift-shift / cmd-k) or the right-click menu turns them on / off per project, and that stays.
+A new project starts with one Claude session, nothing else; a terminal comes with cmd-shift-t and closes like any tab. Changes (its tab with the commits row) are off by default; "Toggle changes" in the palette (shift-shift / cmd-k) or the right-click menu turns them on / off per project (Close on its tab: off), and that stays.
 
 ZI29 **Full screen, never split.**
 Tabs are always full screen, never split — except Claude: cmd-t puts a terminal next to it (cmd-t again: away). cmd-shift-t: a new terminal tab under the project.
@@ -223,6 +229,9 @@ Clicking a file path never opens the browser; relative paths resolve in the sess
 
 ZI52 **file:line.**
 Clicking file:line opens the preview at exactly that line.
+
+ZI87 **Line ranges.**
+Clicking file:16-23 opens the preview with lines 16–23 highlighted, scrolled into view.
 
 ZI53 **Web links: a plain click.**
 A plain click on a web link opens it in the browser (no cmd-click needed).
