@@ -1988,7 +1988,8 @@ def to_sidebar(wid, key, row):
 def cmd_palette(pane):
     """The palette (cmd-k), like WebStorm's Search Everywhere: tabs on top (⇥ switches), ⏎ does what is picked.
     All, empty: what was picked last and most, the common actions, the projects; typing searches everything
-    (actions, sessions, tabs, archived, apps, the project's scripts and files), the last row searches Google.
+    (actions, sessions, tabs, archived, apps, the project's scripts and files, then the text in its files),
+    the last row searches Google.
     Text searches inside the project's files, Clipboard lists the copies zidev.app keeps (⏎ pastes one).
     `>cmd` runs a shell command in a terminal tab, `file:line` opens there.
     pane "float": in zidev.app's panel over another app (shift-shift), on zidev's current session."""
@@ -2039,7 +2040,7 @@ def cmd_palette(pane):
            f"--bind=load:transform:rm -f {work}/pending; [ -e {work}/enter ] && echo accept",
            f"--bind=tab:transform:{self_cmd('palette-tab', work, folder, '1')}",
            f"--bind=btab:transform:{self_cmd('palette-tab', work, folder, '-1')}",
-           "--preview", self_cmd("preview") + " {1} {3} {4}",
+           "--preview", self_cmd("preview") + " {1} {3} {4} {q}",
            "--preview-window=right,50%,border-left,<110(down,50%,border-top),hidden",  # files, scripts, text only
            "--bind=focus:transform:[ {1} = file ] || [ {1} = run ] || [ {1} = text ] || [ {1} = clip ] "
            "&& echo show-preview || echo hide-preview",
@@ -2145,6 +2146,7 @@ def cmd_palette_rows(work, folder, query):
             if tab == "All":  # at most the 3 best apps; the rest are in the Apps tab
                 more_apps = set([r for r in rows if r.startswith("app\t")][3:])
                 rows = [r for r in rows if r not in more_apps]
+                rows += text_rows(folder, query)  # then the text inside the files (ZI88)
     if query and tab == "All":  # always last: search the web for it
         rows.append(f"google\t\033[34mG\033[0m Google: {query}\t{query}\t")
     sys.stdout.write("".join(f"{r}\n" for r in rows))
@@ -2426,6 +2428,7 @@ def page_file(path, line=None, env=None):
     env = {**(env or micro_env()), "LESSKEY_CONTENT": LESSKEYS + "#command\ne quit e\n" + ("" if md else "l quit l\n")}
     prompt = "-Ps" + view_prompt(path, "esc close  e edit  " + ("" if md else "l lines  ") + "/search")
     numbers, top, text, origin = False, None, [], []  # origin: the file line of each screen row
+    first = int(line.split(":")[0]) if line else None  # of lines 16:23: the first
 
     def page():
         if md:
@@ -2435,7 +2438,7 @@ def page_file(path, line=None, env=None):
         shown, origin[:] = render_file(path, line, numbers)
         text[:] = shown.split("\n")
         row = lambda n: origin.index(n) + 1 if n in origin else 1  # a long line takes several rows
-        at = [f"+{row(top)}g", "-j1"] if top else ["-j.3", f"+{row(int(line))}g"] if line else []
+        at = [f"+{row(top)}g", "-j1"] if top else ["-j.3", f"+{row(first)}g"] if first else []
         if len(text) < shutil.get_terminal_size().lines:  # all of it fits: from its first line, never moved
             at = []
         return pager("\n".join(text).encode(), ["-X", prompt, *at], env)
@@ -2448,7 +2451,7 @@ def page_file(path, line=None, env=None):
             return
         if not md:  # the editor opens where you are; the viewer comes back there
             top = origin[top_line(text) - 1]
-        subprocess.call(["micro", f"+{top or line or 1}", path], env=env)
+        subprocess.call(["micro", f"+{top or first or 1}", path], env=env)
 
 
 def top_line(lines):
@@ -2670,11 +2673,21 @@ def token_at(lines, y, x, width):
     return sorted(words, key=len, reverse=True)
 
 
+# where a path names its line: :12, :12:3 (a column), #L12; or lines: :16-23, #L16-L23 (ZI87)
+AT_LINE = r"(?::(\d+(?:-\d+)?)(?::\d+)?|#L(\d+(?:-L\d+)?))"
+
+
+def line_of(m):
+    """The line a match of AT_LINE names: "12", or lines as bat writes them, "16:23"; None for none."""
+    at = m[2] or m[3]
+    return at.replace("-L", ":").replace("-", ":") if at else None
+
+
 def resolve_path(word, cwd):
     """(path, line) of an existing file named by a word like src/a.ts:12:3, ./x.md, ~/x, file:///x."""
     word = word.removeprefix("file://").rstrip(".:,")
-    m = re.match(r"^(.*?)(?::(\d+)(?::\d+)?|#L(\d+))?$", word)
-    path, line = m[1], m[2] or m[3]
+    m = re.match(rf"^(.*?){AT_LINE}?$", word)
+    path, line = m[1], line_of(m)
     for base in (cwd, ""):
         full = os.path.normpath(os.path.join(base, os.path.expanduser(path))) if path else ""
         if full and os.path.isfile(full):
@@ -2684,11 +2697,11 @@ def resolve_path(word, cwd):
 
 def line_in(word, path):
     """The line a shown word like UITicket.svelte.ts:96 names, when a link to path carries none."""
-    m = re.match(r"^(.*?)(?::(\d+)(?::\d+)?|#L(\d+))[.:,]?$", word)
-    return (m[2] or m[3]) if m and os.path.basename(m[1]) == os.path.basename(path) else None
+    m = re.match(rf"^(.*?){AT_LINE}[.:,]?$", word)
+    return line_of(m) if m and os.path.basename(m[1]) == os.path.basename(path) else None
 
 
-FILE_NAME = re.compile(r"^([\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z][A-Za-z0-9]{0,7})(?::(\d+)(?::\d+)?|#L(\d+))?[.:,]?$")
+FILE_NAME = re.compile(rf"^([\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z][A-Za-z0-9]{{0,7}}){AT_LINE}?[.:,]?$")
 
 
 def unique_file(word, root, text=""):
@@ -2704,7 +2717,7 @@ def files_named(word, root, text=""):
     m = FILE_NAME.match(word)
     if not m:
         return [], None
-    name, line = m[1], m[2] or m[3]
+    name, line = m[1], line_of(m)
     shown = {os.path.normpath(os.path.join(root or "/", os.path.expanduser(p)))
              for p in re.findall(r"[\w.~@+/-]*/" + re.escape(name) + r"(?![\w.-])", text)}
     hits = sorted(p for p in shown if os.path.isfile(p))
@@ -3244,8 +3257,9 @@ def add_recent(cwd, path):
     remember(cwd, "recent", path, 10)
 
 
-def cmd_preview(kind, target, extra=""):
-    """The palette's preview. extra: a script's command, or the line of a file (from Text or file:line)."""
+def cmd_preview(kind, target, extra="", query=""):
+    """The palette's preview. extra: a script's command, or the line of a file (from Text or file:line).
+    query: what is typed; a line found in the text shows it marked (ZI89)."""
     width = os.environ.get("FZF_PREVIEW_COLUMNS", "80")
     if kind == "clip":  # a copy: from where and when, then its whole text (an image: its size)
         c = next((c for c in read_json(f"{CLIPS}/index.json", []) if c["id"] == target), None)
@@ -3258,13 +3272,38 @@ def cmd_preview(kind, target, extra=""):
         print("\033[2mnew file\033[0m")
     elif extra:  # at the line: from a little above it, the line marked
         start = max(1, int(extra) - int(os.environ.get("FZF_PREVIEW_LINES", "30")) // 3)
-        subprocess.call(["bat", "--color=always", "--style=changes", f"--highlight-line={extra}",
-                         f"--line-range={start}:{start + 400}", f"--terminal-width={width}", target])
+        shown = subprocess.run(["bat", "--color=always", "--style=changes", f"--highlight-line={extra}",
+                                f"--line-range={start}:{start + 400}", f"--terminal-width={width}", target],
+                               capture_output=True, text=True, errors="replace").stdout
+        print(mark_term(shown, query) if kind == "text" and query else shown, end="")
     elif is_markdown(target):
         subprocess.call(["glow", "-s", THEME["glow"], "-w", width, target])
     else:
         subprocess.call(["bat", "--color=always", "--style=changes", "--line-range=:400",
                          f"--terminal-width={width}", target])
+
+
+def mark_term(text, term):
+    """Colored text with each match of term in reverse, as less marks a /search. term is a regex, its case as
+    ripgrep's --smart-case: only a capital letter makes it count."""
+    try:
+        found = re.compile(term, 0 if any(c.isupper() for c in term) else re.I)
+    except re.error:  # not a regex Python knows: the text as typed
+        found = re.compile(re.escape(term), re.I)
+    out = []
+    for line in text.split("\n"):
+        inside = set()  # the places in the line, colors left out, that match
+        for m in found.finditer(ANSI.sub("", line)):
+            inside.update(range(m.start(), m.end()))
+        marked, at = "", 0
+        for seq, ch in re.findall(r"(\033\[[0-9;]*m)|(.)", line, re.S):
+            if seq:
+                marked += seq
+                continue
+            marked += f"\033[7m{ch}\033[27m" if at in inside else ch
+            at += 1
+        out.append(marked)
+    return "\n".join(out)
 
 
 def read_key():
@@ -4857,7 +4896,8 @@ def cmd_selftest():
             f.write("".join(f"line {i}\n" for i in range(1, 80)) + "the needle\n")
         for keys, typed, find, what in (
                 (["Tab", "Tab", "Tab"], "needle", "notes.txt:80", "⇥ to Text: it finds a line in the files; ⏎ opens it there"),
-                ([], "notes.txt:80", "notes.txt", "file:line: ⏎ opens the file at that line")):
+                ([], "notes.txt:80", "notes.txt", "file:line: ⏎ opens the file at that line"),
+                ([], "needle", "notes.txt:80", "ZI88: All finds the text in the files too; ⏎ opens it there")):
             mark = len(seen())
             press("C-q")
             wait(lambda: "New terminal tab" in seen()[mark:])
@@ -4869,6 +4909,10 @@ def cmd_selftest():
             check(what, wait(lambda: "the needle" in floating()))
             press("Escape")
             wait(lambda: not floats())
+        shown = subprocess.run([sys.executable, SELF, "preview", "text", f"{proj}/notes.txt", "80", "needle"],
+                               capture_output=True, text=True).stdout
+        check("ZI89: the preview of a line found marks the search term",
+              "\033[7mn\033[27m\033[7me\033[27m" in shown and "\033[7mt" not in shown)
         os.remove(f"{proj}/notes.txt")
         mark = len(seen())
         press("C-q")
@@ -5230,6 +5274,21 @@ def cmd_selftest():
               and wait(lambda: "ep1.txt" in t("capture-pane", "-p", "-t", floats().split()[0])))
         esc()
         wait(lambda: not floats())
+        with open(f"{root}/lines.ts", "w") as f:
+            f.write("".join(f"line {n}\n" for n in range(1, 201)))
+        t("send-keys", "-t", term, "-l", "clear; echo 'see lines.ts:150-152 there'")
+        t("send-keys", "-t", term, "Enter")
+        wait(lambda: any(l.startswith("see lines") for l in t("capture-pane", "-p", "-t", term).split("\n")))
+        ly = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", term).split("\n")) if l.startswith("see lines"))
+        z("click", term, "8", str(ly))
+        marked = lambda n: any(re.sub(r"\033\[[0-9;]*m", "", l).split() == ["line", str(n)]
+                               and re.search(r"\b48;[25];", l)  # a background: bat's highlight
+                               for l in t("capture-pane", "-p", "-e", "-t", floats().split()[0]).split("\n"))
+        check("ZI87: a click on lines.ts:150-152: the preview scrolled to them, all three marked",
+              wait(lambda: "lines.ts" in floats()) and wait(lambda: marked(150))
+              and marked(151) and marked(152) and not marked(149) and not marked(153))
+        esc()
+        wait(lambda: not floats())
         for f in ("src/Dup.ts", "lib/Dup.ts"):
             os.makedirs(os.path.dirname(f"{proj}/{f}"), exist_ok=True)
             open(f"{proj}/{f}", "w").write(f"// {f}\n")
@@ -5256,6 +5315,9 @@ def cmd_selftest():
         check("a link without a line takes the line shown: UITicket.svelte.ts:96",
               line_in("UITicket.svelte.ts:96", "/p/src/UITicket.svelte.ts") == "96"
               and line_in("Other.ts:9", "/p/src/UITicket.svelte.ts") is None)
+        check("ZI87: :16-23 and #L16-L23 name lines 16 to 23, as bat writes them",
+              line_in("UITicket.svelte.ts:16-23", "/p/src/UITicket.svelte.ts") == "16:23"
+              and unique_file("Only.ts#L16-L23", uq)[1] == "16:23" and resolve_path("src/Twice.ts:2-3", uq)[1] == "2:3")
         repo, g = f"{root}/branchy", ["git", "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t"]
         os.makedirs(repo)
         with open(f"{repo}/a.ts", "w") as f:
@@ -5713,7 +5775,7 @@ def main():
     elif cmd == "open":
         cmd_open(args[1:])
     elif cmd == "preview":
-        cmd_preview(*args[1:4])
+        cmd_preview(*args[1:5])
     elif cmd == "sidebar":
         cmd_sidebar()
     elif cmd == "welcome":
