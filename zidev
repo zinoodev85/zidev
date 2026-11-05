@@ -1507,7 +1507,8 @@ def cmd_doctor():
     check(True, f"socket {SOCKET}: " + ("running" if running else "not running (zidev starts it)"))
     if running:
         wins = session_windows()
-        missing = [x for x in load_state()["sessions"] if x["id"] not in wins]
+        d = load_state()
+        missing = [x for x in d["sessions"] if x["id"] not in wins and x["cwd"] not in d.get("archived", [])]  # ZI82
         check(not missing, f"{len(wins)} session windows", "zidev start (restores missing windows)")
     if os.path.exists(LOG) and os.path.getsize(LOG):
         check(True, f"log {LOG} ({os.path.getsize(LOG)} bytes; zidev logs)")
