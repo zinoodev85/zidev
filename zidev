@@ -1497,7 +1497,10 @@ def cmd_doctor():
         check(True, f"state {STATE}: {len(d.get('sessions', []))} sessions")
         for sess in d.get("sessions", []):
             if not os.path.isdir(sess["cwd"]):
-                check(False, f"session folder missing: {sess['cwd']}", "close it in the sidebar (x)")
+                hint = "close it in the sidebar (x)"
+                if sess["cwd"] in d.get("archived", []):  # not in the sidebar while archived
+                    hint = f"zidev unarchive {shlex.quote(sess['cwd'])}, then close it in the sidebar (x)"
+                check(False, f"session folder missing: {sess['cwd']}", hint)
     except FileNotFoundError:
         check(True, "no sessions yet")
     except ValueError as e:
