@@ -40,6 +40,15 @@ ZI85 **`/zidev done`.**
 ZI86 **Done only when merged.**
 `/zidev done` checks that the task is really done: its MR is merged. If not yet, it checks again once an hour until it is. No MR, or closed without merge: it asks.
 
+ZI90 **To Be Merged.**
+A project whose `/zidev done` waits for its MR moves into a folded "To Be Merged" group at the bottom of the sidebar. Its sessions keep running. Once merged, it goes (ZI85).
+
+ZI91 **MR row.**
+Each project in To Be Merged has an MR row under its session. A click opens the MR in GitLab.
+
+ZI92 **Back to projects.**
+Right-click "Back to projects" takes a project out of To Be Merged.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
