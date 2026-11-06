@@ -49,6 +49,9 @@ Each project in To Be Merged has an MR row under its session. A click opens the 
 ZI92 **Back to projects.**
 Right-click "Back to projects" takes a project out of To Be Merged.
 
+ZI93 **Kept rebased.**
+While `/zidev done` waits for its MR, each hourly check rebases the branch onto the MR's target and pushes it, once the target has moved on. The session resolves a conflict itself; if unsure, it asks.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
