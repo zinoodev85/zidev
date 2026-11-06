@@ -881,6 +881,10 @@ Do these steps in order, nothing after them:
    folder lose (uncommitted changes, unpushed commits, stashes).
    - It says `not merged yet: <MR>`: tell the user, check again once an hour (the loop skill with
      `1h /zidev done`, started once: not when that loop runs already) and stop here.
+     While it waits, it rebases the branch onto the MR's target and pushes it, once the target has moved on.
+     A line `rebase conflict with origin/<target>: <files>`: rebase it yourself (`git rebase origin/<target>`),
+     resolve the conflicts so both sides' changes stay, run the project's checks, `git push --force-with-lease`;
+     unsure how to resolve: `git rebase --abort` and ask the user. A line `not rebased …`: tell the user.
    - It lists anything else (no MR, MR closed, work that would be lost): show it to the user and ask; without
      their yes stop here.
 2. If a todo works on this folder (the todo skill; `zidev: <this folder>` in its todo.md), mark it done with
@@ -1292,7 +1296,7 @@ def branch_mr(cwd):
         return {**mr, "text": "not on a branch: no MR"}
     remote = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True).stdout
     if "github.com" in remote:
-        ask = ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "state,url,mergedAt"]
+        ask = ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "state,url,mergedAt,baseRefName"]
     else:
         ask = ["glab", "api", "projects/:fullpath/merge_requests?per_page=1&source_branch="
                + urllib.parse.quote(branch, safe="")]
@@ -1312,7 +1316,40 @@ def branch_mr(cwd):
                 "merged_at": found[0].get("merged_at") or found[0].get("mergedAt")}
     if state == "closed":
         return {**mr, "state": "closed", "text": f"its MR is closed, not merged: {url}"}
-    return {**mr, "state": "open", "url": url, "text": f"not merged yet: {url}"}
+    return {**mr, "state": "open", "url": url, "text": f"not merged yet: {url}",
+            "target": found[0].get("target_branch") or found[0].get("baseRefName")}  # the branch it merges into
+
+
+def rebase_branch(cwd, mr):
+    """ZI93: while its MR waits, the branch rebased onto the MR's target and pushed, once the target has moved on.
+    What happened, in a line; None when there was nothing to do."""
+    if not mr.get("target"):
+        return None
+    git = lambda *a: subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+    branch, target = mr["branch"], f"origin/{mr['target']}"
+    if git("fetch", "-q", "origin").returncode != 0:
+        return f"not rebased onto {target}: git fetch failed"
+    if git("rev-parse", "--verify", "-q", f"origin/{branch}").returncode != 0:
+        return f"not rebased onto {target}: {branch} is not on origin"
+    if git("merge-base", "--is-ancestor", target, f"origin/{branch}").returncode == 0:
+        return None  # the target has not moved on
+    if git("status", "--porcelain").stdout.strip():
+        return f"not rebased onto {target}: uncommitted changes"
+    if git("rev-parse", "HEAD").stdout != git("rev-parse", f"origin/{branch}").stdout:
+        return f"not rebased onto {target}: {branch} differs from origin/{branch}"  # a push would lose commits
+    r = git("rebase", target)
+    if r.returncode != 0:
+        files = git("diff", "--name-only", "--diff-filter=U").stdout.split()
+        git("rebase", "--abort")  # the branch as it was
+        if files:
+            return f"rebase conflict with {target}: {', '.join(files)}"
+        why = (r.stderr.strip().splitlines() or ["no answer"])[-1]
+        return f"not rebased onto {target}: {why}"
+    r = git("push", "-q", "--force-with-lease", "origin", branch)
+    if r.returncode != 0:
+        why = (r.stderr.strip().splitlines() or ["no answer"])[-1]
+        return f"rebased onto {target}, not pushed: {why}"
+    return f"rebased onto {target} and pushed"
 
 
 def done_risks(cwd, mr):
@@ -1376,7 +1413,8 @@ def cmd_done(args):
     if mr and mr["state"] == "open":
         with edit_state() as d:  # ZI90: it waits for its MR in the sidebar's To Be Merged group
             d.setdefault("to_merge", {})[cwd] = mr["url"]
-        sys.exit(mr["text"])  # ZI86: the skill checks again in an hour
+        rebased = rebase_branch(cwd, mr)  # ZI93: kept rebased while it waits
+        sys.exit(mr["text"] + (f"\n{rebased}" if rebased else ""))  # ZI86: the skill checks again in an hour
     risks = [] if force else done_risks(cwd, mr)
     if risks:
         more = f"\n  … {len(risks) - 20} more" if len(risks) > 20 else ""
@@ -5715,12 +5753,14 @@ def cmd_selftest():
             f.write(f"#!/bin/sh\ncat {root}/mr.json\n")
         os.chmod(f"{root}/bin/glab", 0o755)
 
-        def mr(state, merged_at=None):
+        def mr(state, merged_at=None, target=None):
             with open(f"{root}/mr.json", "w") as f:
-                json.dump([{"state": state, "web_url": "https://gitlab.test/mr/1", "merged_at": merged_at}]
-                          if state else [], f)
+                json.dump([{"state": state, "web_url": "https://gitlab.test/mr/1", "merged_at": merged_at,
+                            "target_branch": target}] if state else [], f)
 
-        with_glab = {"PATH": f"{root}/bin:{env['PATH']}"}
+        with_glab = {"PATH": f"{root}/bin:{env['PATH']}",  # ZI93's rebase: unsigned, by a test committer
+                     "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         done = lambda *a: z("done", proj4, *a, extra=with_glab)
         with open(f"{proj4}/a.txt", "w") as f:
             f.write("a\n")
@@ -5782,6 +5822,45 @@ def cmd_selftest():
         git4("push", "-q", "origin", "HEAD")
         mr("merged", "2000-01-01T00:00:00.000Z")
         check("zidev done --check: its change is in the main branch, nothing is lost", done("--check").returncode == 0)
+        # ZI93: while its MR waits, its branch is kept rebased onto the MR's target
+        main4 = git4("branch", "--show-current").stdout.decode().strip()
+        git4("switch", "-qc", "feat2")
+        with open(f"{proj4}/c.txt", "w") as f:
+            f.write("c\n")
+        git4("add", "c.txt")
+        git4("commit", "-qm", "c")
+        git4("push", "-q", "origin", "feat2")
+
+        def on_target(name, text):  # a commit on the MR's target, as from someone else
+            git4("switch", "-q", main4)
+            with open(f"{proj4}/{name}", "w") as f:
+                f.write(text)
+            git4("add", name)
+            git4("commit", "-qm", name)
+            git4("push", "-q", "origin", "HEAD")
+            git4("switch", "-q", "feat2")
+
+        mr("opened", target=main4)
+        check("ZI93: the target has not moved on: nothing rebased", "rebase" not in done().stderr)
+        on_target("d.txt", "d\n")
+        r = done()
+        check("ZI93: the target moved on: the branch rebased onto it and pushed",
+              f"rebased onto origin/{main4} and pushed" in r.stderr
+              and git4("merge-base", "--is-ancestor", f"origin/{main4}", "origin/feat2").returncode == 0)
+        on_target("e.txt", "e\n")
+        with open(f"{proj4}/u.txt", "w") as f:
+            f.write("u\n")
+        check("ZI93: uncommitted changes: not rebased, it says so",
+              f"not rebased onto origin/{main4}: uncommitted changes" in done().stderr)
+        os.remove(f"{proj4}/u.txt")
+        on_target("c.txt", "other\n")  # the same file as the branch, another text
+        before = git4("rev-parse", "HEAD").stdout
+        r = done()
+        check("ZI93: a conflict: it names the file, the branch stays as it was",
+              f"rebase conflict with origin/{main4}: c.txt" in r.stderr and git4("rev-parse", "HEAD").stdout == before
+              and not git4("status", "--porcelain").stdout)
+        git4("switch", "-q", main4)
+        mr("merged", "2000-01-01T00:00:00.000Z")
         z("done", extra={**with_glab, "ZIDEV_ID": zid4})  # from its own session, as /zidev done does
         check("zidev done: its project is removed, its folder deleted",
               wait(lambda: not os.path.exists(proj4) and zid4 not in wins()
