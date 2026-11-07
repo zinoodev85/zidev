@@ -16,6 +16,7 @@ sha=$(curl -fsL "$url" | shasum -a 256 | cut -d' ' -f1)
 app_url="https://github.com/zinoodev85/zidev/releases/download/v$v/zidev-app.zip"
 app_sha=$(shasum -a 256 app/build/zidev-app.zip | cut -d' ' -f1)
 tap=../homebrew-zidev
+[ -d "$tap" ] || git clone -q https://github.com/zinoodev85/homebrew-zidev "$tap"
 git -C "$tap" pull -q
 sed -i '' -e "s|^  url \".*\"|  url \"$url\"|" -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
   -e "s|^    url \".*\"|    url \"$app_url\"|" -e "s|^    sha256 \".*\"|    sha256 \"$app_sha\"|" \
