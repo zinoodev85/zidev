@@ -13,6 +13,12 @@ ZI2 **Keep it simple.**
 ZI3 **Light on the Mac.**
 zidev is process-light: nothing polls git; the sidebar waits for file and tmux events.
 
+ZI94 **Idle sessions go to standby.**
+A Claude session not used for 10 minutes and not busy (not working, no tool running, not waiting on a question) goes to standby: its Claude process stops, it stays listed in the sidebar as before. Clicking it resumes it (claude --resume) in place. A busy session never goes to standby.
+
+ZI95 **Hidden sessions stay quiet.**
+A Claude session whose window is not shown does not redraw or use CPU for a screen nobody sees. Claude runs without its spinner animation (prefersReducedMotion).
+
 ZI4 **One color scheme.**
 One color scheme for the whole tool (viewer, editor, changes, markdown).
 

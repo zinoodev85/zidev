@@ -56,6 +56,8 @@ don't ask.
 Status: spinner working · yellow `●` needs you · green `●` finished, not seen yet · `○` idle.
 A terminal tab gets a yellow `●` too when its script stops on a question (`(y/N)`, `password:`, `?`) for 2 s.
 macOS notifications when a session off screen needs you or finishes (`{"notify": false}` in `~/.zidev/config.json` turns them off).
+Standby: a session off screen and unused for 10 minutes, not working, asking or running a tool, stops its Claude
+and stays listed; shown again, it resumes in place (`{"standby_min": 0}` turns it off).
 Dragging the sidebar border saves its width (`sidebar_w`).
 Cursor and scroll are the same in every window (`~/.zidev/view.json`): switching sessions keeps the list still.
 

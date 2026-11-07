@@ -24,6 +24,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev open FILE[:LINE] [--tab]   (inside zidev) show a file in the preview, or as a tab
 """
 
+import calendar
 import collections
 import contextlib
 import curses
@@ -66,7 +67,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -173,7 +174,8 @@ def setup_dirs():
     for d in (HOME, STATUS_DIR, SEEN_DIR, ANCHOR):
         os.makedirs(d, exist_ok=True)
     hook = {"type": "command", "command": shlex.join(self_argv("hook")), "timeout": 5}
-    write_json(HOOK_SETTINGS, {"hooks": {e: [{"hooks": [hook]}] for e in HOOK_EVENTS}})
+    # ZI95: no spinner animation; it redraws a few times a second, shown or not
+    write_json(HOOK_SETTINGS, {"hooks": {e: [{"hooks": [hook]}] for e in HOOK_EVENTS}, "prefersReducedMotion": True})
 
 
 def log(msg):
@@ -1565,9 +1567,171 @@ def claude_bin():
     return found or CLAUDE
 
 
+# ── standby (ZI94) ─────────────────────────────────────────────────────────
+# A session not used for STANDBY minutes and not busy stops its Claude; its pane process (cmd_run) stays
+# and waits. Its own sidebar decides, at its refresh while hidden; shown again, the sidebar wakes it
+# (SIGUSR1) and Claude starts with --resume in place. The status file says "standby", "was" keeps the
+# state shown before, so the sidebar row looks as it did.
+
+STANDBY_DIR = f"{HOME}/standby"  # <zid>: the status before the stop, written just before Claude is stopped
+STANDBY_CHECK_S = float(os.environ.get("ZIDEV_STANDBY_CHECK_S", 60))  # a hidden sidebar looks this often whether its session may go to standby
+LOOP_TOOLS = ("ScheduleWakeup", "CronCreate", "CronDelete")
+
+
+def standby_after():
+    """Seconds unused before standby (config "standby_min", default 10; 0: never)."""
+    return float(read_json(CONFIG, {}).get("standby_min", 10)) * 60
+
+
+def last_used(zid, st):
+    """When the session was last shown, or Claude last did anything (a hook, its transcript, a subagent's)."""
+    times = [seen_at(zid)]
+    paths = [f"{STATUS_DIR}/{zid}.json"]
+    if st.get("transcript"):
+        paths += [st["transcript"], *glob.glob(f"{st['transcript'][:-len('.jsonl')]}/subagents/*.jsonl")]
+    for p in paths:
+        with contextlib.suppress(OSError):
+            times.append(os.path.getmtime(p))
+    return max(times)
+
+
+def loop_pending(transcript, now=None):
+    """A /loop wakeup or a cron job that the session would lose when Claude stops, from its transcript's end."""
+    now = now or time.time()
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(max(0, os.path.getsize(transcript) - 512 * 1024))
+            tail = f.read().decode(errors="replace")
+    except (OSError, TypeError):
+        return False
+    due, crons = 0.0, 0
+    for line in tail.splitlines():
+        if not any(t in line for t in LOOP_TOOLS):
+            continue
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            ev = json.loads(line)
+            for c in ev.get("message", {}).get("content", []):
+                if not isinstance(c, dict) or c.get("type") != "tool_use" or c.get("name") not in LOOP_TOOLS:
+                    continue
+                inp = c.get("input") or {}
+                if c["name"] == "ScheduleWakeup":
+                    at = calendar.timegm(time.strptime(ev["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    due = 0.0 if inp.get("stop") else at + float(inp.get("delaySeconds", 0))
+                elif c["name"] == "CronCreate":
+                    crons += 1
+                else:
+                    crons = max(0, crons - 1)
+    return crons > 0 or due > now - 120
+
+
+def claude_pids(pane_pid):
+    """Claude under a session's pane process and every process under it: {pid: command}."""
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    kids, cmds = collections.defaultdict(list), {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            kids[int(parts[1])].append(int(parts[0]))
+            cmds[int(parts[0])] = parts[2]
+    claude = kids.get(pane_pid, [])[:1]
+    tree, todo = {}, list(claude)
+    while todo:
+        p = todo.pop()
+        tree[p] = cmds.get(p, "")
+        todo += kids.get(p, [])
+    return (claude[0] if claude else None), tree
+
+
+def standby_reason(zid, st, pane_pid, now=None):
+    """None when the session may go to standby, else why not."""
+    now = now or time.time()
+    after = standby_after()
+    if not after:
+        return "standby off"
+    if st.get("state") in ("working", "waiting"):
+        return st["state"]
+    if st.get("state") in ("standby", "exited"):
+        return "not running"
+    if now - last_used(zid, st) < after:
+        return "used lately"
+    if loop_pending(st.get("transcript")):
+        return "a loop or cron job"
+    claude, tree = claude_pids(pane_pid)
+    if not claude:
+        return "no Claude"
+    if any("shell-snapshots" in c for p, c in tree.items() if p != claude):  # a Bash tool, in the background too
+        return "a tool runs"
+    return None
+
+
+def go_standby(zid, pane_pid):
+    """Stop the session's Claude; its pane process waits (cmd_run). True when it went."""
+    st = read_status(zid)
+    if standby_reason(zid, st, pane_pid):
+        return False
+    claude, _ = claude_pids(pane_pid)
+    os.makedirs(STANDBY_DIR, exist_ok=True)
+    write_json(f"{STANDBY_DIR}/{zid}", {"was": st.get("state", "idle"), "since": st.get("since", 0)})
+    try:
+        os.kill(claude, signal.SIGTERM)
+    except (OSError, TypeError):
+        with contextlib.suppress(OSError):
+            os.remove(f"{STANDBY_DIR}/{zid}")
+        return False
+    log(f"standby {zid}")
+    return True
+
+
+class Wake(Exception):
+    pass
+
+
+_waiting = False
+
+
+def _on_wake(*_):
+    if _waiting:  # only while it waits in standby; otherwise a stray signal does nothing
+        raise Wake()
+
+
+def wait_standby(zid):
+    """In standby: the status says so, until a key or the sidebar's SIGUSR1 (the session shown again)."""
+    global _waiting
+    before = read_json(f"{STANDBY_DIR}/{zid}", {})
+    st = read_status(zid)
+    st.update(state="standby", detail="", was=before.get("was", st.get("was", "done")),
+              since=before.get("since", st.get("since", 0)))
+    write_json(f"{STATUS_DIR}/{zid}.json", st)
+    print("\033[2J\033[H\033[2mstandby: Claude stopped while unused. It resumes when shown (or press a key).\033[0m",
+          flush=True)
+    _waiting = True
+    try:
+        read_key()
+    except Wake:
+        pass
+    finally:
+        _waiting = False
+    with contextlib.suppress(OSError):
+        os.remove(f"{STANDBY_DIR}/{zid}")
+    set_status(zid, "starting")
+    print("\033[2J\033[H", end="", flush=True)
+
+
+def wake(pane):
+    """Resume a session in standby: its pane process starts Claude again."""
+    pid, can = ((tmux("display", "-p", "-t", pane, "#{pane_pid} #{@zidev_standby}") or "") + " ").split(" ")[:2]
+    if pid.isdigit() and can == "1":
+        with contextlib.suppress(OSError):
+            os.kill(int(pid), signal.SIGUSR1)
+
+
 def cmd_run(zid):
-    """Pane process of a session: runs Claude, offers restart when it exits."""
+    """Pane process of a session: runs Claude, offers restart when it exits; in standby it waits."""
     os.environ["ZIDEV_ID"] = zid
+    signal.signal(signal.SIGUSR1, _on_wake)
+    tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@zidev_standby", "1")  # the sidebar may stop / wake it
+    if read_status(zid).get("state") == "standby":  # was in standby when zidev stopped: stays so
+        wait_standby(zid)
     while True:
         s = next((s for s in load_state()["sessions"] if s["id"] == zid), None)
         if not s:
@@ -1589,6 +1753,9 @@ def cmd_run(zid):
             subprocess.call(args, cwd=s["cwd"])
         except OSError as e:
             print(f"\033[31mcan't start Claude: {e}\033[0m  (is `claude` on PATH? zidev doctor checks)")
+        if os.path.exists(f"{STANDBY_DIR}/{zid}"):  # stopped for standby, not by its user
+            wait_standby(zid)
+            continue
         set_status(zid, "exited")
         print("\n\033[2mClaude exited.  \033[0m[enter] restart   [x] close session\n")
         if read_key() in ("x", "X"):
@@ -3558,6 +3725,8 @@ class Sidebar:
         self.footer = []   # (y, x from, x to, key) of the clickable footer hints
         self.term_seen = {}  # pane -> (its last rows, since when): a script that stopped on a question
         self.waits = set()   # panes of terminal tabs that wait for you
+        self.standby_checked = time.time()  # ZI94: when it last looked whether its session may go to standby
+        self.woken = 0.0     # when it last woke its session from standby
 
     # data
 
@@ -3698,6 +3867,8 @@ class Sidebar:
         """(state, needs attention) of a session."""
         st = self.status.get(s["id"], {})
         state = st.get("state", "idle")
+        if state == "standby":  # ZI94: listed as before
+            state = st.get("was", "done")
         if s["id"] not in self.windows:
             state = "stopped"
         unseen = st.get("since", 0) > seen_at(s["id"]) and s["id"] != self.my_id
@@ -4374,7 +4545,7 @@ class Sidebar:
                 self.frame += 1
                 self.draw()
             save_titles(10)
-            self.scr.timeout(TICK_MS)
+            self.scr.timeout(TICK_MS if self.visible else HIDDEN_TICK_MS)
             ch = self.scr.getch()
             if ch != -1 and not self.visible:  # a key came before the switch was seen
                 self.refresh()
@@ -4426,6 +4597,27 @@ class Sidebar:
         tmux_all(["paste-buffer", "-p", "-d", "-b", "zidev-paste", "-t", target], ["select-pane", "-t", target])
         return True
 
+    def maybe_standby(self):
+        """ZI94: hidden, its own session unused and not busy goes to standby (looked at every STANDBY_CHECK_S)."""
+        if not self.my_id or time.time() - self.standby_checked < STANDBY_CHECK_S:
+            return
+        self.standby_checked = time.time()
+        claude = claude_tab(self.my_id, self.tabs)
+        pid, can = ((claude and tmux("display", "-p", "-t", claude["pane"], "#{pane_pid} #{@zidev_standby}")
+                     or "") + " ").split(" ")[:2]
+        if pid.isdigit() and can == "1":  # its pane process knows standby (not one from before it, until R)
+            go_standby(self.my_id, int(pid))
+
+    def wake_mine(self):
+        """Shown with its Claude in front: its session in standby resumes."""
+        if self.status.get(self.my_id, {}).get("state") != "standby" or time.time() - self.woken < 5:
+            return
+        wid = tmux("display", "-p", "-t", self.pane, "#{window_id}")
+        shown = shown_in(wid, self.tabs)
+        if shown and shown["kind"] == "claude" and shown["owner"] == self.my_id:
+            self.woken = time.time()
+            wake(shown["pane"])
+
     def refresh(self):
         snap = tmux_snapshot(self.pane)
         flags = snap[0] if snap else ["0", "0", "0"]
@@ -4435,9 +4627,11 @@ class Sidebar:
             self.visible = self.focused = False
             self.load(snap)
             self.adopt_view()
+            self.maybe_standby()
             return
         self.focused, shown, self.visible = flags[2] == "1", self.visible, True
         self.load(snap)
+        self.wake_mine()
         if not shown or self.asks() != self.asked:  # ZI32: shown for a question, hidden again after it
             self.fix_width()
         if self.focused and not self.asks() and self.scr.getmaxyx()[1] == 1:  # hidden, it takes no keys
@@ -4450,6 +4644,7 @@ class Sidebar:
 
 
 TICK_MS = 250  # keys, mouse and the spinner
+HIDDEN_TICK_MS = 1000  # hidden (ZI95): no spinner to turn; keys still come at once, a switch is seen within it
 SHOWN_S = 1    # the shown sidebar asks tmux this often (status, tabs, focus)
 HIDDEN_S = 15  # a hidden one this often; a switch to it wakes it at once (SWITCHED)
 
@@ -4772,7 +4967,7 @@ def cmd_selftest():
     os.chmod(fake, 0o755)
     sock = f"zidev-selftest-{os.getpid()}"
     env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
-           "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
+           "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
            "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell"}
     env.pop("TMUX", None)
     failed = []
@@ -4829,6 +5024,8 @@ def cmd_selftest():
         wid = wins().get(zid, "")
         args = lambda: open(f"{home}/claude-args").read()
         check("claude runs with hook settings", wait(lambda: "--settings" in args()))
+        check("ZI95: Claude runs without the spinner animation",
+              read_json(f"{home}/claude-settings.json", {}).get("prefersReducedMotion") is True)
         check("fresh session uses --session-id", wait(lambda: f"--session-id {zid}" in args()))
         check("SessionStart hook: idle + claude id",
               wait(lambda: status(zid).get("claude_id") == "cid-1" and status(zid)["state"] == "idle"))
@@ -5609,6 +5806,50 @@ def cmd_selftest():
         act("R")
         t("send-keys", "-t", side, "R")
         check("R R restarts claude", wait(lambda: sum(zid in l or "cid-2" in l for l in args().splitlines()) == 2))
+
+        # ZI94 standby: the second session (hidden, its Claude in its window) unused and not busy
+        zid_b = ids()[1]
+        claude_b = lambda: claude_pids(int(t("display", "-p", "-t", f"{wid2}.1", "#{pane_pid}") or 0))[0]
+        first_b = claude_b()
+        poke = lambda: open(f"{home}/switched", "w").close()  # wakes the hidden sidebars at once
+        hook_b = lambda ev: z("hook", stdin=json.dumps(ev), extra={"ZIDEV_ID": zid_b})
+        hook_b({"hook_event_name": "UserPromptSubmit", "prompt": "long job"})
+        conf = read_json(f"{home}/config.json", {})
+        write_json(f"{home}/config.json", {**conf, "standby_min": 0.03})  # 2 s
+        time.sleep(3)
+        check("standby: a working session never goes to standby",
+              not wait(lambda: poke() or claude_b() != first_b, 4) and status(zid_b)["state"] == "working")
+        hook_b({"hook_event_name": "Stop"})
+        check("standby: unused and done, its Claude stops; listed as before",
+              wait(lambda: poke() or (claude_b() != first_b and status(zid_b).get("state") == "standby"), 12)
+              and status(zid_b).get("was") == "done" and zid_b in wins()
+              and "long job" in t("capture-pane", "-p", "-t", side))
+        n_args = len(args().splitlines())
+        t("select-window", "-t", wid2)
+        check("standby: shown again, Claude starts again in place",
+              wait(lambda: len(args().splitlines()) == n_args + 1 and claude_b()
+                   and status(zid_b).get("state") == "idle" and wins().get(zid_b) == wid2))
+        t("select-window", "-t", wid)
+        write_json(f"{home}/config.json", conf)
+        tree = subprocess.Popen(["sh", "-c", "sh -c \"sh -c 'sleep 30; : shell-snapshots' ; :\" ; :"])
+        time.sleep(0.5)
+        check("standby: not while a tool runs (a Bash call, in the background too)",
+              standby_reason("x", {"state": "done"}, tree.pid, now=time.time() + 10 ** 6) == "a tool runs")
+        tree.kill()
+        loop = f"{root}/loop.jsonl"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        use = lambda name, inp: json.dumps({"timestamp": stamp, "message": {"content": [
+            {"type": "tool_use", "name": name, "input": inp}]}})
+        with open(loop, "w") as f:
+            f.write(use("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "/loop x"}) + "\n")
+        pending = loop_pending(loop)
+        with open(loop, "a") as f:
+            f.write(use("ScheduleWakeup", {"stop": True}) + "\n" + use("CronCreate", {"cron": "0 * * * *"}) + "\n")
+        cron = loop_pending(loop)
+        with open(loop, "a") as f:
+            f.write(use("CronDelete", {"id": "1"}) + "\n")
+        check("standby: not while a /loop wakeup or a cron job is pending", pending and cron and not loop_pending(loop))
+
         z("hook", stdin=json.dumps({"hook_event_name": "SessionEnd"}), extra={"ZIDEV_ID": ids()[1]})
         t("kill-window", "-t", wins()[ids()[1]])
         with edit_state_at(home) as d:
@@ -5645,7 +5886,7 @@ def cmd_selftest():
 
         out = z("reload").stdout
         check("reload respawns sidebars and commands", "reloaded" in out)
-        check("reload keeps claude running", wait(lambda: len(args().splitlines()) == 3))
+        check("reload keeps claude running", wait(lambda: len(args().splitlines()) == 4))  # 4: standby woke one
 
         proj3 = f"{root}/proj3"
         os.makedirs(proj3)
