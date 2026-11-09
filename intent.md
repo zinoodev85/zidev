@@ -58,6 +58,29 @@ Right-click "Back to projects" takes a project out of To Be Merged.
 ZI93 **Kept rebased.**
 While `/zidev done` waits for its MR, each hourly check rebases the branch onto the MR's target and pushes it, once the target has moved on. The session resolves a conflict itself; if unsure, it asks.
 
+## Done
+
+ZD1 **Done takes an open MR.**
+`/zidev done` also takes an MR that is still in review.
+
+ZD2 **AI review first.**
+It waits up to an hour for the AI review. Small points it fixes; otherwise it waits for my command.
+
+ZD3 **Then assign.**
+Once the AI review is done, it assigns the reviewer, then checks hourly and keeps the MR rebased until merged (ZI86, ZI93).
+
+ZD4 **Reviewer up front.**
+The reviewer is given at the beginning; otherwise `/zidev done` asks for it at the beginning.
+
+ZD5 **AI review answered in the MR.**
+Each AI review gets a reply in its thread saying what was fixed, then the thread is resolved; me resolving it counts too.
+
+ZD6 **No AI review: assign anyway.**
+No AI review within the hour, or none in the repo: it assigns the reviewer anyway and tells me.
+
+ZD7 **One AI re-review.**
+After its first fixes it starts the AI re-review once; its points are handled the same way, no third round.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
