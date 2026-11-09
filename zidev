@@ -11,7 +11,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
   zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
-  zidev done [DIR] [--check | --force]   task finished: remove the project, delete its folder (not while its MR is open or that loses work)
+  zidev done [DIR] [--check | --force] [--reviewer NAME] [--answer TEXT] [--dry]   task finished: remove the project, delete its folder (not while its MR is open or that loses work); its MR open: AI review first, then NAME assigned as reviewer, TEXT replied to the AI review; --dry: only say it
   zidev list [--json]  print sessions and their status
   zidev kill         stop the tmux server (sessions stay saved, restored on next start)
   zidev reload       load new zidev code into a running server (Claude sessions keep running)
@@ -67,7 +67,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.15"
+VERSION = "0.1.16"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -876,22 +876,47 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
   (Claude's first message, sent when the session starts).
 - Sessions and their status: `zidev list --json`.
 
-## `/zidev done`: the task is finished (the skill called with `done`)
+## `/zidev done`: the task is finished, or its MR is open (the skill called with `done`)
+
+`/zidev done` takes the task from an open MR to merged, then ends it. zidev does the AI review first, then assigns
+the reviewer, and keeps the branch rebased until the MR is merged.
 
 Do these steps in order, nothing after them:
-1. `zidev done --check`: is the task really done (its MR is merged), and what would deleting this project's
-   folder lose (uncommitted changes, unpushed commits, stashes).
-   - It says `not merged yet: <MR>`: tell the user, check again once an hour (the loop skill with
-     `1h /zidev done`, started once: not when that loop runs already) and stop here.
-     While it waits, it rebases the branch onto the MR's target and pushes it, once the target has moved on.
-     A line `rebase conflict with origin/<target>: <files>`: rebase it yourself (`git rebase origin/<target>`),
-     resolve the conflicts so both sides' changes stay, run the project's checks, `git push --force-with-lease`;
-     unsure how to resolve: `git rebase --abort` and ask the user. A line `not rebased …`: tell the user.
+1. The reviewer: the handle in `/zidev done <handle>`, or the reviewer the task's prompt names. Known: pass it as
+   `--reviewer <handle>` below (zidev remembers it for the project). A reviewer already on the MR stays the reviewer.
+2. `zidev done --check [--reviewer <handle>]`: is the task really done (its MR is merged), and what would deleting
+   this project's folder lose (uncommitted changes, unpushed commits, stashes).
+   - It says `not merged yet: <MR>`: the MR is open. Handle the lines under it (below), tell the user where it
+     stands, check again once an hour (the loop skill with `1h /zidev done`, started once: not when that loop
+     runs already) and stop here.
    - It lists anything else (no MR, MR closed, work that would be lost): show it to the user and ask; without
      their yes stop here.
-2. If a todo works on this folder (the todo skill; `zidev: <this folder>` in its todo.md), mark it done with
+3. If a todo works on this folder (the todo skill; `zidev: <this folder>` in its todo.md), mark it done with
    that skill (Done).
-3. `zidev done --force`: removes the project (its sessions and tabs stop, this one too) and deletes its folder.
+4. `zidev done --force`: removes the project (its sessions and tabs stop, this one too) and deletes its folder.
+
+The lines under `not merged yet`:
+- `reviewer unknown`: ask the user for the reviewer now, then `zidev done --check --reviewer <handle>`.
+- `AI review open: <link>` or `AI re-review open: <link>`, its points under it: read the review in full
+  (`glab api "projects/:fullpath/merge_requests/<MR number>/notes/<id>"`, the id is the link's `note_` number).
+  A point is small when its fix is clear and a few lines, inside the MR's
+  goal and the files it touches, with no design choice (e.g. a missing test, `:slow` + REMOVEME, a name, a guard,
+  a typo). Never small: 🛑 findings, behaviour or design changes, points outside the MR's scope, points where the
+  review looks wrong. Minor notes are no points.
+  - Fix the small points, run the project's checks, commit and push.
+  - List the other points to the user, each with your recommendation, and wait for their command (asked once
+    already: don't ask again, wait).
+  - Once every point is fixed or decided: `zidev done --check --answer "<what was fixed, with its commits; what
+    not, and why>"`. It replies in the review's thread and resolves it. The user resolving it counts too.
+- `AI review: waiting …`, `AI re-review: waiting …`, `… starts with the pipeline of the fixes`,
+  `… assigned once the AI review is done`: nothing to do, the hourly check looks again.
+- `AI re-review started`: after the first fixes, the AI reviews once more; its points are handled the same way.
+- `… none within the hour`, `AI review: none in this repo`: tell the user that the reviewer is assigned without
+  an AI review.
+- `rebase conflict with origin/<target>: <files>`: rebase it yourself (`git rebase origin/<target>`), resolve
+  the conflicts so both sides' changes stay, run the project's checks, `git push --force-with-lease`; unsure how
+  to resolve: `git rebase --abort` and ask the user.
+- `not rebased …`, `… not assigned: …`, `… unknown: …`, `… glab failed`: tell the user.
 
 ## Do not
 
@@ -1247,7 +1272,7 @@ def remove_project(cwd):
     with edit_state() as d:
         d["projects"] = [p for p in d["projects"] if p != cwd]
         d["sessions"] = [s for s in d["sessions"] if s["cwd"] != cwd]
-        for key in ("project_tabs", "names", "to_merge"):
+        for key in ("project_tabs", "names", "to_merge", "review"):
             d.get(key, {}).pop(cwd, None)
         for key in ("changes", "changes_open", "commits_open"):
             d[key] = [c for c in d.get(key, []) if c != cwd]
@@ -1298,7 +1323,8 @@ def branch_mr(cwd):
         return {**mr, "text": "not on a branch: no MR"}
     remote = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True, text=True).stdout
     if "github.com" in remote:
-        ask = ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "state,url,mergedAt,baseRefName"]
+        ask = ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json",
+               "state,url,mergedAt,baseRefName,number,reviewRequests,author"]
     else:
         ask = ["glab", "api", "projects/:fullpath/merge_requests?per_page=1&source_branch="
                + urllib.parse.quote(branch, safe="")]
@@ -1318,8 +1344,15 @@ def branch_mr(cwd):
                 "merged_at": found[0].get("merged_at") or found[0].get("mergedAt")}
     if state == "closed":
         return {**mr, "state": "closed", "text": f"its MR is closed, not merged: {url}"}
+    # ZD3: who reviews it; the author on their own MR is no reviewer
+    author = found[0].get("author") or {}
+    author = author.get("username") or author.get("login")
+    reviewers = [r.get("username") or r.get("login") or r.get("name")
+                 for r in found[0].get("reviewers") or found[0].get("reviewRequests") or []]
     return {**mr, "state": "open", "url": url, "text": f"not merged yet: {url}",
-            "target": found[0].get("target_branch") or found[0].get("baseRefName")}  # the branch it merges into
+            "target": found[0].get("target_branch") or found[0].get("baseRefName"),  # the branch it merges into
+            "iid": found[0].get("iid") or found[0].get("number"), "github": "github.com" in remote,
+            "reviewers": [r for r in reviewers if r != author]}
 
 
 def rebase_branch(cwd, mr):
@@ -1352,6 +1385,198 @@ def rebase_branch(cwd, mr):
         why = (r.stderr.strip().splitlines() or ["no answer"])[-1]
         return f"rebased onto {target}, not pushed: {why}"
     return f"rebased onto {target} and pushed"
+
+
+def failed_why(r):
+    """The last line a failed command wrote, to say why it failed."""
+    return (r.stderr.strip().splitlines() or ["no answer"])[-1]
+
+
+def glab_api(cwd, *args):
+    """GitLab's answer to `glab api ARGS` as JSON (with --paginate all pages in one list); None when it fails."""
+    r = subprocess.run(["glab", "api", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    # --paginate prints each page's JSON, one after the other
+    pages, rest = [], r.stdout.strip()
+    try:
+        while rest:
+            page, end = json.JSONDecoder().raw_decode(rest)
+            pages.append(page)
+            rest = rest[end:].strip()
+    except ValueError:
+        return None
+    if len(pages) == 1:
+        return pages[0]
+    return [item for page in pages for item in page]
+
+
+AI_MARKS = ("<!-- ai-review -->", "<!-- claude-review -->")  # how the ai-review CI job marks its notes
+
+
+def ai_notes(cwd, mr):
+    """ZD2: the MR's AI reviews (notes of the ai-review CI job), oldest first: their thread and note, when, whether
+    a re-review, their points, whether answered (ZD5: resolved; no points: nothing to answer). None: unknown."""
+    import datetime
+    if mr["github"]:
+        return []
+    threads = glab_api(cwd, "--paginate", f"projects/:fullpath/merge_requests/{mr['iid']}/discussions?per_page=100")
+    if threads is None:
+        return None
+    found = []
+    for thread in threads:
+        first = thread["notes"][0]
+        if not first["body"].lstrip().startswith(AI_MARKS):
+            continue
+        body = first["body"].split("<details>")[0]  # its Minor notes are no points
+        # the points: its findings (### …) and, in a re-review, the earlier points not fixed (- ❌ …)
+        points = [line for line in body.splitlines() if line.startswith("### ") or line.startswith("- ❌")]
+        points = [re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", p)[:160] for p in points]  # a link as its text
+        # it becomes a thread to resolve with the first reply; before that it is answered by any reply
+        resolvable = [n for n in thread["notes"] if n.get("resolvable")]
+        if resolvable:
+            answered = all(n.get("resolved") for n in resolvable)
+        else:
+            answered = len(thread["notes"]) > 1
+        at = datetime.datetime.fromisoformat(first["created_at"].replace("Z", "+00:00")).timestamp()
+        found.append({"thread": thread["id"], "id": first["id"], "at": at, "points": points,
+                      "re": re.search(r"^## .*Re-Review", body, re.M) is not None,
+                      "answered": answered or not points})
+    return sorted(found, key=lambda n: n["at"])
+
+
+def newest_pipeline(cwd, mr):
+    """The MR's newest pipeline with its jobs (manual ones too); None when unknown."""
+    found = glab_api(cwd, f"projects/:fullpath/merge_requests/{mr['iid']}/pipelines?per_page=1")
+    if not found:
+        return None
+    jobs = glab_api(cwd, "--paginate", f"projects/:fullpath/pipelines/{found[0]['id']}/jobs?per_page=100")
+    if jobs is None:
+        return None
+    return {**found[0], "jobs": jobs}
+
+
+def ai_wait(what, since):
+    """ZD2, ZD6: an AI review is waited for up to an hour: (done waiting, lines that say it)."""
+    if time.time() >= since + 55 * 60:  # the hourly check may come a little early
+        return True, [f"{what}: none within the hour"]
+    until = time.strftime("%H:%M", time.localtime(since + 3600))
+    return False, [f"{what}: waiting, at most until {until}"]
+
+
+def start_rereview(cwd, mr, state, dry):
+    """ZD7: the AI re-review started once, after the first fixes: (AI review done, lines that say it)."""
+    pipeline = newest_pipeline(cwd, mr)
+    head = subprocess.run(["git", "-C", cwd, "rev-parse", f"origin/{mr['branch']}"],
+                          capture_output=True, text=True).stdout.strip()
+    if not pipeline or pipeline["sha"] != head:
+        return False, ["AI review answered; the AI re-review starts with the pipeline of the fixes"]
+    job = next((j for j in pipeline["jobs"] if j["name"] == "ai-re-review"), None)
+    if not job:
+        return True, ["AI review done; no AI re-review in this repo"]
+    if dry:
+        return False, ["AI review answered; the AI re-review would start now"]
+    if job["status"] == "manual":  # not started by someone else already
+        if glab_api(cwd, "-X", "POST", f"projects/:fullpath/jobs/{job['id']}/play") is None:
+            return False, ["AI re-review not started: glab failed"]
+    state["rereview"] = time.time()
+    return False, ["AI re-review started"]
+
+
+def ai_review(cwd, mr, state, dry):
+    """ZD2, ZD6, ZD7: where the MR's AI review stands: (done, lines that say it). Open: its points listed."""
+    if mr["github"]:
+        return True, ["AI review: none in this repo"]
+    notes = ai_notes(cwd, mr)
+    if notes is None:
+        return False, ["AI review unknown: glab failed"]
+    lines = []
+    for note in notes:
+        if not note["answered"]:
+            lines.append(f"AI {'re-review' if note['re'] else 'review'} open: {mr['url']}#note_{note['id']}")
+            lines += [f"  {point}" for point in note["points"]]
+    if lines:
+        return False, lines
+    if not notes:
+        pipeline = newest_pipeline(cwd, mr)
+        if pipeline and not any(j["name"] == "ai-review" for j in pipeline["jobs"]):
+            return True, ["AI review: none in this repo"]
+        return ai_wait("AI review", state["since"])
+    if any(note["re"] for note in notes):
+        return True, ["AI review done"]  # ZD7: no third round
+    if state.get("rereview"):
+        return ai_wait("AI re-review", state["rereview"])
+    # ZD7: the first review had points and commits came after it: its fixes
+    first = notes[0]
+    times = subprocess.run(["git", "-C", cwd, "log", "--format=%at", f"origin/{mr['target']}..origin/{mr['branch']}"],
+                           capture_output=True, text=True).stdout.split()
+    if first["points"] and any(int(t) > first["at"] for t in times):
+        return start_rereview(cwd, mr, state, dry)
+    return True, ["AI review done"]
+
+
+def assign_reviewer(cwd, mr, reviewer):
+    """ZD3: the reviewer put on the MR (added to those on it): a line that says it."""
+    if mr["github"]:
+        ask = ["gh", "pr", "edit", mr["url"], "--add-reviewer", reviewer]
+    else:
+        ask = ["glab", "mr", "update", str(mr["iid"]), "--reviewer", f"+{reviewer}"]
+    r = subprocess.run(ask, cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"reviewer @{reviewer} not assigned: {failed_why(r)}"
+    return f"reviewer: @{reviewer} assigned"
+
+
+def answer_ai_review(cwd, mr, text):
+    """ZD5: each open AI review thread of the MR gets the reply TEXT, then it is resolved: a line that says it."""
+    notes = ai_notes(cwd, mr)
+    if notes is None:
+        return "AI review not answered: glab failed"
+    open_notes = [note for note in notes if not note["answered"]]
+    if not open_notes:
+        return "no open AI review to answer"
+    for note in open_notes:
+        thread = f"projects/:fullpath/merge_requests/{mr['iid']}/discussions/{note['thread']}"
+        if glab_api(cwd, "-X", "POST", f"{thread}/notes", "-f", f"body={text}") is None:
+            return "AI review not answered: glab failed"
+        if glab_api(cwd, "-X", "PUT", thread, "-F", "resolved=true") is None:
+            return "AI review answered, not resolved: glab failed"
+    return "AI review answered and resolved"
+
+
+def mr_review(cwd, mr, reviewer, dry):
+    """ZD1–ZD7: an open MR gets its AI review first, then its reviewer: lines that say where it stands.
+    dry: nothing started, assigned or saved."""
+    saved = load_state().get("review", {}).get(cwd, {})
+    state = {"since": time.time(), "url": mr["url"]}
+    if saved.get("url") == mr["url"]:
+        state.update(saved)  # the same MR as before: its hour counts from the first check
+    state["reviewer"] = reviewer or saved.get("reviewer")  # ZD4: given once, remembered for the project
+    done, lines = ai_review(cwd, mr, state, dry)
+    if mr["reviewers"]:
+        lines.append(f"reviewer: @{', @'.join(mr['reviewers'])} (on the MR)")  # it stays the reviewer
+    elif not state["reviewer"]:
+        lines.insert(0, "reviewer unknown: ask the user, then zidev done --check --reviewer NAME")
+    elif not done:
+        lines.append(f"reviewer: @{state['reviewer']}, assigned once the AI review is done")
+    elif dry:
+        lines.append(f"reviewer: @{state['reviewer']}, would be assigned now")
+    else:
+        lines.append(assign_reviewer(cwd, mr, state["reviewer"]))
+    if not dry:
+        with edit_state() as d:
+            d.setdefault("review", {})[cwd] = state
+    return lines
+
+
+def flag_value(args, name):
+    """The value after the flag NAME, and the args without both; None when the flag is not there."""
+    if name not in args:
+        return None, args
+    i = args.index(name)
+    if i + 1 >= len(args):
+        sys.exit(f"zidev: {name} needs a value")
+    return args[i + 1], args[:i] + args[i + 2:]
 
 
 def done_risks(cwd, mr):
@@ -1397,13 +1622,19 @@ def finish_project(cwd):
 
 
 def cmd_done(args):
-    """zidev done [DIR] [--check | --force]: ZI85, the task is finished: the project is removed and its folder
-    deleted. DIR: this session's project by default. Nothing happens while its MR is not merged (ZI86) or
-    deleting would lose work, it says what (--check: only say it; --force: delete anyway)."""
-    check, force = "--check" in args, "--force" in args
-    rest = [a for a in args if a not in ("--check", "--force", "--now")]
+    """zidev done [DIR] [--check | --force] [--reviewer NAME] [--answer TEXT] [--dry]: ZI85, the task is finished:
+    the project is removed and its folder deleted. DIR: this session's project by default. Nothing happens while
+    its MR is not merged (ZI86) or deleting would lose work, it says what (--check: only say it; --force: delete
+    anyway). Its MR open (ZD1): its AI review first, then NAME assigned as its reviewer (ZD2–ZD7); --answer:
+    TEXT replied in its open AI review threads, which are resolved (ZD5). --dry: only say it, on any folder:
+    nothing fetched, rebased, pushed, assigned, commented, saved or deleted."""
+    reviewer, args = flag_value(args, "--reviewer")
+    answer, args = flag_value(args, "--answer")
+    dry = "--dry" in args
+    check, force = "--check" in args or dry, "--force" in args and not dry
+    rest = [a for a in args if a not in ("--check", "--force", "--now", "--dry")]
     cwd = os.path.realpath(os.path.expanduser(rest[0]) if rest else this_project())
-    if cwd not in load_state()["projects"]:
+    if cwd not in load_state()["projects"] and not dry:
         sys.exit(f"not a zidev project: {cwd}")
     if "--now" in args:  # the detached part, below
         try:
@@ -1413,10 +1644,15 @@ def cmd_done(args):
         return
     mr = None if force else branch_mr(cwd)
     if mr and mr["state"] == "open":
-        with edit_state() as d:  # ZI90: it waits for its MR in the sidebar's To Be Merged group
-            d.setdefault("to_merge", {})[cwd] = mr["url"]
-        rebased = rebase_branch(cwd, mr)  # ZI93: kept rebased while it waits
-        sys.exit(mr["text"] + (f"\n{rebased}" if rebased else ""))  # ZI86: the skill checks again in an hour
+        lines = [mr["text"]]
+        if not dry:
+            with edit_state() as d:  # ZI90: it waits for its MR in the sidebar's To Be Merged group
+                d.setdefault("to_merge", {})[cwd] = mr["url"]
+            lines.append(rebase_branch(cwd, mr))  # ZI93: kept rebased while it waits
+            if answer:
+                lines.append(answer_ai_review(cwd, mr, answer))
+        lines += mr_review(cwd, mr, reviewer and reviewer.lstrip("@"), dry)
+        sys.exit("\n".join(line for line in lines if line))  # ZI86: the skill checks again in an hour
     risks = [] if force else done_risks(cwd, mr)
     if risks:
         more = f"\n  … {len(risks) - 20} more" if len(risks) > 20 else ""
@@ -5988,16 +6224,29 @@ def cmd_selftest():
         subprocess.run(["git", "clone", "-q", origin, proj4], check=True, capture_output=True)
         git4 = lambda *a: subprocess.run(["git", "-C", proj4, "-c", "commit.gpgsign=false", "-c", "user.name=t",
                                           "-c", "user.email=t@t", *a], capture_output=True)
-        # ZI86: GitLab's answer about the branch's MR, from a stand-in glab
+        # ZI86: GitLab's answer about the branch's MR, from a stand-in glab; each call is written to glab.log
         os.makedirs(f"{root}/bin")
         with open(f"{root}/bin/glab", "w") as f:
-            f.write(f"#!/bin/sh\ncat {root}/mr.json\n")
+            f.write(f"""#!/bin/sh
+echo "$*" >> {root}/glab.log
+case "$*" in
+  "mr update"*) ;;
+  *"-X "*) echo '{{}}' ;;
+  *"/discussions?"*) cat {root}/discussions.json ;;
+  *"/pipelines?"*) cat {root}/pipelines.json ;;
+  *"/jobs?"*) cat {root}/jobs.json ;;
+  *) cat {root}/mr.json ;;
+esac
+""")
         os.chmod(f"{root}/bin/glab", 0o755)
+        put = lambda name, data: write_json(f"{root}/{name}.json", data)  # what the stand-in glab answers
+        for name in ("discussions", "pipelines", "jobs"):
+            put(name, [])
 
-        def mr(state, merged_at=None, target=None):
-            with open(f"{root}/mr.json", "w") as f:
-                json.dump([{"state": state, "web_url": "https://gitlab.test/mr/1", "merged_at": merged_at,
-                            "target_branch": target}] if state else [], f)
+        def mr(state, merged_at=None, target=None, reviewers=()):
+            put("mr", [{"state": state, "web_url": "https://gitlab.test/mr/1", "merged_at": merged_at,
+                        "target_branch": target, "iid": 1, "author": {"username": "me"},
+                        "reviewers": [{"username": r} for r in reviewers]}] if state else [])
 
         with_glab = {"PATH": f"{root}/bin:{env['PATH']}",  # ZI93's rebase: unsigned, by a test committer
                      "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "commit.gpgsign", "GIT_CONFIG_VALUE_0": "false",
@@ -6100,6 +6349,80 @@ def cmd_selftest():
         check("ZI93: a conflict: it names the file, the branch stays as it was",
               f"rebase conflict with origin/{main4}: c.txt" in r.stderr and git4("rev-parse", "HEAD").stdout == before
               and not git4("status", "--porcelain").stdout)
+        # ZD1–ZD7: an open MR: its AI review first, then its reviewer assigned
+        glab_log = lambda: open(f"{root}/glab.log").read()
+        clear_log = lambda: open(f"{root}/glab.log", "w").close()
+        review = lambda: json.load(open(f"{home}/sessions.json")).get("review", {}).get(proj4, {})
+        put("pipelines", [{"id": 7, "sha": git4("rev-parse", "origin/feat2").stdout.decode().strip()}])
+        put("jobs", [{"id": 8, "name": "lint", "status": "success"}])
+        clear_log()
+        r = done()
+        check("ZD1: an open MR: it says where its AI review and its reviewer stand",
+              "AI review: none in this repo" in r.stderr and "reviewer unknown" in r.stderr)
+        check("ZD4: no reviewer known: it asks for one, nothing assigned",
+              "reviewer unknown: ask the user" in r.stderr and "mr update" not in glab_log())
+        r = done("--reviewer", "@bob")
+        check("ZD6: no AI review in the repo: the reviewer is assigned at once",
+              "reviewer: @bob assigned" in r.stderr and "mr update 1 --reviewer +bob" in glab_log())
+        check("ZD4: the reviewer given is remembered for the project", review().get("reviewer") == "bob")
+        mr("opened", target=main4, reviewers=["carol"])
+        clear_log()
+        check("ZD3: a reviewer already on the MR stays, no one else is assigned",
+              "reviewer: @carol (on the MR)" in done().stderr and "mr update" not in glab_log())
+        mr("opened", target=main4)
+        put("jobs", [{"id": 8, "name": "ai-review", "status": "running"}])
+        r = done()
+        check("ZD2: the AI review not there yet: it waits, the reviewer not assigned yet",
+              "AI review: waiting, at most until" in r.stderr and "assigned once the AI review is done" in r.stderr
+              and "mr update" not in glab_log())
+        with edit_state_at(home) as d:
+            d["review"][proj4]["since"] -= 3700
+        r = done()
+        check("ZD6: no AI review within the hour: the reviewer is assigned anyway",
+              "AI review: none within the hour" in r.stderr and "reviewer: @bob assigned" in r.stderr)
+        ai = "<!-- ai-review -->\n\n## 🤖 Claude Review\n\n**Verdict:** one gap\n\n"
+        note1 = {"id": 11, "created_at": "2000-01-01T00:00:00.000Z", "resolvable": False, "resolved": False,
+                 "body": ai + "### ⚠️ Missing test ([a.ts:3](https://gitlab.test/a.ts#L3))\n\n"
+                              "<details><summary>Minor notes</summary>\n\n### a minor note\n</details>"}
+        reply = {"id": 12, "created_at": "2000-01-01T01:00:00.000Z", "resolvable": True, "resolved": True, "body": "ok"}
+        answered = lambda note: {**note, "resolvable": True, "resolved": True}
+        put("discussions", [{"id": "d1", "notes": [note1]}])
+        clear_log()
+        r = done()
+        check("ZD2: an open AI review: its points listed (links as text, no minor notes), the reviewer waits",
+              "AI review open: https://gitlab.test/mr/1#note_11\n  ### ⚠️ Missing test (a.ts:3)" in r.stderr
+              and "a minor note" not in r.stderr and "mr update" not in glab_log())
+        done("--answer", "Fixed: the test (c0ffee)")
+        check("ZD5: --answer replies in the AI review's thread, then resolves it",
+              "-X POST projects/:fullpath/merge_requests/1/discussions/d1/notes -f body=Fixed: the test (c0ffee)\n"
+              "api -X PUT projects/:fullpath/merge_requests/1/discussions/d1 -F resolved=true" in glab_log())
+        put("discussions", [{"id": "d1", "notes": [answered(note1), reply]}])
+        put("jobs", [{"id": 8, "name": "ai-review", "status": "success"},
+                     {"id": 9, "name": "ai-re-review", "status": "manual"}])
+        clear_log()
+        r = done()
+        check("ZD7: the AI review answered, fixes pushed: the AI re-review started, the reviewer waits",
+              "AI re-review started" in r.stderr and "-X POST projects/:fullpath/jobs/9/play" in glab_log()
+              and "mr update" not in glab_log())
+        check("ZD7: started once: the next check waits for it",
+              "AI re-review: waiting" in done().stderr and glab_log().count("/play") == 1)
+        note2 = {"id": 21, "created_at": "2099-01-01T00:00:00.000Z", "resolvable": False, "resolved": False,
+                 "body": ai.replace("Review", "Re-Review") + "**Prior review**\n- ✅ Missing test\n- ❌ The name\n"}
+        put("discussions", [{"id": "d1", "notes": [answered(note1), reply]}, {"id": "d2", "notes": [note2]}])
+        check("ZD7: the re-review's points listed the same way",
+              "AI re-review open: https://gitlab.test/mr/1#note_21\n  - ❌ The name" in done().stderr)
+        put("discussions", [{"id": "d1", "notes": [answered(note1), reply]},
+                            {"id": "d2", "notes": [answered(note2), reply]}])
+        r = done()
+        check("ZD3: the AI review done: the reviewer assigned; ZD7: no third round",
+              "AI review done" in r.stderr and "reviewer: @bob assigned" in r.stderr and glab_log().count("/play") == 1)
+        clear_log()
+        before = (review(), to_merge(), git4("rev-parse", "origin/feat2").stdout)
+        r = done("--dry", "--reviewer", "dave")
+        check("--dry: it says where the MR stands, changes nothing (no rebase, assign, comment, state)",
+              "reviewer: @dave, would be assigned now" in r.stderr and "rebase" not in r.stderr
+              and "-X " not in glab_log() and "mr update" not in glab_log()
+              and (review(), to_merge(), git4("rev-parse", "origin/feat2").stdout) == before)
         git4("switch", "-q", main4)
         mr("merged", "2000-01-01T00:00:00.000Z")
         z("done", extra={**with_glab, "ZIDEV_ID": zid4})  # from its own session, as /zidev done does
@@ -6107,6 +6430,7 @@ def cmd_selftest():
               wait(lambda: not os.path.exists(proj4) and zid4 not in wins()
                    and proj4 not in json.load(open(f"{home}/sessions.json"))["projects"]))
         check("ZI90: done, it leaves To Be Merged", proj4 not in to_merge())
+        check("ZD4: done, its reviewer and AI review state go", not review())
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
