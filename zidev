@@ -8,7 +8,11 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev              start (restoring saved sessions) or attach
   zidev DIR          the same, showing DIR's project (its first session); a new project if it is none
   zidev start        start the server in the background, without attaching
-  zidev new [DIR] [--prompt TEXT]   new session in DIR (default: current dir); TEXT is Claude's first message
+  zidev new [DIR] [--prompt TEXT] [--resume CLAUDE_ID] [--title TEXT] [--env K=V]... [--keep] [--json]
+                     new session in DIR (default: current dir); TEXT is Claude's first message; --resume: resumes that
+                     Claude session; --env: exported to its Claude on every start; --keep: never standby;
+                     --json: prints {"id", "claude_id"}, shows nothing
+  zidev say ZID TEXT   type TEXT into that session's Claude as one message and submit it (wakes it first)
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
   zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
   zidev done [DIR] [--check | --force] [--reviewer NAME] [--answer TEXT] [--dry]   task finished: remove the project, delete its folder (not while its MR is open or that loses work); its MR open: AI review first, then NAME assigned as reviewer, TEXT replied to the AI review; --dry: only say it
@@ -875,7 +879,11 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
 - Web links in your output open in the browser on a plain click.
 - Rename your project in the sidebar (the folder stays): `zidev rename-project "Name"`; `""` gives back the folder name.
 - A new session in another folder: `zidev new DIR`. Give it its task right away: `zidev new DIR --prompt "…"`
-  (Claude's first message, sent when the session starts).
+  (Claude's first message, sent when the session starts). More: `--resume CLAUDE_ID` (resume that Claude session),
+  `--title TEXT`, `--env K=V` (repeatable, exported to its Claude), `--keep` (never standby), `--json`
+  (prints `{"id": ZID, "claude_id": CID}`, shows nothing).
+- Type a message into a session's Claude: `zidev say ZID TEXT` (multiline is one message; a session in standby or
+  exited is woken first; a busy Claude queues it).
 - Sessions and their status: `zidev list --json`.
 - The task's important links show under your session in the sidebar; a todo's links and saved mails come by
   themselves. When you publish an artifact, open an MR or find the task's ticket or mail, add it:
@@ -1004,11 +1012,17 @@ def restart_claude(s, wid):
     select_tab(claude)
 
 
-def new_session(cwd, select=True, prompt=None):
+def new_session(cwd, select=True, prompt=None, resume=None, title="", env=None, keep=False):
     cwd = os.path.realpath(os.path.expanduser(cwd))
-    s = {"id": str(uuid.uuid4()), "cwd": cwd, "title": "", "created": time.time()}
+    s = {"id": str(uuid.uuid4()), "cwd": cwd, "title": title, "created": time.time()}
     if prompt:
         s["prompt"] = prompt  # Claude's first message, sent once on its first start
+    if resume:
+        s["resume"] = True  # its first start resumes the Claude session in its status (claude_id)
+    if env:
+        s["env"] = env  # exported to its Claude on every start
+    if keep:
+        s["keep"] = True  # never standby
     if cwd in archived():  # a new session brings the project back
         unarchive_project(cwd)
     with edit_state() as d:
@@ -1017,7 +1031,11 @@ def new_session(cwd, select=True, prompt=None):
             d["projects"].append(cwd)
         if cwd in d["collapsed"]:
             d["collapsed"].remove(cwd)
-    set_status(s["id"], "idle")
+    set_status(s["id"], "starting")
+    if resume:
+        st = read_status(s["id"])
+        st["claude_id"] = resume
+        write_json(f"{STATUS_DIR}/{s['id']}.json", st)
     if server_running():
         spawn_window(s, select)
         ensure_project_tabs()
@@ -1726,14 +1744,79 @@ def cmd_done(args):
 
 
 def cmd_new(args):
-    prompt = None
-    if "--prompt" in args:
-        i = args.index("--prompt")
-        if i + 1 >= len(args):
-            sys.exit("zidev new: --prompt needs a text")
-        prompt, args = args[i + 1], args[:i] + args[i + 2:]
-    s = new_session(args[0] if args else os.getcwd(), prompt=prompt)
-    print(f"new session in {s['cwd']}" + ("" if server_running() else " (starts with zidev)"))
+    opts = {"--prompt": None, "--resume": None, "--title": ""}
+    env = {}
+    rest, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in opts or a == "--env":
+            if i + 1 >= len(args):
+                sys.exit(f"zidev new: {a} needs a value")
+            if a == "--env":
+                k, eq, v = args[i + 1].partition("=")
+                if not k or not eq:
+                    sys.exit("zidev new: --env needs K=V")
+                env[k] = v
+            else:
+                opts[a] = args[i + 1]
+            i += 2
+        else:
+            rest.append(a)
+            i += 1
+    keep, as_json = "--keep" in rest, "--json" in rest
+    rest = [a for a in rest if a not in ("--keep", "--json")]
+    if as_json and not server_running():
+        ensure_server()
+    s = new_session(rest[0] if rest else os.getcwd(), select=not as_json, prompt=opts["--prompt"],
+                    resume=opts["--resume"], title=opts["--title"], env=env, keep=keep)
+    if as_json:
+        print(json.dumps({"id": s["id"], "claude_id": read_status(s["id"]).get("claude_id", "")}))
+    else:
+        print(f"new session in {s['cwd']}" + ("" if server_running() else " (starts with zidev)"))
+
+
+def say_ready(zid):
+    """Claude of the session is up (its hook reported) and its screen settled."""
+    pane = (claude_tab(zid) or {}).get("pane", "")
+    last, since = None, time.time()
+    end = time.time() + 90
+    while time.time() < end:
+        if read_status(zid).get("state") not in ("standby", "exited", "starting"):
+            now = tmux("capture-pane", "-p", "-t", pane)
+            if now != last:
+                last, since = now, time.time()
+            elif time.time() - since > 1:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def cmd_say(args):
+    """zidev say ZID TEXT: TEXT as one submitted message in the session's Claude."""
+    if len(args) < 2:
+        sys.exit("zidev say: ZID TEXT")
+    zid, text = args[0], " ".join(args[1:])
+    s = next((s for s in load_state()["sessions"] if s["id"] == zid), None)
+    if not s:
+        sys.exit(f"zidev say: no session {zid}")
+    if not server_running() or zid not in session_windows():
+        ensure_server()
+    wid = session_windows().get(zid)
+    pane = (claude_tab(zid) or {}).get("pane")
+    if not wid or not pane:
+        sys.exit(f"zidev say: session {zid} has no window")
+    state = read_status(zid).get("state")
+    if state == "standby":
+        wake(pane)
+    elif state == "exited":
+        restart_claude(s, wid)
+    if not say_ready(zid):
+        sys.exit(f"zidev say: Claude of {zid} did not start")
+    buf = f"zidev-say-{os.getpid()}"
+    subprocess.run(["tmux", "-L", SOCKET, "load-buffer", "-b", buf, "-"], input=text, text=True, check=True)
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)  # bracketed paste: newlines stay inside one message
+    time.sleep(0.4)
+    tmux("send-keys", "-t", pane, "Enter")
 
 
 def cmd_list(args):
@@ -1943,6 +2026,8 @@ def standby_reason(zid, st, pane_pid, now=None):
     after = standby_after()
     if not after:
         return "standby off"
+    if any(x.get("keep") for x in load_state()["sessions"] if x["id"] == zid):
+        return "kept"
     if st.get("state") in ("working", "waiting"):
         return st["state"]
     if st.get("state") in ("standby", "exited"):
@@ -2036,14 +2121,18 @@ def cmd_run(zid):
         cid = read_status(zid).get("claude_id") or zid
         # Claude saves a session only after its first message; an unused one can't be resumed
         saved = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{cid}.jsonl"))
-        args = [claude_bin(), "--settings", HOOK_SETTINGS, "--resume" if saved else "--session-id", cid]
-        if s.get("prompt"):
-            if not saved:
+        forced = s.get("resume")  # zidev new --resume: its first start resumes, with or without a saved file
+        args = [claude_bin(), "--settings", HOOK_SETTINGS, "--resume" if saved or forced else "--session-id", cid]
+        if s.get("prompt") or forced:
+            if s.get("prompt") and (forced or not saved):
                 args.append(s["prompt"])
             with edit_state() as d:  # sent once: a restart must not repeat it
                 for x in d["sessions"]:
                     if x["id"] == zid:
                         x.pop("prompt", None)
+                        x.pop("resume", None)
+        os.environ.update(s.get("env") or {})
+        set_status(zid, "starting")
         try:
             subprocess.call(args, cwd=s["cwd"])
         except OSError as e:
@@ -5072,6 +5161,10 @@ FAKE_CLAUDE = """#!/bin/sh
 echo "$@" >> "$ZIDEV_HOME/claude-args"
 echo "fake claude $*"
 printf '{"hook_event_name":"SessionStart","session_id":"%s"}' "$ZIDEV_TEST_CID" | "$ZIDEV_SELF" hook
+if [ -n "$ZIDEV_TEST_SAY" ]; then  # takes input like Claude: bracketed paste on, keys raw
+  echo "$ZIDEV_TEST_SAY" > "$ZIDEV_HOME/claude-env-$ZIDEV_ID"
+  printf '\033[?2004h'; stty raw -echo; exec cat >> "$ZIDEV_HOME/say-got-$ZIDEV_ID"
+fi
 exec sleep 3600
 """
 
@@ -6644,6 +6737,42 @@ esac
                    and proj4 not in json.load(open(f"{home}/sessions.json"))["projects"]))
         check("ZI90: done, it leaves To Be Merged", proj4 not in to_merge())
         check("ZD4: done, its reviewer and AI review state go", not review())
+        # zidev new --resume / --title / --env / --keep / --json, and zidev say
+        proj5 = f"{root}/proj5"
+        os.makedirs(proj5)
+        r = z("new", proj5, "--json", "--resume", "resumed-cid", "--title", "Planner X", "--env", "ZIDEV_TEST_SAY=planner-env",
+              "--env", "OTHER=a=b", "--keep", "--prompt", "hello again")
+        j = json.loads(r.stdout or "{}")
+        zid5 = j.get("id", "")
+        sess5 = lambda: next((x for x in read_json(f"{home}/sessions.json", {})["sessions"] if x["id"] == zid5), {})
+        got5 = lambda: open(f"{home}/say-got-{zid5}", "rb").read() if os.path.exists(f"{home}/say-got-{zid5}") else b""
+        check("new --json: prints id and claude id, the window is not shown",
+              j.get("claude_id") == "resumed-cid" and wait(lambda: zid5 in wins()) and t("display", "-p", "#{window_id}") == wid)
+        check("new --resume: Claude starts with --resume CID (and the prompt)",
+              wait(lambda: "--resume resumed-cid hello again" in args()) and not sess5().get("resume"))
+        check("new --title: the sidebar title", sess5().get("title") == "Planner X"
+              and title_of(sess5(), status(zid5)) == "Planner X")
+        check("new --env: reaches Claude's environment",
+              wait(lambda: open(f"{home}/claude-env-{zid5}").read().strip() == "planner-env"
+                   if os.path.exists(f"{home}/claude-env-{zid5}") else False) and sess5().get("env", {}).get("OTHER") == "a=b")
+        check("say: a multiline text arrives as one pasted message, submitted",
+              wait(lambda: status(zid5).get("state") == "idle") and z("say", zid5, "line one\nline two\nline 3").returncode == 0
+              and wait(lambda: got5() == b"\x1b[200~line one\rline two\rline 3\x1b[201~\r"))
+        check("say: no such session exits 1 with a message", (lambda r: r.returncode == 1 and "no session" in r.stderr)(z("say", "nope", "x")))
+        zid6 = json.loads(z("new", proj5, "--json", "--env", "ZIDEV_TEST_SAY=2").stdout)["id"]
+        wait(lambda: zid6 in wins())
+        write_json(f"{home}/config.json", {**read_json(f"{home}/config.json", {}), "standby_min": 0.03})
+        pid6 = lambda: int(t("display", "-p", "-t", f"{wins().get(zid6)}.1", "#{pane_pid}") or 0)
+        standby6 = wait(lambda: poke() or status(zid6).get("state") == "standby", 20)
+        wait(lambda: poke() and False, 4)  # the kept one had as long to go
+        check("new --keep: never standby, while an unkept session goes",
+              standby6 and sess5().get("keep") and status(zid5).get("state") != "standby" and "keep" not in
+              next(x for x in read_json(f"{home}/sessions.json", {})["sessions"] if x["id"] == zid6))
+        z("say", zid6, "after standby")
+        got6 = lambda: open(f"{home}/say-got-{zid6}", "rb").read() if os.path.exists(f"{home}/say-got-{zid6}") else b""
+        check("say: a session in standby is woken first, then gets the message",
+              wait(lambda: got6() == b"\x1b[200~after standby\x1b[201~\r", 20) and status(zid6).get("state") != "standby")
+        write_json(f"{home}/config.json", {**read_json(f"{home}/config.json", {}), "standby_min": 10})
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
@@ -6689,6 +6818,8 @@ def main():
         ensure_server()
     elif cmd == "new":
         cmd_new(args[1:])
+    elif cmd == "say":
+        cmd_say(args[1:])
     elif cmd == "rename-project":
         cmd_rename_project(args[1:])
     elif cmd in ("archive", "unarchive"):
