@@ -1781,7 +1781,10 @@ def say_ready(zid):
     last, since = None, time.time()
     end = time.time() + 90
     while time.time() < end:
-        if read_status(zid).get("state") not in ("standby", "exited", "starting"):
+        st = read_status(zid).get("state")
+        if st == "working":
+            return True  # a working screen never settles
+        if st not in ("standby", "exited", "starting"):
             now = tmux("capture-pane", "-p", "-t", pane)
             if now != last:
                 last, since = now, time.time()
@@ -1798,7 +1801,8 @@ def cmd_say(args):
     zid, text = args[0], " ".join(args[1:])
     s = next((s for s in load_state()["sessions"] if s["id"] == zid), None)
     if not s:
-        sys.exit(f"zidev say: no session {zid}")
+        print(f"zidev say: no session {zid}", file=sys.stderr)
+        sys.exit(3)
     if not server_running() or zid not in session_windows():
         ensure_server()
     wid = session_windows().get(zid)
@@ -1810,13 +1814,25 @@ def cmd_say(args):
         wake(pane)
     elif state == "exited":
         restart_claude(s, wid)
-    if not say_ready(zid):
+    elif state in ("working", "waiting", "done", "idle"):
+        state = "up"   # Claude is up: type at once (a busy screen never settles)
+    if state != "up" and not say_ready(zid):
         sys.exit(f"zidev say: Claude of {zid} did not start")
     buf = f"zidev-say-{os.getpid()}"
     subprocess.run(["tmux", "-L", SOCKET, "load-buffer", "-b", buf, "-"], input=text, text=True, check=True)
     tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)  # bracketed paste: newlines stay inside one message
     time.sleep(0.4)
     tmux("send-keys", "-t", pane, "Enter")
+
+
+def cmd_close(args):
+    """zidev close ZID: the session is removed and its Claude stops (exit 3: no such session)."""
+    if len(args) != 1:
+        sys.exit("zidev close: ZID")
+    if not any(s["id"] == args[0] for s in load_state()["sessions"]):
+        print(f"zidev close: no session {args[0]}", file=sys.stderr)
+        sys.exit(3)
+    close_session(args[0])
 
 
 def cmd_list(args):
@@ -5163,6 +5179,7 @@ echo "fake claude $*"
 printf '{"hook_event_name":"SessionStart","session_id":"%s"}' "$ZIDEV_TEST_CID" | "$ZIDEV_SELF" hook
 if [ -n "$ZIDEV_TEST_SAY" ]; then  # takes input like Claude: bracketed paste on, keys raw
   echo "$ZIDEV_TEST_SAY" > "$ZIDEV_HOME/claude-env-$ZIDEV_ID"
+  if [ -n "$ZIDEV_TEST_BUSY" ]; then (i=0; while :; do i=$((i+1)); printf '\r busy %s' "$i"; sleep 0.1; done) & fi  # a working Claude: the screen keeps changing
   printf '\033[?2004h'; stty raw -echo; exec cat >> "$ZIDEV_HOME/say-got-$ZIDEV_ID"
 fi
 exec sleep 3600
@@ -6758,7 +6775,7 @@ esac
         check("say: a multiline text arrives as one pasted message, submitted",
               wait(lambda: status(zid5).get("state") == "idle") and z("say", zid5, "line one\nline two\nline 3").returncode == 0
               and wait(lambda: got5() == b"\x1b[200~line one\rline two\rline 3\x1b[201~\r"))
-        check("say: no such session exits 1 with a message", (lambda r: r.returncode == 1 and "no session" in r.stderr)(z("say", "nope", "x")))
+        check("say: no such session exits 3 with a message", (lambda r: r.returncode == 3 and "no session" in r.stderr)(z("say", "nope", "x")))
         zid6 = json.loads(z("new", proj5, "--json", "--env", "ZIDEV_TEST_SAY=2").stdout)["id"]
         wait(lambda: zid6 in wins())
         write_json(f"{home}/config.json", {**read_json(f"{home}/config.json", {}), "standby_min": 0.03})
@@ -6768,11 +6785,22 @@ esac
         check("new --keep: never standby, while an unkept session goes",
               standby6 and sess5().get("keep") and status(zid5).get("state") != "standby" and "keep" not in
               next(x for x in read_json(f"{home}/sessions.json", {})["sessions"] if x["id"] == zid6))
+        zid7 = json.loads(z("new", proj5, "--json", "--keep", "--env", "ZIDEV_TEST_SAY=busy", "--env", "ZIDEV_TEST_BUSY=1").stdout)["id"]
+        got7 = lambda: open(f"{home}/say-got-{zid7}", "rb").read() if os.path.exists(f"{home}/say-got-{zid7}") else b""
+        wait(lambda: status(zid7).get("state") == "idle")
+        t0 = time.time()
+        r7 = z("say", zid7, "to a busy one")
+        check("say: a Claude that keeps redrawing (busy) gets the message within seconds, no settle wait",
+              r7.returncode == 0 and time.time() - t0 < 5 and wait(lambda: got7() == b"\x1b[200~to a busy one\x1b[201~\r"))
         z("say", zid6, "after standby")
         got6 = lambda: open(f"{home}/say-got-{zid6}", "rb").read() if os.path.exists(f"{home}/say-got-{zid6}") else b""
         check("say: a session in standby is woken first, then gets the message",
               wait(lambda: got6() == b"\x1b[200~after standby\x1b[201~\r", 20) and status(zid6).get("state") != "standby")
         write_json(f"{home}/config.json", {**read_json(f"{home}/config.json", {}), "standby_min": 10})
+        r8 = z("close", zid7)
+        check("close: the session and its window are gone, no such session exits 3",
+              r8.returncode == 0 and wait(lambda: zid7 not in wins()) and zid7 not in
+              [x["id"] for x in read_json(f"{home}/sessions.json", {})["sessions"]] and z("close", zid7).returncode == 3)
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
@@ -6820,6 +6848,8 @@ def main():
         cmd_new(args[1:])
     elif cmd == "say":
         cmd_say(args[1:])
+    elif cmd == "close":
+        cmd_close(args[1:])
     elif cmd == "rename-project":
         cmd_rename_project(args[1:])
     elif cmd in ("archive", "unarchive"):
