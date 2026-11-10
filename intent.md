@@ -81,6 +81,17 @@ No AI review within the hour, or none in the repo: it assigns the reviewer anywa
 ZD7 **One AI re-review.**
 After its first fixes it starts the AI re-review once; its points are handled the same way, no third round.
 
+## Links
+
+ZL1 **Links under the session.**
+A session lists its task's important links under it in the sidebar, like the MR row: MR, ticket (GitLab, Asana, Jira), mail, artifacts. A click opens it.
+
+ZL2 **Links from its todo.**
+A session working on a todo shows the todo's links and its saved mails.
+
+ZL3 **Claude adds links.**
+Claude adds a link (`zidev link URL "label"`) when it publishes an artifact, opens an MR or finds the task's ticket.
+
 ## Sidebar
 
 ZI10 **No tab bar.**
