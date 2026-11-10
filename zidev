@@ -22,6 +22,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev selftest     run the end-to-end test on a throwaway tmux server
   zidev apptest      check the running zidev.app against spec.md (clicks, cmd-cmd) on a throwaway window
   zidev open FILE[:LINE] [--tab]   (inside zidev) show a file in the preview, or as a tab
+  zidev link URL ["label"]   (inside zidev) list a link of the task (ticket, MR, mail, artifact) under its session
 """
 
 import calendar
@@ -67,7 +68,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.16"
+VERSION = "0.1.17"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -110,6 +111,7 @@ def load_state():
     d.setdefault("collapsed", [])
     d.setdefault("changes_open", [])  # projects whose changed files show under the changes tab
     d.setdefault("commits_open", [])  # projects whose last commits show under the commits row
+    d.setdefault("links_open", [])  # projects whose links show under the links row (ZL1)
     for s in d["sessions"]:  # the files pane became the commands bar
         if "files" in s:
             s["cmds"] = s.pop("files")
@@ -875,6 +877,9 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
 - A new session in another folder: `zidev new DIR`. Give it its task right away: `zidev new DIR --prompt "…"`
   (Claude's first message, sent when the session starts).
 - Sessions and their status: `zidev list --json`.
+- The task's important links show under your session in the sidebar; a todo's links and saved mails come by
+  themselves. When you publish an artifact, open an MR or find the task's ticket or mail, add it:
+  `zidev link URL "short label"`.
 
 ## `/zidev done`: the task is finished, or its MR is open (the skill called with `done`)
 
@@ -1066,6 +1071,60 @@ def this_project():
     """The project of the session this runs in, else the current folder."""
     own = next((s["cwd"] for s in load_state()["sessions"] if s["id"] == os.environ.get("ZIDEV_ID")), None)
     return own or os.getcwd()
+
+
+TODO_HOME = os.environ.get("TODO_HOME", os.path.expanduser("~/projects/work-todos"))  # the todo skill's data
+_todos = {}  # todo.md -> (its mtime, what read_todo found in it)
+
+
+def read_todo(path):
+    """A todo.md: (the folder its `zidev:` names, its links and saved mails as [{url, label}])."""
+    folder, links, section = "", [], ""
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if line.startswith("zidev:") and not folder:
+            value = line.split(":", 1)[1].strip()
+            folder = os.path.realpath(os.path.expanduser(value)) if value else ""
+        elif line.startswith("## "):
+            section = line[3:].strip()
+        else:
+            m = re.match(r"\s*[-*]\s+\[(.*)\]\((\S+)\)", line)  # - [label](url)
+            if m and section == "Links":
+                links.append({"url": m[2], "label": m[1]})
+            elif m and section == "Anhänge" and re.fullmatch(r"email\d*\.md", m[2]):  # a saved mail
+                links.append({"url": os.path.join(os.path.dirname(path), m[2]), "label": m[1]})
+    return folder, links
+
+
+def todo_links():
+    """ZL2: project folder -> the links and saved mails of the open todos worked on there."""
+    by_cwd = {}
+    for path in glob.glob(f"{TODO_HOME}/todos/open/*/todo.md"):
+        try:
+            mtime = os.path.getmtime(path)
+            if _todos.get(path, (None,))[0] != mtime:  # read again only when it changed
+                _todos[path] = (mtime, read_todo(path))
+        except OSError:
+            continue
+        folder, links = _todos[path][1]
+        if folder:
+            by_cwd.setdefault(folder, []).extend(links)
+    return by_cwd
+
+
+def cmd_link(args):
+    """ZL3: `zidev link URL ["label"]`: a link of the task, listed under this session's project in the sidebar."""
+    if not args:
+        sys.exit('usage (inside zidev): zidev link URL ["label"]')
+    url = os.path.realpath(args[0]) if os.path.isfile(args[0]) else args[0]  # a file: where it is
+    label = args[1].strip() if len(args) > 1 and args[1].strip() else url
+    cwd = this_project()
+    if cwd not in load_state()["projects"]:
+        sys.exit(f"not a zidev project: {cwd}")
+    with edit_state() as d:
+        links = d.setdefault("links", {}).setdefault(cwd, [])
+        links[:] = [link for link in links if link["url"] != url]  # each once: a new label replaces the old
+        links.append({"url": url, "label": label})
+    print(f"{label} → {project_name(cwd)}")
 
 
 def cmd_rename_project(args):
@@ -1272,9 +1331,9 @@ def remove_project(cwd):
     with edit_state() as d:
         d["projects"] = [p for p in d["projects"] if p != cwd]
         d["sessions"] = [s for s in d["sessions"] if s["cwd"] != cwd]
-        for key in ("project_tabs", "names", "to_merge", "review"):
+        for key in ("project_tabs", "names", "to_merge", "review", "links"):
             d.get(key, {}).pop(cwd, None)
-        for key in ("changes", "changes_open", "commits_open"):
+        for key in ("changes", "changes_open", "commits_open", "links_open"):
             d[key] = [c for c in d.get(key, []) if c != cwd]
     for zid in zids:
         for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
@@ -3991,6 +4050,7 @@ class Sidebar:
                 self.items.append(("pickmore", pick))
             if pick["at"] != self.pick_at:  # new: the cursor on its first file
                 self.pick_at, key, self.scrolled = pick["at"], ("pickfile", files[0]), False
+        self.todo_links = todo_links()  # ZL2
         to_merge = self.data.get("to_merge", {})  # ZI90: projects whose MR is not merged yet
         for cwd in [c for c in projects if c not in to_merge]:
             self.add_project(cwd, by_cwd.get(cwd, []))
@@ -4007,7 +4067,7 @@ class Sidebar:
         self.select(key)
 
     def add_project(self, cwd, sessions):
-        """A project's rows: the project; unfolded, its sessions, its MR (ZI91) and its tabs."""
+        """A project's rows: the project; unfolded, its sessions, its MR (ZI91), its links (ZL1) and its tabs."""
         self.items.append(("project", cwd))
         if cwd in self.data["collapsed"]:
             return
@@ -4015,6 +4075,11 @@ class Sidebar:
         url = self.data.get("to_merge", {}).get(cwd)
         if url:  # in To Be Merged: its MR
             self.items.append(("mr", {"project": cwd, "url": url}))
+        links = self.links_of(cwd)
+        if links:  # ZL1: folded at first, ↗ N links
+            self.items.append(("links", {"project": cwd, "n": len(links)}))
+            if cwd in self.data["links_open"]:
+                self.items += [("link", {"project": cwd, **link}) for link in links]
         for t in project_tabs(cwd, self.tabs):  # shared by its sessions
             self.items.append(("tab", t))
             if t["kind"] == "git":  # its changed files under it, when unfolded
@@ -4024,6 +4089,18 @@ class Sidebar:
                 self.items.append(("commits", t))  # its own row under the changes, folds the same way
                 if cwd in self.data["commits_open"]:
                     self.items += [("commit", (t, sha, subject)) for sha, subject in recent_commits(cwd)]
+
+    def links_of(self, cwd):
+        """ZL1: a project's links: its todo's (ZL2), then the ones zidev link added (ZL3); each once, not its MR
+        when the MR row shows it."""
+        mr = self.data.get("to_merge", {}).get(cwd)
+        seen = {mr} if mr else set()
+        links = []
+        for link in self.todo_links.get(os.path.realpath(cwd), []) + self.data.get("links", {}).get(cwd, []):
+            if link["url"] not in seen:
+                seen.add(link["url"])
+                links.append(link)
+        return links
 
     ASKS = re.compile(r"([?:\])›])\s*$|\b(y/n|yes/no|password|passphrase|press (any key|enter|return))\b", re.I)
 
@@ -4071,7 +4148,8 @@ class Sidebar:
                       v["at"] if kind in ("pick", "pickmore") else
                       (v[0]["pane"], v[2]) if kind == "change" else
                       (v[0]["pane"], v[1]) if kind == "commit" else
-                      v["project"] if kind == "mr" else v["pane"])
+                      (v["project"], v["url"]) if kind == "link" else
+                      v["project"] if kind in ("mr", "links") else v["pane"])
 
     def session_of_item(self, kind, v):
         """The session a row's t / c open in: its own; a project or tab row: here()."""
@@ -4081,7 +4159,7 @@ class Sidebar:
     def project_of(kind, v):
         return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"], "commits": lambda: v["project"],
                 "change": lambda: v[0]["project"], "commit": lambda: v[0]["project"], "mr": lambda: v["project"],
-                "group": lambda: None}[kind]()
+                "links": lambda: v["project"], "link": lambda: v["project"], "group": lambda: None}[kind]()
 
     def here(self, cwd):
         """Where a project's tab shows: this window when it is the project's, else its window used last."""
@@ -4148,6 +4226,9 @@ class Sidebar:
                     lines.append((i, "detail", f"{st['detail']} · {age(st.get('since'))}", 1))
 
         body_top, body_h = 2, max(h - 4, 1)
+        group = next((n for n, line in enumerate(lines) if line[1] == "group"), None)
+        if group is not None and len(lines) < body_h:  # ZI90: To Be Merged at the very bottom, above the footer
+            lines[group:group] = [(None, "gap", None, 0)] * (body_h - len(lines))
         cur_line = next((n for n, l in enumerate(lines) if l[0] == self.cursor), 0)
         if self.scrolled:
             pass
@@ -4160,6 +4241,8 @@ class Sidebar:
         self.rows = {}
         for n, (i, kind, v, _) in enumerate(lines[self.top:self.top + body_h]):
             y = body_top + n
+            if kind == "gap":  # the free space above To Be Merged
+                continue
             self.rows[y] = i
             sel = i == self.cursor  # always shown; dimmer while the focus is elsewhere
             base = curses.A_REVERSE | (0 if self.focused or self.theme else curses.A_DIM) if sel else 0
@@ -4184,6 +4267,10 @@ class Sidebar:
                 self.draw_session(y, w, v, base)
             elif kind == "mr":
                 self.draw_mr(y, w, v, base)
+            elif kind == "links":
+                self.draw_links(y, w, v, base)
+            elif kind == "link":
+                self.draw_link(y, w, v, base)
             elif kind == "tab":
                 self.draw_tab(y, w, v, base)
             elif kind == "change":
@@ -4266,6 +4353,20 @@ class Sidebar:
         gx, tx = (1, 3) if w < 20 else (3, 5)
         self.put(y, gx, "↗", base | curses.A_DIM)
         self.put(y, tx, f"MR !{mr['url'].rstrip('/').rsplit('/', 1)[-1]}"[: w - tx - 1], base | curses.A_DIM)
+
+    def draw_links(self, y, w, links, base):
+        """ZL1: the links row under a project's sessions: how many, folds open on them."""
+        gx, tx = (1, 3) if w < 20 else (3, 5)
+        n = links["n"]
+        self.put(y, gx, "↗", base | curses.A_DIM)
+        self.put(y, tx, f"{n} link{'s' if n > 1 else ''}"[: w - tx - 1], base | curses.A_DIM)
+        self.put(y, w - 3, "▾" if links["project"] in self.data["links_open"] else "▸", base | curses.A_DIM)
+
+    def draw_link(self, y, w, link, base):
+        """ZL1: one link under the links row; a click opens it."""
+        tx = 5 if w < 20 else 7
+        self.put(y, tx, "·", base | curses.A_DIM)
+        self.put(y, tx + 2, link["label"][: max(0, w - tx - 3)], base | curses.A_DIM)
 
     def draw_session(self, y, w, s, base):
         state, attention = self.state_of(s)
@@ -4442,7 +4543,16 @@ class Sidebar:
             self.fold_changes(v["project"], "commits_open")
         elif kind == "group":  # ⏎ or a click folds it (ZI90)
             self.fold_group()
-        elif kind == "mr":  # ZI91: the MR in the browser
+        elif kind == "links":  # ⏎ or a click folds it (ZL1)
+            self.fold_changes(v["project"], "links_open")
+        elif kind == "link" and os.path.isfile(v["url"]):  # a saved mail (ZL2): the preview, in its session's window
+            s = self.here(v["project"])
+            if s and self.windows.get(s["id"]):
+                show_window(self.windows[s["id"]])
+                show_file(s["id"], f"{self.windows[s['id']]}.0", v["url"])
+            else:
+                self.message = "no session: n starts one"
+        elif kind in ("mr", "link"):  # ZI91, ZL1: in the browser
             open_default(v["url"])
         elif kind in ("tab", "change", "commit"):  # in this window when it is the project's
             t = v[0] if kind in ("change", "commit") else v
@@ -4480,15 +4590,15 @@ class Sidebar:
         with edit_state() as d:
             d["to_merge_open"] = not d.get("to_merge_open")
 
-    FOLDS = {"tab": "changes_open", "commits": "commits_open"}
+    FOLDS = {"tab": "changes_open", "commits": "commits_open", "links": "links_open"}
 
     def opened(self, kind, v):
-        """A row that folds (a project, the changes tab, commits): is it open; None for other rows."""
+        """A row that folds (a project, the changes tab, commits, links): is it open; None for other rows."""
         if kind == "project":
             return v not in self.data["collapsed"]
         if kind == "group":
             return bool(self.data.get("to_merge_open"))
-        if kind == "commits" or kind == "tab" and v["kind"] == "git":
+        if kind in ("commits", "links") or kind == "tab" and v["kind"] == "git":
             return v["project"] in self.data[self.FOLDS[kind]]
         return None
 
@@ -5204,7 +5314,8 @@ def cmd_selftest():
     sock = f"zidev-selftest-{os.getpid()}"
     env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
            "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
-           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell"}
+           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell",
+           "TODO_HOME": f"{root}/todo-home"}
     env.pop("TMUX", None)
     failed = []
 
@@ -6285,11 +6396,41 @@ esac
                                     if text in l), -1)
         check("ZI90: To Be Merged at the bottom of the sidebar, folded: proj4 not listed",
               wait(lambda: row_of("To Be Merged") > row_of("proj") >= 0 and row_of("proj4") == -1))
+        height = int(t("display", "-p", "-t", side, "#{pane_height}"))
+        check("ZI90: with free space above it, To Be Merged is still the last row, just above the footer",
+              row_of("To Be Merged") == height - 3 and "⌘k all actions" in t("capture-pane", "-p", "-t", side).splitlines()[-1])
         mouse_click(side, 3, row_of("To Be Merged"))
         check("ZI90: a click unfolds it: proj4, its MR under its session",
               wait(lambda: row_of("To Be Merged") < row_of("proj4") < row_of("MR !1")))
         mouse_click(side, 6, row_of("MR !1"))
         check("ZI91: a click on its MR row opens the MR", wait(lambda: opened() == "https://gitlab.test/mr/1"))
+        # ZL1, ZL2, ZL3: the task's links under its session: its todo's links and saved mails, what zidev link adds
+        todo = f"{root}/todo-home/todos/open/2000-01-01-proj4"
+        os.makedirs(todo)
+        with open(f"{todo}/email1.md", "w") as f:
+            f.write("# Mail from the museum\n\nhello-from-the-mail\n")
+        with open(f"{todo}/todo.md", "w") as f:
+            f.write(f"---\ntitle: proj4\nzidev: {proj4}\n---\n\n## Links\n- [Ticket 7](https://gitlab.test/issues/7)\n"
+                    "- [its MR](https://gitlab.test/mr/1)\n\n## Anhänge\n- [Mail from the museum](email1.md)\n"
+                    "- [Kickoff](kickoff.md)\n")
+        check("ZL1, ZL2: the todo's links under its session, folded: ↗ 2 links (its MR has its own row, no kickoff)",
+              wait(lambda: row_of("MR !1") < row_of("2 links") and row_of("Ticket 7") == -1))
+        mouse_click(side, 6, row_of("2 links"))
+        check("ZL1: a click unfolds it: its links",
+              wait(lambda: row_of("2 links") < row_of("Ticket 7") < row_of("Mail from the museum")))
+        mouse_click(side, 9, row_of("Ticket 7"))
+        check("ZL1: a click on a link opens it in the browser", wait(lambda: opened() == "https://gitlab.test/issues/7"))
+        mouse_click(side, 9, row_of("Mail from the museum"))
+        mail = lambda: t("list-panes", "-t", wins()[zid4], "-f", "#{&&:#{pane_floating_flag},#{pane_index}}",
+                         "-F", "#{pane_id}").split()
+        check("ZL2: a click on a saved mail shows it in the preview, in its session's window",
+              wait(lambda: "hello-from-the-mail" in t("capture-pane", "-p", "-t", mail()[0])))
+        for pane in mail():
+            t("kill-pane", "-t", pane)
+        t("select-window", "-t", wid)
+        r = z("link", "https://artifacts.test/report", "The report", extra={"ZIDEV_ID": zid4})
+        check("ZL3: zidev link adds one under its session",
+              r.returncode == 0 and wait(lambda: row_of("3 links") < row_of("The report")))
         mouse_click(side, 3, row_of("proj4"), button=2)
         check("ZI92: right click on it: Back to projects in its menu",
               wait(lambda: b"Back to projects" in open(f"{root}/client.out", "rb").read()))
@@ -6516,6 +6657,8 @@ def main():
         cmd_view(*args[1:3])
     elif cmd == "open":
         cmd_open(args[1:])
+    elif cmd == "link":
+        cmd_link(args[1:])
     elif cmd == "preview":
         cmd_preview(*args[1:5])
     elif cmd == "sidebar":
