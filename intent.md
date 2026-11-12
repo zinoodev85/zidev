@@ -100,6 +100,9 @@ Arc-style, everything open lives in the vertical sidebar.
 ZI11 **Selected shows as selected.**
 What is selected always shows as selected.
 
+ZI96 **Selected is what is shown.**
+The sidebar's gray bar is on what the window shows. Only ↑ ↓ move it away, while I pick; once the keyboard leaves the sidebar, it is back. A click on ▸, a right-click and palette actions do not move it at all.
+
 ZI12 **Shows when I am needed.**
 When a human is needed (by Claude or a script), the sidebar shows it.
 
