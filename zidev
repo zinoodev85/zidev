@@ -68,7 +68,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -4022,6 +4022,8 @@ class Sidebar:
         self.waits = set()   # panes of terminal tabs that wait for you
         self.standby_checked = time.time()  # ZI94: when it last looked whether its session may go to standby
         self.woken = 0.0     # when it last woke its session from standby
+        self.menu = None     # the row right-clicked: its menu's action is for it (ZI96: the bar stays)
+        self.to_shown = False  # a click: then the bar is on what the window shows (ZI96)
 
     # data
 
@@ -4167,12 +4169,30 @@ class Sidebar:
         zid = self.my_id if me and me["cwd"] == cwd else last_session(cwd, self.tabs, self.windows)
         return next((s for s in self.data["sessions"] if s["id"] == zid), None)
 
+    def find(self, key):
+        """The index of the row with this ident; None when it is not listed."""
+        return next((i for i, item in enumerate(self.items) if self.ident(item) == key), None)
+
     def select(self, key):
-        for i, item in enumerate(self.items):
-            if key == self.ident(item):
-                self.cursor = i
-                return
-        self.cursor = min(self.cursor, max(len(self.items) - 1, 0))
+        at = self.find(key)
+        self.cursor = at if at is not None else min(self.cursor, max(len(self.items) - 1, 0))
+
+    def select_shown(self):
+        """ZI96: the bar on what this window shows: the diff of a changed file or commit, a tab, its Claude
+        (the session); the project when that row is folded away."""
+        me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
+        if not me:
+            return
+        keys = [("session", self.my_id), ("project", me["cwd"])]
+        t = shown_in(self.windows.get(self.my_id), self.tabs)
+        if t and t["kind"] != "claude":
+            keys.insert(0, ("tab", t["pane"]))
+        if t and t["kind"] == "git":  # the changes tab: the row of the diff it shows
+            sha = t["file"].removeprefix("commit:")
+            keys.insert(0, ("commit", (t["pane"], sha)) if sha != t["file"] else ("change", (t["pane"], t["file"])))
+        for key in keys:
+            if self.find(key) is not None:
+                return self.select(key)
 
     def current(self):
         return self.items[self.cursor] if self.items else (None, None)
@@ -4664,7 +4684,7 @@ class Sidebar:
     KEYS = (curses.KEY_DOWN, curses.KEY_UP, curses.KEY_LEFT, curses.KEY_RIGHT, 10, 13, curses.KEY_ENTER, 27,
             curses.KEY_MOUSE, 25, 5)
 
-    def key(self, ch, act=False):
+    def key(self, ch, act=False, item=None):
         if ch == curses.KEY_RESIZE:  # not a key: keeps the help open
             return self.fix_width(drag=True)
         self.message = ""
@@ -4673,7 +4693,7 @@ class Sidebar:
             return
         if not act and ch not in self.KEYS:
             return
-        kind, v = self.current()
+        kind, v = item or self.current()  # item: the row a palette / menu action is for (ZI96)
         sess = self.session_of_item(kind, v)
         if (kind or "").startswith("pick") and ch in (27, ord("X")):  # no pick
             with edit_state() as d:
@@ -4800,12 +4820,12 @@ class Sidebar:
                         tmux("select-pane", "-t", f"{SESSION}:.0")
                     elif kind in ("project", "session", "tab"):
                         tmux("select-pane", "-t", f"{SESSION}:.1")
+                self.to_shown = True  # ZI96: a fold, an MR, a link: the bar stays on what is shown
             else:
                 key = next((k for fy, x0, x1, k in self.footer if fy == y and x0 <= x < x1), None)
                 if key is not None:
                     open_palette(self.pane) if key == "palette" else self.key(ord(key), act=True)
         elif bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED) and y in self.rows and not self.help:
-            self.cursor = self.rows[y]
             self.context_menu(x, y)
 
     CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X / A act without asking)
@@ -4814,11 +4834,13 @@ class Sidebar:
                            ("Archive", "a", "A"), ("Remove", "x", "X")]}
 
     def context_menu(self, x, y):
-        """Right click on a row: its actions as a menu; each one is the row's key, sent to the sidebar."""
-        kind, v = self.items[self.cursor]
+        """Right click on a row: its actions as a menu; each one is the row's key, sent to the sidebar.
+        The bar stays where it is (ZI96): the action is for the row remembered here."""
+        kind, v = self.items[self.rows[y]]
         items = self.CONTEXT.get(kind)
         if not items:
             return
+        self.menu = self.ident((kind, v))
         if kind == "project" and v in self.data.get("to_merge", {}):  # ZI92
             items = [("Back to projects", "b", "b")] + items
         top = tmux("display", "-p", "-t", self.pane, "#{pane_top}")
@@ -4897,12 +4919,17 @@ class Sidebar:
                 self.refresh()
             if ch == 27 and self.paste():
                 continue
+            item = None  # the row an action is for; the bar stays where it is (ZI96)
             if ch == curses.KEY_F12:  # an action from the palette or the right-click menu: its letter follows
                 self.scr.timeout(1000)
-                ch, target = self.scr.getch(), read_json(PALETTE_PICK, None)
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(PALETTE_PICK)
-                if target:  # the palette's row: [kind, id]; a session in a folded project: unfolded first
+                ch = self.scr.getch()
+                if os.path.exists(PALETTE_PICK):  # from the palette: its row, or none
+                    target = read_json(PALETTE_PICK, None)
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(PALETTE_PICK)
+                else:  # from the right-click menu: the row right-clicked
+                    target, self.menu = self.menu, None
+                if target:  # the row: [kind, id]; a session in a folded project: unfolded first
                     want = (target[0], target[1])
                     if target[0] == "session" and session_of(target[1]).get("cwd") in self.data["collapsed"]:
                         self.fold(session_of(target[1])["cwd"], False)
@@ -4910,14 +4937,16 @@ class Sidebar:
                     if cwd in self.data.get("to_merge", {}) and not self.data.get("to_merge_open"):
                         self.fold_group()  # in the folded To Be Merged group: unfolded first
                     self.load()
-                    self.select(want)
-                    if self.ident(self.current()) != want:  # gone: not on another row
+                    at = self.find(want)
+                    if at is None:  # gone: not on another row
                         ch = -1
+                    else:
+                        item = self.items[at]
                 act = True
             else:
                 act = False
             if ch != -1 and self.visible:
-                self.key(ch, act)
+                self.key(ch, act, item)
                 self.save_view()
                 stale = True
 
@@ -4973,6 +5002,8 @@ class Sidebar:
             self.visible = self.focused = False
             self.load(snap)
             self.adopt_view()
+            if not self.asks():  # ZI96: drawn so, a switch here shows the bar on what is shown at once
+                self.select_shown()
             self.maybe_standby()
             return
         self.focused, shown, self.visible = flags[2] == "1", self.visible, True
@@ -4984,9 +5015,10 @@ class Sidebar:
             tmux("select-pane", "-t", f"{tmux('display', '-p', '-t', self.pane, '#{window_id}')}.1")
         if not shown:
             self.adopt_view()
-            me = next((s for s in self.data["sessions"] if s["id"] == self.my_id), None)
-            if me and not (self.items and self.is_mine(self.current(), me)):
-                self.select(("session", self.my_id))
+        # ZI96: the bar on what the window shows; only ↑ ↓ move it away while the sidebar has the keys
+        if (not shown or not self.focused or self.to_shown) and not self.asks():
+            self.select_shown()
+        self.to_shown = False
 
 
 TICK_MS = 250  # keys, mouse and the spinner
@@ -5453,7 +5485,7 @@ def cmd_selftest():
         check("Claude's own title names the session", shows("Login bug hunt"))
         say({"type": "custom-title", "customTitle": "Auth fix"})
         check("/rename in Claude renames it in the sidebar", shows("Auth fix"))
-        t("select-pane", "-t", side)  # the cursor is still on the session (the right click put it there)
+        t("select-pane", "-t", side)  # the cursor is on the session: it shows (ZI96)
         act("r")
         wait(lambda: "name: Auth fix" in t("capture-pane", "-p", "-t", side))
         t("send-keys", "-t", side, "C-u")
@@ -5481,17 +5513,19 @@ def cmd_selftest():
                 client.stdin.write(f"\x1b[<{button};{left + x + 1};{top + y + 1}{end}".encode())
                 client.stdin.flush()
                 time.sleep(0.1)
-        def cursor_to(text):  # the sidebar's cursor to the first row with text
-            t("select-pane", "-t", side)  # focused: the cursor shows
-            t("send-keys", "-t", side, *["Up"] * 30)
+        def lit(pane):  # the sidebar row under its gray bar
+            return next((l for l in t("capture-pane", "-p", "-e", "-t", pane).splitlines() if re.search(r"48;5;23[68]m", l)), "")
+
+        def cursor_to(text, pane=side):  # the sidebar's cursor to the first row with text
+            t("select-pane", "-t", pane)  # focused: the cursor shows
+            t("send-keys", "-t", pane, *["Up"] * 30)
             time.sleep(0.5)
-            lit = lambda: next((l for l in t("capture-pane", "-p", "-e", "-t", side).splitlines() if re.search(r"48;5;23[68]m", l)), "")  # its gray bar
             for _ in range(40):
-                row = lit()
+                row = lit(pane)
                 if text in row:
                     return
-                t("send-keys", "-t", side, "Down")
-                wait(lambda: lit() != row, 2)  # one step at a time: a slow redraw must not make it overshoot
+                t("send-keys", "-t", pane, "Down")
+                wait(lambda: lit(pane) != row, 2)  # one step at a time: a slow redraw must not make it overshoot
 
         pane_of = lambda kind: next((p for p, k in (l.split(" ") for l in t(
             "list-panes", "-a", "-F", "#{pane_id} #{@zidev_side}").splitlines() if " " in l) if k == kind), "")
@@ -5512,7 +5546,7 @@ def cmd_selftest():
               wait(lambda: main() == "git" and "git" in kinds() and "commits" in t("capture-pane", "-p", "-t", side)))
         z("tab", "select", pane_of("term"))
         wait(lambda: main() == "term")
-        cursor_to("fix the login bug")  # the right click put it on the project
+        cursor_to("fix the login bug")
         # the palette (cmd-k; here ctrl-q): a popup, short until something is typed
         def press(*keys):  # keys from the client; not waited for: the palette's popup holds the key's command
             subprocess.Popen(["tmux", "-L", sock, "send-keys", "-K", "-c", t("list-clients", "-F", "#{client_name}").split()[0],
@@ -5648,6 +5682,9 @@ def cmd_selftest():
         t("kill-pane", "-t", float_pane)
         t("send-keys", "-t", side, "Enter")
         check("⏎ on the session shows Claude", wait(lambda: main() == "claude"))
+        time.sleep(1)  # ⏎ gave Claude the keys
+        t("select-pane", "-t", side)  # back in the sidebar: ↓ moves its bar (ZI96)
+        time.sleep(0.5)
         t("send-keys", "-t", side, "Down")
         t("send-keys", "-t", side, "Enter")
         check("⏎ on a tab row shows that tab", wait(lambda: main() == "term"))
@@ -6088,7 +6125,7 @@ def cmd_selftest():
                    and not any("prompt" in x for x in read_json(f"{home}/sessions.json", {})["sessions"])))
         t("select-window", "-t", wid)  # `new` switched to the new session
         time.sleep(1.2)
-        cursor_to("fix the login bug")  # Toggle changes left it on the project
+        cursor_to("fix the login bug")
         act("J")
         check("J moves a session down", wait(lambda: ids()[1] == zid))
         act("K")
@@ -6329,6 +6366,41 @@ def cmd_selftest():
         z("unarchive", proj2)
         check("unarchive: session and terminal back",
               wait(lambda: len(wins()) == n_wins and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        # ZI96: the gray bar is on what the window shows; only ↑ ↓ move it away, while the sidebar has the keys
+        side1 = f"{wid}.0"
+        row_of = lambda text: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side1).splitlines()) if text in l)
+        t("select-pane", "-t", f"{wid}.1")
+        check("ZI96: the bar is on what the window shows", wait(lambda: "fix the login bug" in lit(side1)))
+        cursor_to("proj2", side1)
+        time.sleep(1.5)  # the sidebar looks at tmux every second: it does not take the bar back
+        check("ZI96: ↑ ↓ move it while the sidebar has the keys", "proj2" in lit(side1))
+        t("select-pane", "-t", f"{wid}.1")
+        check("ZI96: the keys leave the sidebar: the bar is back", wait(lambda: "fix the login bug" in lit(side1)))
+        folded2 = lambda: "▸ proj2" in t("capture-pane", "-p", "-t", side1)
+        was = folded2()
+        mouse_click(side1, 1, row_of("proj2"))
+        wait(lambda: folded2() != was)
+        time.sleep(1.5)
+        check("ZI96: a click on ▸ does not move the bar", folded2() != was and "fix the login bug" in lit(side1))
+        mouse_click(side1, 1, row_of("proj2"))  # unfolded again, as it was
+        wait(lambda: folded2() == was)
+        mark = len(open(f"{root}/client.out", "rb").read())
+        mouse_click(side1, 6, row_of("proj2"), button=2)
+        wait(lambda: b"Archive" in open(f"{root}/client.out", "rb").read()[mark:])
+        time.sleep(1)
+        check("ZI96: a right-click does not move the bar", "fix the login bug" in lit(side1))
+        client.stdin.write(b"r")
+        client.stdin.flush()
+        check("ZI96: the menu's action is for the row right-clicked",
+              wait(lambda: "name: proj2" in t("capture-pane", "-p", "-t", side1)))
+        t("send-keys", "-t", side1, "Escape")
+        wait(lambda: "name:" not in t("capture-pane", "-p", "-t", side1))
+        write_json(f"{home}/palette-pick.json", ["project", proj2])
+        t("send-keys", "-t", side1, "F12", "r")  # Rename project in the palette, for proj2
+        wait(lambda: "name: proj2" in t("capture-pane", "-p", "-t", side1))
+        t("send-keys", "-t", side1, "Escape")
+        wait(lambda: "name:" not in t("capture-pane", "-p", "-t", side1))
+        check("ZI96: a palette action for another project does not move the bar", "fix the login bug" in lit(side1))
         # ZI85: zidev done: not while it would lose work; then the project is removed and its folder deleted
         origin, proj4 = f"{root}/origin.git", os.path.realpath(root) + "/proj4"
         subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
