@@ -6859,6 +6859,27 @@ esac
         check("close: the session and its window are gone, no such session exits 3",
               r8.returncode == 0 and wait(lambda: zid7 not in wins()) and zid7 not in
               [x["id"] for x in read_json(f"{home}/sessions.json", {})["sessions"]] and z("close", zid7).returncode == 3)
+        # pane loop on (re)start: a cold saved transcript goes to standby, a warm one resumes (W1000)
+        zid9 = json.loads(z("new", proj5, "--json", "--keep", "--env", "ZIDEV_TEST_SAY=3").stdout)["id"]
+        wait(lambda: zid9 in wins() and f"--session-id {zid9}" in args())
+        pane9 = f"{wins().get(zid9)}.1"
+        restart9 = lambda: t("respawn-pane", "-k", "-t", pane9, "-e", f"ZIDEV_ID={zid9}",
+                             f"{shlex.quote(sys.executable)} {shlex.quote(SELF)} run {zid9}")
+        resumed9 = lambda: args().count(f"--resume {zid9}")
+        fake_transcript(zid9, 120)
+        restart9()
+        cold_standby = wait(lambda: status(zid9).get("state") == "standby", 15)
+        wait(lambda: False, 2)
+        check("pane loop restart: a cold saved transcript goes to standby, Claude is not resumed",
+              cold_standby and resumed9() == 0)
+        os.kill(int(t("display", "-p", "-t", pane9, "#{pane_pid}")), signal.SIGUSR1)  # the investor shows it
+        check("pane loop: showing the cold session in standby resumes it",
+              wait(lambda: resumed9() == 1) and status(zid9).get("state") != "standby")
+        fake_transcript(zid9, 1)
+        restart9()
+        check("pane loop restart: a warm saved transcript resumes at once, no standby",
+              wait(lambda: resumed9() == 2) and status(zid9).get("state") != "standby")
+        z("close", zid9)
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
