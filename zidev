@@ -8,9 +8,10 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev              start (restoring saved sessions) or attach
   zidev DIR          the same, showing DIR's project (its first session); a new project if it is none
   zidev start        start the server in the background, without attaching
-  zidev new [DIR] [--prompt TEXT] [--resume CLAUDE_ID] [--title TEXT] [--env K=V]... [--keep] [--json]
+  zidev new [DIR] [--prompt TEXT] [--resume CLAUDE_ID] [--title TEXT] [--env K=V]... [--keep] [--json] [--investor]
                      new session in DIR (default: current dir); TEXT is Claude's first message; --resume: resumes that
-                     Claude session; --env: exported to its Claude on every start; --keep: never standby;
+                     Claude session (a cold one, no process and transcript idle 60+ min, is refused, exit 4;
+                     --investor: only for the investor's own click (dash2 open)); --env: exported to its Claude on every start; --keep: never standby;
                      --json: prints {"id", "claude_id"}, shows nothing
   zidev say ZID TEXT   type TEXT into that session's Claude as one message and submit it (wakes it first)
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
@@ -879,7 +880,7 @@ You are inside zidev when `ZIDEV_ID` is set: it is your session's id. Your proje
 - Web links in your output open in the browser on a plain click.
 - Rename your project in the sidebar (the folder stays): `zidev rename-project "Name"`; `""` gives back the folder name.
 - A new session in another folder: `zidev new DIR`. Give it its task right away: `zidev new DIR --prompt "…"`
-  (Claude's first message, sent when the session starts). More: `--resume CLAUDE_ID` (resume that Claude session),
+  (Claude's first message, sent when the session starts). More: `--resume CLAUDE_ID` (resume that Claude session; a cold one, no process and transcript idle 60+ min, is refused with exit 4, `--investor` is only for the investor's own click),
   `--title TEXT`, `--env K=V` (repeatable, exported to its Claude), `--keep` (never standby), `--json`
   (prints `{"id": ZID, "claude_id": CID}`, shows nothing).
 - Type a message into a session's Claude: `zidev say ZID TEXT` (multiline is one message; a session in standby or
@@ -1743,6 +1744,36 @@ def cmd_done(args):
     print(f"done: {project_name(cwd)} is removed, {cwd} deleted")
 
 
+COLD_MIN = 60  # no process holds the Claude id and its transcript is this old (minutes): cold (W1000)
+
+
+def claude_transcript(cid):
+    """Newest saved transcript of a Claude id, or None."""
+    root = os.environ.get("ZIDEV_PROJECTS") or os.path.expanduser("~/.claude/projects")
+    files = glob.glob(f"{root}/*/{cid}.jsonl")
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def is_cold(cid):
+    """Cold: no process holds the Claude id and its transcript was last written COLD_MIN or more minutes ago
+    (missing: cold). An agent never reopens a cold session."""
+    f = claude_transcript(cid)
+    if f and time.time() - os.path.getmtime(f) < COLD_MIN * 60:
+        return False
+    skip = {str(os.getpid()), str(os.getppid())}
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if pid not in skip and re.search(rf"--(resume|session-id)[ =]{re.escape(cid)}(\s|$)", cmd):
+            return False
+    return True
+
+
+def refuse_cold(cid):
+    print(f"cold session {cid}: agents open a fresh one with `firma fresh NAME` (W1000)", file=sys.stderr)
+    sys.exit(4)
+
+
 def cmd_new(args):
     opts = {"--prompt": None, "--resume": None, "--title": ""}
     env = {}
@@ -1763,8 +1794,10 @@ def cmd_new(args):
         else:
             rest.append(a)
             i += 1
-    keep, as_json = "--keep" in rest, "--json" in rest
-    rest = [a for a in rest if a not in ("--keep", "--json")]
+    keep, as_json, investor = "--keep" in rest, "--json" in rest, "--investor" in rest
+    rest = [a for a in rest if a not in ("--keep", "--json", "--investor")]
+    if opts["--resume"] and not investor and is_cold(opts["--resume"]):
+        refuse_cold(opts["--resume"])
     if as_json and not server_running():
         ensure_server()
     s = new_session(rest[0] if rest else os.getcwd(), select=not as_json, prompt=opts["--prompt"],
@@ -1811,6 +1844,9 @@ def cmd_say(args):
         sys.exit(f"zidev say: session {zid} has no window")
     state = read_status(zid).get("state")
     if state == "standby":
+        cid = read_status(zid).get("claude_id") or zid
+        if is_cold(cid):  # typing would wake a cold session for an agent
+            refuse_cold(cid)
         wake(pane)
     elif state == "exited":
         restart_claude(s, wid)
@@ -2128,6 +2164,7 @@ def cmd_run(zid):
     tmux("set", "-p", "-t", os.environ.get("TMUX_PANE", ""), "@zidev_standby", "1")  # the sidebar may stop / wake it
     if read_status(zid).get("state") == "standby":  # was in standby when zidev stopped: stays so
         wait_standby(zid)
+    checked = False  # the saved transcript is known not cold (or the investor woke it)
     while True:
         s = next((s for s in load_state()["sessions"] if s["id"] == zid), None)
         if not s:
@@ -2136,8 +2173,12 @@ def cmd_run(zid):
             d["last"] = zid
         cid = read_status(zid).get("claude_id") or zid
         # Claude saves a session only after its first message; an unused one can't be resumed
-        saved = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{cid}.jsonl"))
-        forced = s.get("resume")  # zidev new --resume: its first start resumes, with or without a saved file
+        saved = claude_transcript(cid)
+        forced = s.get("resume")  # zidev new --resume: its first start resumes (already checked by cmd_new)
+        if saved and not forced and not checked and is_cold(cid):  # after a restart: no resume by itself
+            set_status(zid, "standby")
+            wait_standby(zid)  # the investor shows it or presses a key
+        checked = True
         args = [claude_bin(), "--settings", HOOK_SETTINGS, "--resume" if saved or forced else "--session-id", cid]
         if s.get("prompt") or forced:
             if s.get("prompt") and (forced or not saved):
@@ -5455,7 +5496,7 @@ def cmd_selftest():
     os.chmod(fake, 0o755)
     sock = f"zidev-selftest-{os.getpid()}"
     env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
-           "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
+           "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_PROJECTS": f"{root}/cprojects", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
            "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell",
            "TODO_HOME": f"{root}/todo-home"}
     env.pop("TMUX", None)
@@ -6757,6 +6798,18 @@ esac
         # zidev new --resume / --title / --env / --keep / --json, and zidev say
         proj5 = f"{root}/proj5"
         os.makedirs(proj5)
+        os.makedirs(f"{root}/cprojects/p")
+        fake_transcript = lambda cid, age_min: (open(f"{root}/cprojects/p/{cid}.jsonl", "w").close(),
+                                                os.utime(f"{root}/cprojects/p/{cid}.jsonl", (time.time() - age_min * 60,) * 2))
+        fake_transcript("resumed-cid", 5)
+        fake_transcript("cold-cid", 120)
+        rc = z("new", proj5, "--json", "--resume", "cold-cid")
+        rm = z("new", proj5, "--json", "--resume", "missing-cid")
+        check("new --resume: a cold CID (old transcript, or none) is refused, exit 4, message names firma fresh",
+              rc.returncode == 4 and rm.returncode == 4 and "agents open a fresh one with `firma fresh NAME` (W1000)" in rc.stderr
+              and not rc.stdout)
+        ri = z("new", proj5, "--json", "--resume", "cold-cid", "--investor", "--keep")
+        check("new --resume --investor: a cold CID is allowed", ri.returncode == 0 and json.loads(ri.stdout).get("claude_id") == "cold-cid")
         r = z("new", proj5, "--json", "--resume", "resumed-cid", "--title", "Planner X", "--env", "ZIDEV_TEST_SAY=planner-env",
               "--env", "OTHER=a=b", "--keep", "--prompt", "hello again")
         j = json.loads(r.stdout or "{}")
@@ -6792,6 +6845,11 @@ esac
         r7 = z("say", zid7, "to a busy one")
         check("say: a Claude that keeps redrawing (busy) gets the message within seconds, no settle wait",
               r7.returncode == 0 and time.time() - t0 < 5 and wait(lambda: got7() == b"\x1b[200~to a busy one\x1b[201~\r"))
+        cid6 = status(zid6).get("claude_id") or zid6
+        rs = z("say", zid6, "into cold")
+        check("say: into a standby session whose Claude id is cold is refused, exit 4",
+              rs.returncode == 4 and "cold session" in rs.stderr and status(zid6).get("state") == "standby")
+        fake_transcript(cid6, 1)
         z("say", zid6, "after standby")
         got6 = lambda: open(f"{home}/say-got-{zid6}", "rb").read() if os.path.exists(f"{home}/say-got-{zid6}") else b""
         check("say: a session in standby is woken first, then gets the message",
