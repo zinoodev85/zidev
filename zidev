@@ -73,7 +73,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.18"
+VERSION = "0.1.19"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -3882,6 +3882,27 @@ def install_tmux_hooks():
         tmux("bind", "-n", wheel, "if-shell", "-t", "=", "-F", "#{&&:#{==:#{pane_index},0},#{@zidev_id}}",
              f"send-keys -t = {side}",
              "if-shell -t = -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' { " + less + " }")
+    # a right click in a tab: a menu with only Copy and Paste, none of tmux's pane menus (float, split, swap,
+    # kill). The sidebar and apps that take the mouse get the click. The menu's commands are expanded when it
+    # opens, so the word under the mouse is the one right-clicked
+    copy = shlex.quote(os.environ.get("ZIDEV_COPY", "pbcopy"))
+    paste = shlex.quote(os.environ.get("ZIDEV_PASTE", "pbpaste"))
+    tm = "tmux -S '#{socket_path}'"
+    copy_cmd = (f"if -F '#{{selection_present}}' {{ send -X copy-pipe-and-cancel \"{copy}\" }} "
+                f"{{ set-buffer -b zidev-rcopy -- '#{{q:mouse_word}}' ; "
+                f"run-shell \"{tm} save-buffer -b zidev-rcopy - | {copy} ; {tm} delete-buffer -b zidev-rcopy\" }}")
+    paste_cmd = (f"if -F '#{{pane_in_mode}}' {{ send -X cancel }} ; "
+                 f"run-shell \"{paste} | {tm} load-buffer -b zidev-rpaste -\" ; paste-buffer -p -d -b zidev-rpaste")
+    menu = (f"display-menu -O -t = -x M -y M "
+            f"'#{{?#{{||:#{{selection_present}},#{{mouse_word}}}},,-}}Copy' c {{ {copy_cmd} }} "
+            f"Paste v {{ {paste_cmd} }}")
+    tmux("bind", "-n", "MouseDown3Pane", "if-shell", "-F", "-t", "=",
+         "#{||:#{==:#{pane_index},0},#{mouse_any_flag}}", "select-pane -t = ; send-keys -M", menu)
+    for key in ("M-MouseDown3Pane", "MouseDown3Status", "M-MouseDown3Status", "MouseDown3StatusLeft",
+                "M-MouseDown3StatusLeft", "MouseDown3Empty", "M-MouseDown3Empty"):
+        tmux("unbind", "-n", key)
+    for key in ("<", ">"):
+        tmux("unbind", "-T", "prefix", key)
     tmux("set", "-g", "status", "off")  # no tab bar: tabs are listed in the sidebar
 
 
@@ -5487,6 +5508,9 @@ def cmd_selftest():
     with open(f"{root}/copy", "w") as f:  # stands in for pbcopy
         f.write(f"#!/bin/sh\ncat > {root}/copied\n")
     os.chmod(f"{root}/copy", 0o755)
+    with open(f"{root}/paste", "w") as f:  # stands in for pbpaste
+        f.write("#!/bin/sh\nprintf from-clipboard\n")
+    os.chmod(f"{root}/paste", 0o755)
     with open(f"{root}/guess", "w") as f:  # stands in for the AI asked which file a name means
         f.write("#!/bin/sh\ncat >/dev/null\nsleep 1\necho lib/Dup.ts\n")
     os.chmod(f"{root}/guess", 0o755)
@@ -5497,7 +5521,7 @@ def cmd_selftest():
     sock = f"zidev-selftest-{os.getpid()}"
     env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
            "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_PROJECTS": f"{root}/cprojects", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
-           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_TELL_APP": f"{root}/tell",
+           "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_PASTE": f"{root}/paste", "ZIDEV_TELL_APP": f"{root}/tell",
            "TODO_HOME": f"{root}/todo-home"}
     env.pop("TMUX", None)
     failed = []
@@ -5626,6 +5650,31 @@ def cmd_selftest():
               any(l.strip() == "name:" for l in t("capture-pane", "-p", "-t", side).splitlines()))
         t("send-keys", "-t", side, "Escape")
         wait(lambda: "name:" not in t("capture-pane", "-p", "-t", side))
+        # right click in a tab: only Copy and Paste, none of tmux's pane menu (float, split, swap, kill)
+        tab = t("display", "-p", "-t", side, "#{window_id}") + ".1"
+        left, ptop = (int(v) for v in t("display", "-p", "-t", tab, "#{pane_left} #{pane_top}").split())
+        trow = next(i for i, l in enumerate(t("capture-pane", "-p", "-t", tab).splitlines()) if l.startswith("fake claude"))
+
+        def right_click(key):
+            seen = os.path.getsize(f"{root}/client.out")
+            for end in "Mm":
+                client.stdin.write(f"\x1b[<2;{left + 2};{ptop + trow + top + 1}{end}".encode())
+                client.stdin.flush()
+                time.sleep(0.1)
+            shown = wait(lambda: b"Paste" in open(f"{root}/client.out", "rb").read()[seen:])
+            menu = open(f"{root}/client.out", "rb").read()[seen:]
+            client.stdin.write(key)
+            client.stdin.flush()
+            return shown, menu
+        shown, menu = right_click(b"c")
+        check("right click in a tab: a menu of Copy and Paste only",
+              shown and b"Copy" in menu and not any(w in menu for w in (b"Float", b"Split", b"Swap", b"Kill", b"Zoom")))
+        check("Copy: the word right-clicked goes to the clipboard",
+              wait(lambda: os.path.exists(f"{root}/copied") and open(f"{root}/copied").read() == "fake"))
+        right_click(b"v")
+        check("Paste: the clipboard is typed into the tab",
+              wait(lambda: "from-clipboard" in t("capture-pane", "-p", "-t", tab)))
+        check("alt-right-click: no tmux menu", "M-MouseDown3Pane" not in t("list-keys", "-T", "root"))
         # Claude's names for the session (its own title, /rename) from its transcript; r wins until a later /rename
         tr = f"{root}/transcript.jsonl"
         say = lambda e: open(tr, "a").write(json.dumps(e) + "\n")

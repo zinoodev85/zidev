@@ -67,6 +67,12 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | K4 | The palette's Clipboard tab lists the copies, newest first, with the app and when; searchable, with a preview. ⏎ on a text in zidev types it into the tab (from the sidebar: into the tab beside it). An image or files, or any copy from the panel over another app: zidev.app pastes it into the app in front. | self: "⇧⇥ to Clipboard: it lists the copies", "⏎ on a text from the sidebar: …", "not into the sidebar", "⏎ on an image: zidev.app pastes it", "float: ⏎ on a text, …" |
 | K5 | ctrl-cmd-1 … 5 paste copy 1 … 5 (1 = newest) into the app in front; ctrl-cmd-0 pastes the clipboard as plain text. A paste is cmd-v once the keys are up; 0.5 s later the clipboard is put back, the history stays as it was. Without Accessibility the copy stays on the clipboard, to paste by hand. | hand |
 
+## Mouse in tabs
+
+| # | Spec | Check |
+|---|------|-------|
+| M1 | ZI97: a right-click in a tab (not the sidebar, not an app that takes the mouse) opens a menu of Copy and Paste only. Copy copies the selection, else the word right-clicked, to the clipboard; Paste types the clipboard into the tab. tmux's own menus (pane, alt-right-click, status, prefix < >) are gone. | self: "right click in a tab: a menu of Copy and Paste only", "Copy: the word right-clicked goes to the clipboard", "Paste: the clipboard is typed into the tab", "alt-right-click: no tmux menu" |
+
 ## Clicks in Claude (zidev.app cmd-click)
 
 | # | Spec | Check |
