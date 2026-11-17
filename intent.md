@@ -277,6 +277,9 @@ The wheel scrolls the pane under the mouse; over the sidebar it scrolls the list
 ZI50 **Menus work with the mouse.**
 Menus work with the mouse: click picks an item, moving the mouse does not close them.
 
+ZI97 **Right-click: copy and paste.**
+A right-click in a tab gives a menu with just Copy and Paste. No tmux pane menu (float, split, swap, kill) anywhere.
+
 ## Clicks
 
 ZI51 **Paths stay out of the browser.**
