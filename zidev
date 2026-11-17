@@ -73,7 +73,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.20"
+VERSION = "0.1.21"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -2188,6 +2188,7 @@ def cmd_run(zid):
                     if x["id"] == zid:
                         x.pop("prompt", None)
                         x.pop("resume", None)
+        os.environ["CLAUDE_CODE_NO_FLICKER"] = "1"  # fullscreen: scrolling keeps the prompt (ZI98)
         os.environ.update(s.get("env") or {})
         set_status(zid, "starting")
         try:
@@ -5237,6 +5238,7 @@ def cmd_sidebar():
 FAKE_CLAUDE = """#!/bin/sh
 # stands in for claude: records its arguments, reports hook events like the real one
 echo "$@" >> "$ZIDEV_HOME/claude-args"
+echo "$CLAUDE_CODE_NO_FLICKER" > "$ZIDEV_HOME/claude-flicker"
 echo "fake claude $*"
 printf '{"hook_event_name":"SessionStart","session_id":"%s"}' "$ZIDEV_TEST_CID" | "$ZIDEV_SELF" hook
 if [ -n "$ZIDEV_TEST_SAY" ]; then  # takes input like Claude: bracketed paste on, keys raw
@@ -5598,7 +5600,7 @@ def cmd_selftest():
         check("/clear: claude id followed, title kept",
               status(zid).get("claude_id") == "cid-2" and status(zid).get("prompt") == "fix the login bug")
         check("Claude gets its real colors in tmux", t("show-environment", "-g", "CLAUDE_CODE_TMUX_TRUECOLOR") == "CLAUDE_CODE_TMUX_TRUECOLOR=1")
-        check("ZI98: Claude always starts fullscreen", t("show-environment", "-g", "CLAUDE_CODE_NO_FLICKER") == "CLAUDE_CODE_NO_FLICKER=1")
+        check("ZI98: Claude always starts fullscreen", open(f"{home}/claude-flicker").read().strip() == "1")
         check("list --json", json.loads(z("list", "--json").stdout)[0]["status"]["state"] == "working")
 
         # the sidebar reacts only while a client looks at it

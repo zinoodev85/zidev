@@ -72,7 +72,7 @@ zidev.app, through its probe) · **hand** = no automatic check yet: try it, then
 | # | Spec | Check |
 |---|------|-------|
 | M1 | ZI97: a right-click in a tab (not the sidebar, not an app that takes the mouse) opens a menu of Copy and Paste only. Copy copies the selection, else the word right-clicked, to the clipboard; Paste types the clipboard into the tab. tmux's own menus (pane, alt-right-click, status, prefix < >) are gone. | self: "right click in a tab: a menu of Copy and Paste only", "Copy: the word right-clicked goes to the clipboard", "Paste: the clipboard is typed into the tab", "alt-right-click: no tmux menu" |
-| M2 | ZI98: Claude in zidev starts fullscreen (`CLAUDE_CODE_NO_FLICKER=1` in the tmux server's environment), also after Claude turned it off by itself after failed starts (`fullscreenAutoDisabled`): the wheel scrolls Claude, its prompt stays. | self: "ZI98: Claude always starts fullscreen" |
+| M2 | ZI98: Claude in zidev starts fullscreen (`CLAUDE_CODE_NO_FLICKER=1`, set by zidev each time it starts Claude, also on a restart inside a running tab), also after Claude turned it off by itself after failed starts (`fullscreenAutoDisabled`): the wheel scrolls Claude, its prompt stays. | self: "ZI98: Claude always starts fullscreen" |
 
 ## Clicks in Claude (zidev.app cmd-click)
 
