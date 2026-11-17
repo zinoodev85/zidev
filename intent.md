@@ -274,6 +274,9 @@ alt / cmd + arrows and backspace move and delete by word / line everywhere (edit
 ZI49 **Wheel scrolls what is under it.**
 The wheel scrolls the pane under the mouse; over the sidebar it scrolls the list (the cursor stays).
 
+ZI98 **Scrolling Claude keeps its prompt.**
+Claude runs fullscreen: scrolling up in a session scrolls Claude's answers, its prompt stays, I can type. Also when Claude turned fullscreen off by itself.
+
 ZI50 **Menus work with the mouse.**
 Menus work with the mouse: click picks an item, moving the mouse does not close them.
 
