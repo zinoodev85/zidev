@@ -73,7 +73,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.19"
+VERSION = "0.1.20"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -5598,6 +5598,7 @@ def cmd_selftest():
         check("/clear: claude id followed, title kept",
               status(zid).get("claude_id") == "cid-2" and status(zid).get("prompt") == "fix the login bug")
         check("Claude gets its real colors in tmux", t("show-environment", "-g", "CLAUDE_CODE_TMUX_TRUECOLOR") == "CLAUDE_CODE_TMUX_TRUECOLOR=1")
+        check("ZI98: Claude always starts fullscreen", t("show-environment", "-g", "CLAUDE_CODE_NO_FLICKER") == "CLAUDE_CODE_NO_FLICKER=1")
         check("list --json", json.loads(z("list", "--json").stdout)[0]["status"]["state"] == "working")
 
         # the sidebar reacts only while a client looks at it
