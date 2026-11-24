@@ -16,6 +16,7 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev say ZID TEXT   type TEXT into that session's Claude as one message and submit it (wakes it first)
   zidev rename-project [DIR] NAME   show a project under NAME ("" gives back the folder's name)
   zidev archive DIR / unarchive DIR   hide a project (its sessions stop) / bring it back
+  zidev sleep DIR / wake DIR   a project's sessions stop, it stays in the Sleeping group at the bottom of the sidebar / back
   zidev done [DIR] [--check | --force] [--reviewer NAME] [--answer TEXT] [--dry]   task finished: remove the project, delete its folder (not while its MR is open or that loses work); its MR open: AI review first, then NAME assigned as reviewer, TEXT replied to the AI review; --dry: only say it
   zidev list [--json]  print sessions and their status
   zidev kill         stop the tmux server (sessions stay saved, restored on next start)
@@ -73,7 +74,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.21"
+VERSION = "0.1.22"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -668,7 +669,7 @@ def _ensure_project_tabs():
         return
     d = load_state()
     for cwd in dict.fromkeys(d["projects"] + [s["cwd"] for s in d["sessions"]]):
-        if not os.path.isdir(cwd) or cwd in d.get("archived", []):
+        if not os.path.isdir(cwd) or cwd in stopped_projects(d):
             continue
         kinds = always(cwd, d)
         for t in project_tabs(cwd, tabs):
@@ -767,8 +768,8 @@ def repair_tabs():
 
 
 def sync_tabs(cwd, tabs=None):
-    """Save a project's tabs (restored after a restart). An archived one's stay as saved."""
-    if cwd in archived():
+    """Save a project's tabs (restored after a restart). An archived or sleeping one's stay as saved."""
+    if cwd in stopped_projects(load_state()):
         return
     tabs, wins = all_tabs(strict=True) if tabs is None else tabs, session_windows(strict=True)
     if tabs is None or wins is None:  # tmux did not answer: keep what is saved
@@ -824,7 +825,7 @@ def _restore_tabs():
             tmux("kill-pane", "-t", t["pane"])
         if extra:
             sync_tabs(cwd)
-        if project_tabs(cwd, tabs) or not os.path.isdir(cwd) or cwd in d.get("archived", []):
+        if project_tabs(cwd, tabs) or not os.path.isdir(cwd) or cwd in stopped_projects(d):
             continue
         shown = set()
         saved = saved_tabs(d, cwd)
@@ -990,7 +991,7 @@ def ensure_server():
     wins = session_windows()
     d = load_state()
     for s in d["sessions"]:
-        if s["id"] not in wins and os.path.isdir(s["cwd"]) and s["cwd"] not in d.get("archived", []):
+        if s["id"] not in wins and os.path.isdir(s["cwd"]) and s["cwd"] not in stopped_projects(d):
             wins[s["id"]] = spawn_window(s)
     restore_tabs()
     ensure_project_tabs()
@@ -1024,7 +1025,7 @@ def new_session(cwd, select=True, prompt=None, resume=None, title="", env=None, 
         s["env"] = env  # exported to its Claude on every start
     if keep:
         s["keep"] = True  # never standby
-    if cwd in archived():  # a new session brings the project back
+    if cwd in stopped_projects(load_state()):  # a new session brings the project back
         unarchive_project(cwd)
     with edit_state() as d:
         d["sessions"].append(s)
@@ -1232,7 +1233,7 @@ def cmd_open_dir(path):
     """zidev DIR (zidev .): zidev showing that folder's project, on its first session; new if it is none."""
     cwd = os.path.realpath(os.path.expanduser(path))
     ensure_server()
-    if cwd in archived():
+    if cwd in stopped_projects(load_state()):
         unarchive_project(cwd)
     first = next((s for s in load_state()["sessions"] if s["cwd"] == cwd), None)
     if not first:
@@ -1264,13 +1265,20 @@ def archived():
     return load_state().get("archived", [])
 
 
-def archive_project(cwd):
+def stopped_projects(d):
+    """The projects that run nothing: the archived ones (ZI82) and the sleeping ones (ZI99)."""
+    return d.get("archived", []) + d.get("asleep", [])
+
+
+def archive_project(cwd, key="archived"):
     """Hide a project from the sidebar. Nothing of it keeps running: its sessions and tabs stop (saved,
-    back on unarchive), and so does what they left running. How many such processes stopped."""
+    back on unarchive), and so does what they left running. How many such processes stopped.
+    key "asleep" (ZI99): the same, but it stays in the sidebar as a gray row at the bottom."""
     sync_tabs(cwd)
     with edit_state() as d:
-        if cwd not in d.setdefault("archived", []):
-            d["archived"].append(cwd)
+        d["asleep"] = [c for c in d.get("asleep", []) if c != cwd]  # an archived one does not sleep too
+        if cwd not in d.setdefault(key, []):
+            d[key].append(cwd)
     return stop_project(cwd, {s["id"] for s in load_state()["sessions"] if s["cwd"] == cwd})
 
 
@@ -1352,7 +1360,7 @@ def remove_project(cwd):
         d["sessions"] = [s for s in d["sessions"] if s["cwd"] != cwd]
         for key in ("project_tabs", "names", "to_merge", "review", "links"):
             d.get(key, {}).pop(cwd, None)
-        for key in ("changes", "changes_open", "commits_open", "links_open"):
+        for key in ("changes", "changes_open", "commits_open", "links_open", "asleep"):
             d[key] = [c for c in d.get(key, []) if c != cwd]
     for zid in zids:
         for path in (f"{STATUS_DIR}/{zid}.json", f"{SEEN_DIR}/{zid}"):
@@ -1362,8 +1370,10 @@ def remove_project(cwd):
 
 
 def unarchive_project(cwd):
+    """An archived project back in the sidebar, a sleeping one awake (ZI99): its sessions and tabs start again."""
     with edit_state() as d:
         d["archived"] = [c for c in d.get("archived", []) if c != cwd]
+        d["asleep"] = [c for c in d.get("asleep", []) if c != cwd]
         if cwd not in d["projects"]:
             d["projects"].append(cwd)
     if server_running():
@@ -1389,6 +1399,24 @@ def cmd_archive(args, on=True):
         return
     stopped = archive_project(cwd)  # again on an archived one: stops what still runs for it
     print(f"archived {project_name(cwd)}" + (f", {stopped} processes it left running stopped" if stopped else ""))
+
+
+def cmd_sleep(args, on=True):
+    """zidev sleep DIR / wake DIR (ZI99)."""
+    if not args:
+        sys.exit(f"usage: zidev {'sleep' if on else 'wake'} DIR")
+    cwd = os.path.realpath(os.path.expanduser(args[0]))
+    d = load_state()
+    if not on and cwd not in d.get("asleep", []):
+        sys.exit(f"not asleep: {cwd}")
+    if not on:
+        unarchive_project(cwd)
+        print(f"woke {project_name(cwd)}")
+        return
+    if cwd not in d["projects"] or cwd in d.get("archived", []):
+        sys.exit(f"not a zidev project: {cwd}")
+    archive_project(cwd, "asleep")
+    print(f"{project_name(cwd)} sleeps")
 
 
 def branch_mr(cwd):
@@ -1981,7 +2009,7 @@ def cmd_doctor():
     if running:
         wins = session_windows()
         d = load_state()
-        missing = [x for x in d["sessions"] if x["id"] not in wins and x["cwd"] not in d.get("archived", [])]  # ZI82
+        missing = [x for x in d["sessions"] if x["id"] not in wins and x["cwd"] not in stopped_projects(d)]  # ZI82
         check(not missing, f"{len(wins)} session windows", "zidev start (restores missing windows)")
     if os.path.exists(LOG) and os.path.getsize(LOG):
         check(True, f"log {LOG} ({os.path.getsize(LOG)} bytes; zidev logs)")
@@ -2612,6 +2640,7 @@ PALETTE_ACTIONS = [  # (label, key hint, what: "tab ACTION", "side KEY ROW" (F12
     ("Rename session", "", "side r session"), ("Rename project", "", "side r project"),
     ("Restart Claude", "", "side R session"), ("Close tab", "⌘W", "tab close"),
     ("Close session", "", "side x session"), ("Archive project", "", "side a project"),
+    ("Sleep project", "", "side s project"),
     ("Remove project", "", "side x project"), ("Move session up", "", "side K session"),
     ("Move session down", "", "side J session"), ("Move project up", "", "side K project"),
     ("Move project down", "", "side J project"), ("Keys", "", "side ? -")]
@@ -2663,7 +2692,7 @@ def cmd_palette(pane):
             name = f"{label} · {project_name(cwd)}" if row == "project" else label
             acts[f"act\t{what}"] = f"act\t\033[36m›\033[0m {name}  {dim(hint)}\t{what}\t"
     common = [k for k in acts if k.split("\t")[1] in PALETTE_COMMON]
-    live = [p for p in d["projects"] if p not in archived()]
+    live = [p for p in d["projects"] if p not in stopped_projects(d)]
     projects = {f"project\t{p}": f"project\t▾ {project_name(p)}  {dim(p)}\t{p}\t" for p in live}
     found = {f"session\t{x['id']}": f"session\t◆ {title_of(x, read_status(x['id']))}  {dim(project_name(p))}\t{x['id']}\t"
              for p in live for x in d["sessions"] if x["cwd"] == p}
@@ -2671,6 +2700,8 @@ def cmd_palette(pane):
                   for t in (project_tabs(cwd) if s else [])})
     found.update({f"archived\t{c}": f"archived\t▸ {project_name(c)}  {dim('archived · ⏎ unarchives')}\t{c}\t"
                   for c in archived()})
+    found.update({f"archived\t{c}": f"archived\t☾ {project_name(c)}  {dim('asleep · ⏎ wakes')}\t{c}\t"
+                  for c in d.get("asleep", [])})
     rows = {**acts, **projects, **found}
     apps = {f"app\t{a}": f"app\t◇ {os.path.basename(a)[:-4]}  {dim('app')}\t{a}\t" for a in mac_apps()}
     top = palette_used({**rows, **apps}, cwd if s else None)
@@ -4203,7 +4234,7 @@ class Sidebar:
         wins, tabs = snap[1:] if snap else (None, None)
         self.windows = wins if wins is not None else getattr(self, "windows", {})
         self.tabs = tabs if tabs is not None else getattr(self, "tabs", [])
-        gone = set(self.data.get("archived", []))  # archived: not listed (the palette finds them)
+        gone = set(stopped_projects(self.data))  # archived: not listed (the palette finds them); asleep: a row
         self.data["projects"] = [c for c in self.data["projects"] if c not in gone]
         self.data["sessions"] = [s for s in self.data["sessions"] if s["cwd"] not in gone]
         key = self.ident(self.items[self.cursor]) if self.items else None
@@ -4224,6 +4255,11 @@ class Sidebar:
         to_merge = self.data.get("to_merge", {})  # ZI90: projects whose MR is not merged yet
         for cwd in [c for c in projects if c not in to_merge]:
             self.add_project(cwd, by_cwd.get(cwd, []))
+        asleep = self.data.get("asleep", [])
+        if asleep:  # ZI99: at the bottom, in their own group, folded at first; above To Be Merged
+            self.items.append(("group", "Sleeping"))
+            if self.data.get("asleep_open"):
+                self.items += [("asleep", cwd) for cwd in asleep]
         waiting = [c for c in projects if c in to_merge]
         if waiting:  # at the bottom, in their own group, folded at first
             self.items.append(("group", "To Be Merged"))
@@ -4314,7 +4350,7 @@ class Sidebar:
     @staticmethod
     def ident(item):
         kind, v = item
-        return kind, (v if kind in ("project", "pickfile", "group") else v["id"] if kind == "session" else
+        return kind, (v if kind in ("project", "pickfile", "group", "asleep") else v["id"] if kind == "session" else
                       v["at"] if kind in ("pick", "pickmore") else
                       (v[0]["pane"], v[2]) if kind == "change" else
                       (v[0]["pane"], v[1]) if kind == "commit" else
@@ -4327,7 +4363,7 @@ class Sidebar:
 
     @staticmethod
     def project_of(kind, v):
-        return {"project": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"], "commits": lambda: v["project"],
+        return {"project": lambda: v, "asleep": lambda: v, "session": lambda: v["cwd"], "tab": lambda: v["project"], "commits": lambda: v["project"],
                 "change": lambda: v[0]["project"], "commit": lambda: v[0]["project"], "mr": lambda: v["project"],
                 "links": lambda: v["project"], "link": lambda: v["project"], "group": lambda: None}[kind]()
 
@@ -4415,7 +4451,8 @@ class Sidebar:
 
         body_top, body_h = 2, max(h - 4, 1)
         group = next((n for n, line in enumerate(lines) if line[1] == "group"), None)
-        if group is not None and len(lines) < body_h:  # ZI90: To Be Merged at the very bottom, above the footer
+        # ZI90, ZI99: Sleeping and To Be Merged at the very bottom, above the footer
+        if group is not None and len(lines) < body_h:
             lines[group:group] = [(None, "gap", None, 0)] * (body_h - len(lines))
         cur_line = next((n for n, l in enumerate(lines) if l[0] == self.cursor), 0)
         if self.scrolled:
@@ -4429,7 +4466,7 @@ class Sidebar:
         self.rows = {}
         for n, (i, kind, v, _) in enumerate(lines[self.top:self.top + body_h]):
             y = body_top + n
-            if kind == "gap":  # the free space above To Be Merged
+            if kind == "gap":  # the free space above Sleeping and To Be Merged
                 continue
             self.rows[y] = i
             sel = i == self.cursor  # always shown; dimmer while the focus is elsewhere
@@ -4450,7 +4487,9 @@ class Sidebar:
                 if folded and waiting:
                     self.put(y, w - (5 if mark else 3), f"{waiting} ", base | c(3) | bold)
             elif kind == "group":
-                self.draw_group(y, w, base)
+                self.draw_group(y, w, v, base)
+            elif kind == "asleep":  # ZI99: a sleeping project, gray
+                self.put(y, 1, f"☾ {project_name(v)}"[: w - 2], base | dim)
             elif kind == "session":
                 self.draw_session(y, w, v, base)
             elif kind == "mr":
@@ -4525,12 +4564,15 @@ class Sidebar:
             return SPIN[self.frame % len(SPIN)], curses.color_pair(4)
         return None
 
-    def draw_group(self, y, w, base):
-        """ZI90: the To Be Merged row, how many projects are in it; folded, it still shows their work."""
-        to_merge = self.data.get("to_merge", {})
-        folded = not self.data.get("to_merge_open")
+    def draw_group(self, y, w, name, base):
+        """ZI90, ZI99: the To Be Merged or Sleeping row, how many projects are in it; folded, To Be Merged
+        still shows their work (a sleeping project does none)."""
+        to_merge = self.data.get("to_merge", {}) if name == "To Be Merged" else {}
+        folded = not self.data.get(self.GROUP_OPEN[name])
         n = sum(1 for cwd in self.data["projects"] if cwd in to_merge)
-        self.put(y, 1, ("▸ " if folded else "▾ ") + "To Be Merged", base | curses.A_BOLD | curses.A_DIM)
+        if name == "Sleeping":
+            n = len(self.data.get("asleep", []))
+        self.put(y, 1, ("▸ " if folded else "▾ ") + name, base | curses.A_BOLD | curses.A_DIM)
         mark = self.work_mark([s for s in self.data["sessions"] if s["cwd"] in to_merge]) if folded else None
         if mark:
             self.put(y, w - 2, mark[0], base | mark[1])
@@ -4710,6 +4752,10 @@ class Sidebar:
                 pick = d.pop("pick", None)
             if pick:
                 show_file(pick["zid"], pick["pane"], v, pick["line"])
+        elif kind == "asleep":  # ZI99: a click or ⏎ wakes it and shows it
+            unarchive_project(v)
+            self.load()
+            self.open(("project", v))
         elif kind == "project":  # its session used last (the first when none was); folded or not, it stays so
             sessions = [s for s in self.data["sessions"] if s["cwd"] == v]
             if sessions:
@@ -4729,8 +4775,8 @@ class Sidebar:
                     select_tab(claude["pane"])
         elif kind == "commits":  # ⏎ or a click folds it
             self.fold_changes(v["project"], "commits_open")
-        elif kind == "group":  # ⏎ or a click folds it (ZI90)
-            self.fold_group()
+        elif kind == "group":  # ⏎ or a click folds it (ZI90, ZI99)
+            self.fold_group(v)
         elif kind == "links":  # ⏎ or a click folds it (ZL1)
             self.fold_changes(v["project"], "links_open")
         elif kind == "link" and os.path.isfile(v["url"]):  # a saved mail (ZL2): the preview, in its session's window
@@ -4773,10 +4819,12 @@ class Sidebar:
             elif now and not want:
                 d["collapsed"].remove(cwd)
 
-    def fold_group(self):
-        """Fold / unfold the To Be Merged group (ZI90)."""
+    GROUP_OPEN = {"To Be Merged": "to_merge_open", "Sleeping": "asleep_open"}  # group -> its state key, set: unfolded
+
+    def fold_group(self, name="To Be Merged"):
+        """Fold / unfold the To Be Merged group (ZI90) or the Sleeping group (ZI99)."""
         with edit_state() as d:
-            d["to_merge_open"] = not d.get("to_merge_open")
+            d[self.GROUP_OPEN[name]] = not d.get(self.GROUP_OPEN[name])
 
     FOLDS = {"tab": "changes_open", "commits": "commits_open", "links": "links_open"}
 
@@ -4785,7 +4833,7 @@ class Sidebar:
         if kind == "project":
             return v not in self.data["collapsed"]
         if kind == "group":
-            return bool(self.data.get("to_merge_open"))
+            return bool(self.data.get(self.GROUP_OPEN[v]))
         if kind in ("commits", "links") or kind == "tab" and v["kind"] == "git":
             return v["project"] in self.data[self.FOLDS[kind]]
         return None
@@ -4882,12 +4930,12 @@ class Sidebar:
             if kind == "project":
                 self.fold(v)
             elif kind == "group":
-                self.fold_group()
+                self.fold_group(v)
             else:
                 self.fold_changes(v["project"], self.FOLDS[kind])
         elif ch in (10, 13, curses.KEY_ENTER) and kind:
             self.open((kind, v))
-        elif ch == curses.KEY_LEFT and kind and kind not in ("project", "group") and "pick" not in kind:  # up to its project, folded
+        elif ch == curses.KEY_LEFT and kind and kind not in ("project", "group", "asleep") and "pick" not in kind:  # up to its project, folded
             cwd = self.project_of(kind, v)
             self.fold(cwd, True)
             self.select(("project", cwd))
@@ -4916,14 +4964,18 @@ class Sidebar:
         elif ch in (ord("x"), ord("X")) and kind == "session":
             if ch == ord("X") or self.confirm(f"close '{title_of(v, self.status.get(v['id'], {}))[:14]}'?", "x"):
                 close_session(v["id"])
-        elif ch in (ord("x"), ord("X")) and kind == "project":
-            n = sum(s["cwd"] == v for s in self.data["sessions"])
+        elif ch in (ord("x"), ord("X")) and kind in ("project", "asleep"):
+            n = sum(s["cwd"] == v for s in load_state()["sessions"])  # a sleeping one's are not in self.data
             if ch == ord("X") or not n or self.confirm(
                     f"remove {project_name(v)[:14]} and {n} session{'s' * (n > 1)}?", "x"):
                 remove_project(v)
         elif ch == ord("b") and kind == "project":  # ZI92: Back to projects, out of To Be Merged
             with edit_state() as d:
                 d.get("to_merge", {}).pop(v, None)
+        elif ch == ord("s") and kind == "asleep":  # ZI99: Wake
+            self.open((kind, v))
+        elif ch == ord("s") and kind:  # ZI99: Sleep
+            archive_project(self.project_of(kind, v), "asleep")
         elif ch == ord("w"):
             self.next_attention()
         elif ch in (ord("a"), ord("A")) and kind:  # A: from the right-click menu, no question
@@ -4986,7 +5038,7 @@ class Sidebar:
                     # already, or on a changed file / commit (its diff beside), leaves them here (t, g, …)
                     if kind in ("change", "commit") or shown() == before:
                         tmux("select-pane", "-t", f"{SESSION}:.0")
-                    elif kind in ("project", "session", "tab"):
+                    elif kind in ("project", "session", "tab", "asleep"):
                         tmux("select-pane", "-t", f"{SESSION}:.1")
                 self.to_shown = True  # ZI96: a fold, an MR, a link: the bar stays on what is shown
             else:
@@ -4999,7 +5051,8 @@ class Sidebar:
     CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X / A act without asking)
                "session": [("Rename", "r", "r"), ("Restart Claude", "R", "R"), ("Close", "x", "X")],
                "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Toggle changes", "c", "c"),
-                           ("Archive", "a", "A"), ("Remove", "x", "X")]}
+                           ("Sleep", "s", "s"), ("Archive", "a", "A"), ("Remove", "x", "X")],
+               "asleep": [("Wake", "s", "s"), ("Archive", "a", "A"), ("Remove", "x", "X")]}
 
     def context_menu(self, x, y):
         """Right click on a row: its actions as a menu; each one is the row's key, sent to the sidebar.
@@ -6569,6 +6622,29 @@ def cmd_selftest():
         z("unarchive", proj2)
         check("unarchive: session and terminal back",
               wait(lambda: len(wins()) == n_wins and "proj2" in t("capture-pane", "-p", "-t", f"{wid}.0")))
+        # ZI99: a sleeping project runs nothing and is in the Sleeping group at the bottom of the sidebar
+        side_rows = lambda: t("capture-pane", "-p", "-t", f"{wid}.0").splitlines()
+        row_with = lambda text: next((i for i, l in enumerate(side_rows()) if text in l), -1)
+        write_json(f"{home}/palette-pick.json", ["project", proj2])
+        t("send-keys", "-t", f"{wid}.0", "F12", "s")  # Sleep in the right-click menu
+        check("ZI99: Sleep: its sessions stop, it is in the folded Sleeping group, the last row above the footer",
+              wait(lambda: len(wins()) == n_wins - 1 and row_with("▸ Sleeping") == len(side_rows()) - 3
+                   and row_with("proj2") == -1))
+        z("wake", proj2)
+        check("ZI99: zidev wake: its session is back, it is a project again, the Sleeping group is gone",
+              wait(lambda: len(wins()) == n_wins and row_with("Sleeping") == -1 and row_with("proj2") >= 0))
+        z("sleep", proj2)
+        wait(lambda: row_with("▸ Sleeping") >= 0)
+        mouse_click(f"{wid}.0", 3, row_with("▸ Sleeping"))
+        check("ZI99: a click unfolds the Sleeping group: the sleeping project, a gray row under it",
+              wait(lambda: 0 <= row_with("▾ Sleeping") < row_with("☾ proj2")))
+        time.sleep(1)  # that click is over: the next one is a click of its own
+        mouse_click(f"{wid}.0", 3, row_with("☾ proj2"))
+        check("ZI99: a click on the sleeping project wakes it and shows it",
+              wait(lambda: len(wins()) == n_wins and t("display", "-p", "#{window_id}") == wins().get(zid2())))
+        time.sleep(1)  # the sidebar is done showing it: it must not switch back after the next line
+        t("select-window", "-t", wid)
+        wait(lambda: row_with("Sleeping") == -1 and row_with("proj2") >= 0)
         # ZI96: the gray bar is on what the window shows; only ↑ ↓ move it away, while the sidebar has the keys
         side1 = f"{wid}.0"
         row_of = lambda text: next(i for i, l in enumerate(t("capture-pane", "-p", "-t", side1).splitlines()) if text in l)
@@ -6985,6 +7061,8 @@ def main():
         cmd_rename_project(args[1:])
     elif cmd in ("archive", "unarchive"):
         cmd_archive(args[1:], cmd == "archive")
+    elif cmd in ("sleep", "wake"):
+        cmd_sleep(args[1:], cmd == "sleep")
     elif cmd == "done":
         cmd_done(args[1:])
     elif cmd == "list":
