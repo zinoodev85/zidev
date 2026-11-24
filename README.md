@@ -118,7 +118,7 @@ One fuzzy list: package scripts (pnpm / yarn / bun / npm from the lockfile), `ma
 | command | |
 |---|---|
 | `zidev` | start (restoring saved sessions) or attach |
-| `zidev new [dir] [--prompt TEXT]` | new session in dir, TEXT as its first message |
+| `zidev new [dir] [--prompt TEXT] [--qwen]` | new session in dir, TEXT as its first message; `--qwen`: Qwen Code runs in it, not Claude |
 | `zidev rename-project [DIR] NAME` | show a project under NAME (`""`: folder name again); DIR defaults to this session's project |
 | `zidev archive DIR` / `unarchive DIR` | hide a project (its sessions stop) / bring it back |
 | `zidev list [--json]`, `zidev status` | sessions and their status |

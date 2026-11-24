@@ -8,8 +8,8 @@ right. Claude Code hooks report each session's status to ~/.zidev/status.
   zidev              start (restoring saved sessions) or attach
   zidev DIR          the same, showing DIR's project (its first session); a new project if it is none
   zidev start        start the server in the background, without attaching
-  zidev new [DIR] [--prompt TEXT] [--resume CLAUDE_ID] [--title TEXT] [--env K=V]... [--keep] [--json] [--investor]
-                     new session in DIR (default: current dir); TEXT is Claude's first message; --resume: resumes that
+  zidev new [DIR] [--prompt TEXT] [--resume CLAUDE_ID] [--title TEXT] [--env K=V]... [--keep] [--json] [--investor] [--qwen]
+                     new session in DIR (default: current dir); TEXT is Claude's first message; --qwen: Qwen Code runs in it; --resume: resumes that
                      Claude session (a cold one, no process and transcript idle 60+ min, is refused, exit 4;
                      --investor: only for the investor's own click (dash2 open)); --env: exported to its Claude on every start; --keep: never standby;
                      --json: prints {"id", "claude_id"}, shows nothing
@@ -74,7 +74,7 @@ LOG = f"{HOME}/zidev.log"
 # cwd of the Zed tab running zidev: a restored Zed tab starting here re-execs zidev (see README)
 ANCHOR = f"{HOME}/home"
 
-VERSION = "0.1.22"
+VERSION = "0.1.23"
 # the path it was started by, not resolved: a brew symlink (/opt/homebrew/bin/zidev) outlives upgrades,
 # so hooks and key bindings that call it keep working; its files sit next to the real one
 SELF = os.path.abspath(__file__)
@@ -85,6 +85,7 @@ SESSION = "zidev"
 SIDEBAR_W = 34  # default; dragging its border sets config sidebar_w
 SIDEBAR_MIN = 8
 CLAUDE = os.environ.get("ZIDEV_CLAUDE", "claude")  # override for tests
+QWEN = os.environ.get("ZIDEV_QWEN", "qwen")  # Qwen Code, for a Qwen session (ZQ1)
 
 HOOK_EVENTS = [
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
@@ -1014,7 +1015,7 @@ def restart_claude(s, wid):
     select_tab(claude)
 
 
-def new_session(cwd, select=True, prompt=None, resume=None, title="", env=None, keep=False):
+def new_session(cwd, select=True, prompt=None, resume=None, title="", env=None, keep=False, agent=None):
     cwd = os.path.realpath(os.path.expanduser(cwd))
     s = {"id": str(uuid.uuid4()), "cwd": cwd, "title": title, "created": time.time()}
     if prompt:
@@ -1025,6 +1026,8 @@ def new_session(cwd, select=True, prompt=None, resume=None, title="", env=None, 
         s["env"] = env  # exported to its Claude on every start
     if keep:
         s["keep"] = True  # never standby
+    if agent:
+        s["agent"] = agent  # "qwen": Qwen Code runs in it, not Claude (ZQ1)
     if cwd in stopped_projects(load_state()):  # a new session brings the project back
         unarchive_project(cwd)
     with edit_state() as d:
@@ -1776,9 +1779,10 @@ COLD_MIN = 60  # no process holds the Claude id and its transcript is this old (
 
 
 def claude_transcript(cid):
-    """Newest saved transcript of a Claude id, or None."""
+    """Newest saved transcript of a Claude (or Qwen) id, or None."""
     root = os.environ.get("ZIDEV_PROJECTS") or os.path.expanduser("~/.claude/projects")
-    files = glob.glob(f"{root}/*/{cid}.jsonl")
+    qwen_root = os.path.expanduser("~/.qwen/projects")
+    files = glob.glob(f"{root}/*/{cid}.jsonl") + glob.glob(f"{qwen_root}/*/chats/{cid}.jsonl")
     return max(files, key=os.path.getmtime) if files else None
 
 
@@ -1822,14 +1826,14 @@ def cmd_new(args):
         else:
             rest.append(a)
             i += 1
-    keep, as_json, investor = "--keep" in rest, "--json" in rest, "--investor" in rest
-    rest = [a for a in rest if a not in ("--keep", "--json", "--investor")]
+    keep, as_json, investor, qwen = "--keep" in rest, "--json" in rest, "--investor" in rest, "--qwen" in rest
+    rest = [a for a in rest if a not in ("--keep", "--json", "--investor", "--qwen")]
     if opts["--resume"] and not investor and is_cold(opts["--resume"]):
         refuse_cold(opts["--resume"])
     if as_json and not server_running():
         ensure_server()
     s = new_session(rest[0] if rest else os.getcwd(), select=not as_json, prompt=opts["--prompt"],
-                    resume=opts["--resume"], title=opts["--title"], env=env, keep=keep)
+                    resume=opts["--resume"], title=opts["--title"], env=env, keep=keep, agent="qwen" if qwen else None)
     if as_json:
         print(json.dumps({"id": s["id"], "claude_id": read_status(s["id"]).get("claude_id", "")}))
     else:
@@ -1973,6 +1977,7 @@ def cmd_doctor():
 
     print("tools")
     for tool, fix, needed in (("tmux", "brew install tmux", True), (CLAUDE, "npm i -g @anthropic-ai/claude-code", True),
+                              (QWEN, "brew install qwen-code (for Qwen sessions)", False),
                               ("fzf", "brew install fzf", False), ("fd", "brew install fd", False),
                               ("bat", "brew install bat", False), ("glow", "brew install glow", False),
                               ("delta", "brew install git-delta", False),
@@ -2207,10 +2212,15 @@ def cmd_run(zid):
             set_status(zid, "standby")
             wait_standby(zid)  # the investor shows it or presses a key
         checked = True
-        args = [claude_bin(), "--settings", HOOK_SETTINGS, "--resume" if saved or forced else "--session-id", cid]
+        qwen = s.get("agent") == "qwen"  # ZQ1: Qwen Code takes the same hooks, from a settings file named in its environment
+        name = "Qwen" if qwen else "Claude"
+        args = [shutil.which(QWEN) or QWEN] if qwen else [claude_bin(), "--settings", HOOK_SETTINGS]
+        args += ["--resume" if saved or forced else "--session-id", cid]
+        if qwen:
+            os.environ["QWEN_CODE_SYSTEM_SETTINGS_PATH"] = HOOK_SETTINGS
         if s.get("prompt") or forced:
             if s.get("prompt") and (forced or not saved):
-                args.append(s["prompt"])
+                args += ["-i", s["prompt"]] if qwen else [s["prompt"]]
             with edit_state() as d:  # sent once: a restart must not repeat it
                 for x in d["sessions"]:
                     if x["id"] == zid:
@@ -2222,12 +2232,12 @@ def cmd_run(zid):
         try:
             subprocess.call(args, cwd=s["cwd"])
         except OSError as e:
-            print(f"\033[31mcan't start Claude: {e}\033[0m  (is `claude` on PATH? zidev doctor checks)")
+            print(f"\033[31mcan't start {name}: {e}\033[0m  (is `{args[0]}` on PATH? zidev doctor checks)")
         if os.path.exists(f"{STANDBY_DIR}/{zid}"):  # stopped for standby, not by its user
             wait_standby(zid)
             continue
         set_status(zid, "exited")
-        print("\n\033[2mClaude exited.  \033[0m[enter] restart   [x] close session\n")
+        print(f"\n\033[2m{name} exited.  \033[0m[enter] restart   [x] close session\n")
         if read_key() in ("x", "X"):
             close_session(zid)
             return
@@ -2633,7 +2643,7 @@ def cmd_html(zid, path, line, choice):
 
 
 PALETTE_ACTIONS = [  # (label, key hint, what: "tab ACTION", "side KEY ROW" (F12 KEY to the sidebar) or "focus")
-    ("New session", "", "side n project"), ("New project…", "", "side p -"),
+    ("New session", "", "side n project"), ("New Qwen session", "", "side q project"), ("New project…", "", "side p -"),
     ("New terminal tab", "⌘⇧T", "tab term"), ("Toggle changes", "", "side c project"),
     ("Terminal next to Claude", "⌘T", "tab split"), ("Hide / show sidebar", "⌘B", "tab sidebar"),
     ("Sidebar ⇄ tab", "", "focus"), ("Next session that needs you", "", "side w -"),
@@ -4619,6 +4629,8 @@ class Sidebar:
             label = ""
         room = w - tx - 1 - (len(label) + 1 if label else 0)
         title = title_of(s, st)
+        if s.get("agent") == "qwen":
+            title = f"qwen · {title}"
         title = title if len(title) <= room else title[: room - 1] + "…"
         self.put(y, tx, title, base | (curses.A_BOLD if attention else 0))
         self.put(y, w - len(label) - 1, label, base | (color if state == "waiting" else curses.A_DIM))
@@ -4853,13 +4865,13 @@ class Sidebar:
             show_window(wid)
             (new_tab if new else show_kind)(s["id"], kind)
 
-    def new_in(self, cwd):
+    def new_in(self, cwd, agent=None):
         if not cwd:
             return self.new_project()
         if not os.path.isdir(cwd):
             self.message = f"missing: {cwd}"
             return
-        new_session(cwd)
+        new_session(cwd, agent=agent)
 
     def new_project(self):
         kind, v = self.current()
@@ -4941,6 +4953,8 @@ class Sidebar:
             self.select(("project", cwd))
         elif ch == ord("n"):
             self.new_in(self.project_of(kind, v) if kind else None)
+        elif ch == ord("q") and kind:  # ZQ1: New Qwen session
+            self.new_in(self.project_of(kind, v), "qwen")
         elif ch == ord("p"):
             self.new_project()
         elif ch == ord("r") and kind == "session":
@@ -5050,7 +5064,8 @@ class Sidebar:
 
     CONTEXT = {"tab": [("Close", "x", "X")],  # (name, shortcut shown, key sent: X / A act without asking)
                "session": [("Rename", "r", "r"), ("Restart Claude", "R", "R"), ("Close", "x", "X")],
-               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("Toggle changes", "c", "c"),
+               "project": [("Rename", "r", "r"), ("New session", "n", "n"), ("New Qwen session", "q", "q"),
+                           ("Toggle changes", "c", "c"),
                            ("Sleep", "s", "s"), ("Archive", "a", "A"), ("Remove", "x", "X")],
                "asleep": [("Wake", "s", "s"), ("Archive", "a", "A"), ("Remove", "x", "X")]}
 
@@ -5299,6 +5314,13 @@ if [ -n "$ZIDEV_TEST_SAY" ]; then  # takes input like Claude: bracketed paste on
   if [ -n "$ZIDEV_TEST_BUSY" ]; then (i=0; while :; do i=$((i+1)); printf '\r busy %s' "$i"; sleep 0.1; done) & fi  # a working Claude: the screen keeps changing
   printf '\033[?2004h'; stty raw -echo; exec cat >> "$ZIDEV_HOME/say-got-$ZIDEV_ID"
 fi
+exec sleep 3600
+"""
+
+FAKE_QWEN = """#!/bin/sh
+# stands in for qwen: records its arguments and the settings file its hooks come from
+echo "$@" >> "$ZIDEV_HOME/qwen-args"
+echo "$QWEN_CODE_SYSTEM_SETTINGS_PATH" > "$ZIDEV_HOME/qwen-settings"
 exec sleep 3600
 """
 
@@ -5573,8 +5595,11 @@ def cmd_selftest():
     with open(fake, "w") as f:
         f.write(FAKE_CLAUDE)
     os.chmod(fake, 0o755)
+    with open(f"{root}/qwen", "w") as f:
+        f.write(FAKE_QWEN)
+    os.chmod(f"{root}/qwen", 0o755)
     sock = f"zidev-selftest-{os.getpid()}"
-    env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake,
+    env = {**os.environ, "ZIDEV_HOME": home, "ZIDEV_SOCKET": sock, "ZIDEV_CLAUDE": fake, "ZIDEV_QWEN": f"{root}/qwen",
            "ZIDEV_SELF": SELF, "ZIDEV_TEST_CID": "cid-1", "ZIDEV_NOTIFY": "0", "ZIDEV_PROJECTS": f"{root}/cprojects", "ZIDEV_STANDBY_CHECK_S": "1", "ZIDEV_GUESS": f"{root}/guess", "ZIDEV_SKILL_DIR": f"{root}/skill",
            "ZIDEV_OPENER": browser, "ZIDEV_COPY": f"{root}/copy", "ZIDEV_PASTE": f"{root}/paste", "ZIDEV_TELL_APP": f"{root}/tell",
            "TODO_HOME": f"{root}/todo-home"}
@@ -7003,11 +7028,25 @@ esac
         os.kill(int(t("display", "-p", "-t", pane9, "#{pane_pid}")), signal.SIGUSR1)  # the investor shows it
         check("pane loop: showing the cold session in standby resumes it",
               wait(lambda: resumed9() == 1) and status(zid9).get("state") != "standby")
-        fake_transcript(zid9, 1)
+        wait(lambda: status(zid9).get("claude_id") == "cid-1")  # the fake Claude reports the test's id as its own
+        fake_transcript("cid-1", 1)
+        resumes = args().count("--resume cid-1")
         restart9()
         check("pane loop restart: a warm saved transcript resumes at once, no standby",
-              wait(lambda: resumed9() == 2) and status(zid9).get("state") != "standby")
+              wait(lambda: args().count("--resume cid-1") == resumes + 1) and status(zid9).get("state") != "standby")
         z("close", zid9)
+        # ZQ1: a Qwen session runs Qwen Code, with zidev's hooks
+        qwen_file = lambda name: open(f"{home}/{name}").read() if os.path.exists(f"{home}/{name}") else ""
+        zid10 = json.loads(z("new", proj5, "--json", "--qwen", "--prompt", "hi qwen").stdout)["id"]
+        check("ZQ1: zidev new --qwen: Qwen Code starts with the session's id, the prompt and zidev's hook settings",
+              wait(lambda: f"--session-id {zid10} -i hi qwen" in qwen_file("qwen-args")
+                   and qwen_file("qwen-settings").strip() == f"{home}/claude-settings.json"))
+        qwen_sessions = lambda: [x for x in read_json(f"{home}/sessions.json", {})["sessions"] if x.get("agent") == "qwen"]
+        write_json(f"{home}/palette-pick.json", ["project", os.path.realpath(proj5)])
+        t("send-keys", "-t", f"{wid}.0", "F12", "q")  # New Qwen session in the right-click menu
+        check("ZQ1: New Qwen session in a project's menu: a second Qwen session there",
+              wait(lambda: len(qwen_sessions()) == 2 and qwen_file("qwen-args").count("--session-id") == 2))
+        check("ZQ1: the sidebar marks a Qwen session", "qwen ·" in t("capture-pane", "-p", "-t", f"{wid}.0"))
         check("doctor runs", "tools" in z("doctor").stdout)
     finally:
         if client:
