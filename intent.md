@@ -1,7 +1,7 @@
 # zidev — intent
 
 Decisions on how zidev should be. Only these.
-ZI<n> = one intent; ids are never reused. Replaced or dropped ones: `intent-history.md`.
+ZI<n> / ZQ<n> = one intent; ids are never reused. Replaced or dropped ones: `intent-history.md`.
 
 ## Basics
 
@@ -60,6 +60,9 @@ Right-click "Back to projects" takes a project out of To Be Merged.
 
 ZI93 **Kept rebased.**
 While `/zidev done` waits for its MR, each hourly check rebases the branch onto the MR's target and pushes it, once the target has moved on. The session resolves a conflict itself; if unsure, it asks.
+
+ZQ1 **Qwen sessions.**
+An option to run Qwen sessions in a project, via Qwen Code.
 
 ## Done
 
