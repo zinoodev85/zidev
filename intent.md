@@ -40,6 +40,9 @@ An agent skill (~/.claude/skills/zidev) explains zidev to agents; zidev rewrites
 ZI82 **Archived runs nothing.**
 An archived project takes no resources: its sessions, tabs and what they started stop; nothing watches it.
 
+ZI99 **Sleep.**
+"Sleep" is a half archive: a sleeping project turns to a gray item stacked at the bottom of the list, similar to the To Be Merged projects. The sleeping projects are in a foldable group "Sleeping".
+
 ZI85 **`/zidev done`.**
 `/zidev done` in a session ends its task: its todo is marked done, its folder is deleted, its project is removed (Remove). With uncommitted or unpushed work it asks first.
 
